@@ -493,6 +493,7 @@ version = "0.1.0"
 dependencies = [
  "chainsim-core",
  "chainsim-evm",
+ "chainsim-sui",
  "clap",
  "serde",
  "serde_json",
@@ -527,6 +528,12 @@ dependencies = [
 [[package]]
 name = "chainsim-sui"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chainsim-core",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "clap"

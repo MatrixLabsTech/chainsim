@@ -22,3 +22,4 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 chainsim-core = { path = "crates/chainsim-core" }
 chainsim-evm = { path = "crates/chainsim-evm" }
+chainsim-sui = { path = "crates/chainsim-sui" }

@@ -35,6 +35,29 @@
         }
       }
     },
+    "sui-tools": {
+      "version": "mainnet-v1.81.1",
+      "pull": {
+        "image": "mysten/sui-tools:mainnet-v1.81.1",
+        "digest": "sha256:5336a71e37812bd6609a73a07bb99c267b3861c7670b7c49e20a6c9e5d5f1de6",
+        "platforms": {
+          "amd64": "mysten/sui-tools:mainnet-v1.81.1@sha256:5336a71e37812bd6609a73a07bb99c267b3861c7670b7c49e20a6c9e5d5f1de6",
+          "arm64": "mysten/sui-tools:mainnet-v1.81.1-arm64@sha256:75cffe13c485980874bf24874b9d892fa718b13748b690d0b0ba84b5872b2836"
+        }
+      }
+    },
+    "control-grpcurl": {
+      "version": "1.9.3",
+      "user": "grpcurl",
+      "pull": {
+        "image": "fullstorydev/grpcurl:v1.9.3-alpine",
+        "digest": "sha256:4614424ed58e9b9837c48b6b8eadb9ef40491d5af3499bcc8b378e9c64a9e4a9",
+        "platforms": {
+          "amd64": "sha256:7bb71ad3f119338154bcf4d5730af794f8fdb8f882110140d49acb488e44df22",
+          "arm64": "sha256:086220a7900409841a0bd9115c43749a2c8cb783bb24c21fc77657905a21b9e9"
+        }
+      }
+    },
     "control-curl": {
       "version": "8.16.0",
       "user": "curl_user",

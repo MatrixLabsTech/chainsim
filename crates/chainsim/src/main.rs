@@ -11,6 +11,7 @@ use chainsim_core::lock::EngineLock;
 use chainsim_core::profile::{self, Profile};
 use chainsim_core::{envelope, Adapter, Error, ErrorCode, Result};
 use chainsim_evm::EvmAdapter;
+use chainsim_sui::SuiAdapter;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
@@ -91,6 +92,7 @@ enum Command {
 async fn adapter(family: &str) -> Result<Box<dyn Adapter>> {
     match family {
         "evm" => Ok(Box::new(EvmAdapter::connect().await?)),
+        "sui" => Ok(Box::new(SuiAdapter::connect().await?)),
         other => Err(Error::unsupported(&format!("the {other} family"), "chainsim describe")),
     }
 }
@@ -112,7 +114,7 @@ fn describe_profile(p: &Profile, lock: &EngineLock) -> Value {
         "family": p.family,
         "engine": format!("{}@{}", p.engine, engine.map_or("?", |e| e.version.as_str())),
         "maturity": p.maturity,
-        "operations": if p.family == "evm" { chainsim_evm::OPERATIONS } else { &[] },
+        "operations": match p.family.as_str() { "evm" => chainsim_evm::OPERATIONS, "sui" => chainsim_sui::OPERATIONS, _ => &[] },
         "upstream": { "default": p.upstream.default, "env": p.upstream.env, "fromEnv": p.upstream_is_secret() },
         "native": p.native,
         "tokens": p.tokens,
