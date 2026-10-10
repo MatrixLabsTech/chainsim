@@ -193,6 +193,8 @@ impl SuiAdapter {
         }
     }
 
+    // The engine spec sets every field today; `..Default::default()` keeps it compiling when core adds one.
+    #[allow(clippy::needless_update)]
     async fn start(&self, profile: &Profile, req: &UpRequest) -> Result<Fork> {
         let name = &req.name;
         let upstream = profile.upstream_url();
@@ -264,6 +266,7 @@ impl SuiAdapter {
                 publish: req.publish.then_some(profile.ports.rpc),
                 // The data directory and snapshots outlive a sui-fork restart; down removes the volume.
                 mounts: vec![(data_volume(name), DATA.into())],
+                ..Default::default()
             })
             .await?;
 
