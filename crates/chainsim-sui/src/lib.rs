@@ -96,7 +96,8 @@ pub fn engine_script(checkpoint: u64, funder: Option<&str>, port: u16) -> String
 }
 
 /// Stops sui-fork for a copy. Exits 3 when it does not stop within 30 s.
-const STOP: &str = "D=/data; touch $D/hold; pid=$(cat $D/pid); kill $pid 2>/dev/null; i=0; \
+/// A trap clears `hold` on any exit, so a failed copy never leaves sui-fork stopped.
+const STOP: &str = "D=/data; trap 'rm -f $D/hold' EXIT; touch $D/hold; pid=$(cat $D/pid); kill $pid 2>/dev/null; i=0; \
     while kill -0 $pid 2>/dev/null; do i=$((i+1)); [ $i -gt 300 ] && kill -9 $pid; [ $i -gt 350 ] && exit 3; sleep 0.1; done";
 
 fn snapshot_script(id: &str) -> String {
@@ -516,7 +517,7 @@ impl Adapter for SuiAdapter {
     async fn call(&self, name: &str, method: &str, params: Value, from: Option<&str>) -> Result<Value> {
         let (handle, profile) = self.open(name).await?;
         if from.is_some() {
-            return Err(Error::new(ErrorCode::Usage, "--from is EVM only; on Sui, send TransactionExecutionService/ExecuteTransaction with an empty signatures list to act as the sender"));
+            return Err(Error::unsupported("call --from", "chainsim call <name> TransactionExecutionService/ExecuteTransaction '<request>' with an empty signatures list acts as the transaction's sender"));
         }
         let g = self.grpc(&handle, &profile);
         let out = g.call(&full_method(method)?, &call_body(params)?, CALL_TIMEOUT).await?;
@@ -581,6 +582,7 @@ mod tests {
         assert!(!valid_snapshot_id("s1; rm -rf /"));
         assert!(!valid_snapshot_id("../x"));
         assert!(revert_script("s1", "s2").starts_with("D=/data; [ -d $D/snap/s1 ] || exit 4;"));
+        assert!(snapshot_script("s1").contains("trap 'rm -f $D/hold' EXIT"));
     }
 
     #[test]
