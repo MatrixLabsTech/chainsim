@@ -1,14 +1,16 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["crates/chainsim", "crates/chainsim-core", "crates/chainsim-evm", "crates/chainsim-sui"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+alloy-primitives = "1"
 async-trait = "0.1"
 bollard = "0.21"
 clap = { version = "4", features = ["derive"] }

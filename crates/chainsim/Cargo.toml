@@ -3,6 +3,7 @@ name = "chainsim"
 description = "Local mainnet forks in Docker, with a JSON interface for agents"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 

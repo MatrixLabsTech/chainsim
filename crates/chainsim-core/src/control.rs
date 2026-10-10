@@ -98,6 +98,14 @@ impl<'a> Control<'a> {
         Ok(v.get("result").cloned().unwrap_or(Value::Null))
     }
 
+    /// Removes the provider URL, and nothing else, from engine output.
+    pub fn scrub_secret(&self, s: &str) -> String {
+        match self.secret.as_deref().filter(|x| !x.is_empty()) {
+            Some(secret) => s.replace(secret, "<upstream>"),
+            None => s.to_string(),
+        }
+    }
+
     /// Removes the upstream URL and any other http(s) URL from a message.
     pub fn scrub(&self, s: &str) -> String {
         let mut s = s.to_string();
@@ -146,7 +154,8 @@ pub fn redact_urls(s: &str) -> String {
     }
 }
 
-fn shell_quote(s: &str) -> String {
+/// Quotes one argument for `sh -c`.
+pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 

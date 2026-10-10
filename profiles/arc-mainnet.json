@@ -14,7 +14,8 @@
   "native": { "symbol": "USDC", "decimals": 18 },
   "overrides": [],
   "tokens": [
-    { "symbol": "USDC", "address": "0x3600000000000000000000000000000000000000", "decimals": 6, "nativeView": true }
+    { "symbol": "USDC", "address": "0x3600000000000000000000000000000000000000", "decimals": 6, "nativeView": true },
+    { "symbol": "EURC", "address": "0xbEf5f6d51CB62b58e6A8f77868681825C6fe21c1", "decimals": 6 }
   ],
   "warmup": [
     { "action": "native-transfer" },

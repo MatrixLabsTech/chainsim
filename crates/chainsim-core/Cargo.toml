@@ -3,6 +3,7 @@ name = "chainsim-core"
 description = "chainsim core: the Adapter trait, the fork object, the JSON envelope, profiles, the engine lock and Docker control"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 build = "build.rs"
