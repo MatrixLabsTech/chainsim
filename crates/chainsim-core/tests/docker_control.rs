@@ -80,3 +80,69 @@ async fn labeled_volume_mounts_and_remove_fork_deletes_it() {
     assert!(!docker.volume_exists(volume).await.unwrap());
     assert!(!docker.network_exists(&network).await.unwrap());
 }
+
+/// A hardened engine spec running as `user` with `volume` at `path`.
+fn writer_spec(image: &str, fork: &str, network: &str, user: &str, volume: &str, path: &str) -> chainsim_core::docker::ContainerSpec {
+    use std::collections::HashMap;
+    docker::ContainerSpec {
+        name: docker::engine_container(fork),
+        image: image.to_string(),
+        user: Some(user.into()),
+        entrypoint: Some(vec!["sh".into(), "-c".into()]),
+        cmd: vec!["sleep infinity".into()],
+        labels: HashMap::from([
+            (docker::LABEL_FORK.to_string(), fork.to_string()),
+            (docker::LABEL_ROLE.to_string(), docker::ROLE_ENGINE.to_string()),
+            (docker::LABEL_NETWORK.to_string(), network.to_string()),
+            (docker::LABEL_NETWORK_CREATED.to_string(), "true".to_string()),
+        ]),
+        network: network.to_string(),
+        memory: 64 << 20,
+        mounts: vec![(volume.to_string(), path.to_string())],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn owned_volume_is_writable_by_a_non_root_engine() {
+    let docker = Docker::connect().await.unwrap();
+    let lock = EngineLock::embedded().unwrap();
+    let image = docker.ensure_engine(chainsim_core::lock::CONTROL_ENGINE, lock.engine(chainsim_core::lock::CONTROL_ENGINE).unwrap()).await.unwrap();
+    let write = |name: &str| ["sh".to_string(), "-c".to_string(), format!("echo ok > {name}/state && cat {name}/state")];
+
+    // Without an owner the fresh volume is root's, so uid 65534 cannot write it.
+    let name = "core-noown";
+    docker.remove_fork(name).await.unwrap();
+    let network = docker::default_network(name);
+    docker.ensure_network(&network, name).await.unwrap();
+    docker.run(&writer_spec(&image, name, &network, "65534:65534", "chainsim-core-noown-data", "/data")).await.unwrap();
+    let out = docker.exec(&docker::engine_container(name), &write("/data")).await.unwrap();
+    assert_ne!(out.exit_code, 0, "a root-owned volume took a write from 65534");
+    assert!(docker.remove_fork(name).await.unwrap());
+
+    // With an owner, at a path absent from the image and at one present in it (/mnt).
+    for (name, path) in [("core-own", "/data"), ("core-own-mnt", "/mnt")] {
+        let volume = format!("chainsim-{name}-data");
+        docker.remove_fork(name).await.unwrap();
+        let network = docker::default_network(name);
+        docker.ensure_network(&network, name).await.unwrap();
+        docker.ensure_volume_owned(&lock, &volume, name, "65534:65534").await.unwrap();
+        // A second call leaves the existing volume alone.
+        docker.ensure_volume_owned(&lock, &volume, name, "65534:65534").await.unwrap();
+        let labels = docker.api().inspect_volume(&volume).await.unwrap().labels;
+        assert_eq!(labels.get(docker::LABEL_FORK).map(String::as_str), Some(name));
+        assert!(!docker.is_running(&format!("{volume}-chown")).await);
+
+        docker.run(&writer_spec(&image, name, &network, "65534:65534", &volume, path)).await.unwrap();
+        let out = docker.exec(&docker::engine_container(name), &write(path)).await.unwrap();
+        assert_eq!((out.exit_code, out.stdout.trim()), (0, "ok"), "{path}: {}", out.stderr);
+
+        assert!(docker.remove_fork(name).await.unwrap());
+        assert!(!docker.volume_exists(&volume).await.unwrap());
+        assert!(!docker.network_exists(&network).await.unwrap());
+    }
+
+    assert!(docker.ensure_volume_owned(&lock, "chainsim-core-bad-data", "core-bad", "nobody").await.is_err());
+    assert!(!docker.volume_exists("chainsim-core-bad-data").await.unwrap());
+}

@@ -16,7 +16,7 @@ use futures_util::StreamExt;
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::fork::{Fork, ForkPoint};
-use crate::lock::{host_arch, Engine, EngineLock};
+use crate::lock::{host_arch, Engine, EngineLock, CONTROL_ENGINE};
 use crate::profile::Profile;
 
 pub const LABEL_FORK: &str = "org.chainsim.fork";
@@ -27,9 +27,13 @@ pub const LABEL_ROLE: &str = "org.chainsim.role";
 pub const LABEL_NETWORK: &str = "org.chainsim.network";
 pub const LABEL_ALIAS: &str = "org.chainsim.alias";
 pub const LABEL_NETWORK_CREATED: &str = "org.chainsim.network-created";
+/// On a volume: the `uid:gid` it was chowned to when created.
+pub const LABEL_OWNER: &str = "org.chainsim.owner";
 
 pub const ROLE_ENGINE: &str = "engine";
 pub const ROLE_CONTROL: &str = "control";
+/// A short-lived container that prepares a fork volume.
+pub const ROLE_INIT: &str = "init";
 
 /// The engine's memory limit.
 pub const ENGINE_MEMORY: i64 = 1 << 30;
@@ -264,18 +268,99 @@ impl Docker {
 
     /// Creates a named volume labeled with the fork, unless it exists.
     pub async fn ensure_volume(&self, volume: &str, fork: &str) -> Result<()> {
+        self.ensure_volume_labels(volume, fork).await.map(|_| ())
+    }
+
+    /// Creates the volume, labeled with the fork, unless it exists, and returns its labels.
+    async fn ensure_volume_labels(&self, volume: &str, fork: &str) -> Result<HashMap<String, String>> {
         match self.inner.inspect_volume(volume).await {
-            Ok(_) => return Ok(()),
+            Ok(v) => return Ok(v.labels),
             Err(e) if is_not_found(&e) => {}
             Err(e) => return Err(docker_err(e)),
         }
-        let req = bollard::models::VolumeCreateRequest {
-            name: Some(volume.to_string()),
-            labels: Some(HashMap::from([(LABEL_FORK.to_string(), fork.to_string())])),
-            ..Default::default()
-        };
+        let labels = HashMap::from([(LABEL_FORK.to_string(), fork.to_string())]);
+        self.create_volume(volume, labels.clone()).await?;
+        Ok(labels)
+    }
+
+    async fn create_volume(&self, volume: &str, labels: HashMap<String, String>) -> Result<()> {
+        let req = bollard::models::VolumeCreateRequest { name: Some(volume.to_string()), labels: Some(labels), ..Default::default() };
         self.inner.create_volume(req).await.map_err(docker_err)?;
         Ok(())
+    }
+
+    /// Creates a named volume labeled with the fork and owned by `owner`
+    /// (`uid:gid`), so a non-root engine can write it. The owner is applied
+    /// once, when the volume is created: an existing volume is left as is.
+    /// Call it before `run`, whose mount then finds the volume in place and
+    /// mounts it with `nocopy`, so Docker does not copy the image directory at
+    /// the mount path, and its owner, over the volume.
+    ///
+    /// The chown runs in a short-lived container from the lock-pinned control
+    /// image, as root with only CAP_CHOWN and no network.
+    pub async fn ensure_volume_owned(&self, lock: &EngineLock, volume: &str, fork: &str, owner: &str) -> Result<()> {
+        let valid = owner.split_once(':').is_some_and(|(u, g)| [u, g].iter().all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())));
+        if !valid {
+            return Err(Error::new(ErrorCode::Internal, format!("volume owner {owner:?} is not uid:gid")));
+        }
+        if self.volume_exists(volume).await? {
+            return Ok(());
+        }
+        self.create_volume(volume, HashMap::from([(LABEL_FORK.to_string(), fork.to_string()), (LABEL_OWNER.to_string(), owner.to_string())])).await?;
+        let chowned = self.chown_volume(lock, volume, fork, owner).await;
+        if chowned.is_err() {
+            // Without its owner the volume is unusable; the next up retries from scratch.
+            let _ = self.inner.remove_volume(volume, None::<bollard::query_parameters::RemoveVolumeOptions>).await;
+        }
+        chowned
+    }
+
+    async fn chown_volume(&self, lock: &EngineLock, volume: &str, fork: &str, owner: &str) -> Result<()> {
+        const MOUNT: &str = "/volume";
+        let image = self.ensure_engine(CONTROL_ENGINE, lock.engine(CONTROL_ENGINE)?).await?;
+        let name = format!("{volume}-chown");
+        self.remove_container(&name).await?;
+        let body = ContainerCreateBody {
+            image: Some(image),
+            user: Some("0:0".into()),
+            entrypoint: Some(vec!["chown".into()]),
+            cmd: Some(vec![owner.to_string(), MOUNT.to_string()]),
+            labels: Some(HashMap::from([(LABEL_FORK.to_string(), fork.to_string()), (LABEL_ROLE.to_string(), ROLE_INIT.to_string())])),
+            host_config: Some(HostConfig {
+                readonly_rootfs: Some(true),
+                cap_drop: Some(vec!["ALL".into()]),
+                cap_add: Some(vec!["CHOWN".into()]),
+                security_opt: Some(vec!["no-new-privileges".into()]),
+                memory: Some(CONTROL_MEMORY),
+                network_mode: Some("none".into()),
+                binds: Some(vec![format!("{volume}:{MOUNT}")]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let opts = CreateContainerOptionsBuilder::default().name(&name).build();
+        let created = self.inner.create_container(Some(opts), body).await.map_err(|e| Error::new(ErrorCode::EngineFailed, format!("create {name}: {e}")))?;
+        let result = async {
+            self.inner
+                .start_container(&created.id, None::<bollard::query_parameters::StartContainerOptions>)
+                .await
+                .map_err(|e| Error::new(ErrorCode::EngineFailed, format!("start {name}: {e}")))?;
+            let mut wait = self.inner.wait_container(&created.id, None::<bollard::query_parameters::WaitContainerOptions>);
+            let code = match wait.next().await {
+                Some(Ok(r)) => r.status_code,
+                Some(Err(bollard::errors::Error::DockerContainerWaitError { code, .. })) => code,
+                Some(Err(e)) => return Err(docker_err(e)),
+                None => -1,
+            };
+            if code != 0 {
+                let log = self.logs_tail(&created.id, 5).await;
+                return Err(Error::new(ErrorCode::EngineFailed, format!("chown {owner} on volume {volume} exited {code}: {}", log.trim())));
+            }
+            Ok(())
+        }
+        .await;
+        self.remove_container(&created.id).await?;
+        result
     }
 
     /// True when the volume exists.
@@ -293,8 +378,9 @@ impl Docker {
         if !spec.mounts.is_empty() {
             let fork = spec.labels.get(LABEL_FORK).ok_or_else(|| Error::new(ErrorCode::Internal, format!("{} mounts volumes but has no {LABEL_FORK} label", spec.name)))?;
             for (volume, path) in &spec.mounts {
-                self.ensure_volume(volume, fork).await?;
-                binds.push(format!("{volume}:{path}"));
+                let labels = self.ensure_volume_labels(volume, fork).await?;
+                let nocopy = if labels.contains_key(LABEL_OWNER) { ":nocopy" } else { "" };
+                binds.push(format!("{volume}:{path}{nocopy}"));
             }
         }
         let mut port_bindings = None;
