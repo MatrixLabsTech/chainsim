@@ -151,8 +151,8 @@ struct FundToken {
 }
 
 /// An `up --block` failure that reads like missing history: the upstream is
-/// not an archive node. Upstream failures (exit 5) on an old block get the
-/// same advice, since a pruned node often answers with a generic error.
+/// not an archive node. Other upstream failures (exit 5) keep their advice,
+/// with the archive hint after it, since a pruned node may answer vaguely.
 pub fn archive_hint(e: Error, profile: &Profile) -> Error {
     let lower = e.message.to_lowercase();
     let history = ["missing trie node", "pruned", "historical state", "header not found", "state not available", "state is not available", "archive", "unknown block", "state histories"];
@@ -160,7 +160,11 @@ pub fn archive_hint(e: Error, profile: &Profile) -> Error {
         return Error { code: ErrorCode::UpstreamUnavailable, next: Some(archive_next(&profile.upstream.env)), ..e };
     }
     if e.code.exit_code() == 5 {
-        return Error { next: Some(archive_next(&profile.upstream.env)), ..e };
+        let next = match &e.next {
+            Some(n) => format!("{n}. If the block is old: {}", archive_next(&profile.upstream.env)),
+            None => archive_next(&profile.upstream.env),
+        };
+        return Error { next: Some(next), ..e };
     }
     e
 }
@@ -681,8 +685,8 @@ mod tests {
         let want = "an old --block needs an archive upstream: export CHAINSIM_ETHEREUM_MAINNET_RPC=<archive provider URL>, or drop --block to fork at the head";
         let e = archive_hint(Error::new(ErrorCode::RpcError, "eth_getBalance: missing trie node abc"), &p);
         assert_eq!((e.code, e.next.as_deref()), (ErrorCode::UpstreamUnavailable, Some(want)));
-        let e = archive_hint(Error::new(ErrorCode::UpstreamUnavailable, "the engine could not fork").next("x"), &p);
-        assert_eq!(e.next.as_deref(), Some(want));
+        let e = archive_hint(Error::new(ErrorCode::RateLimited, "slow down").next("retry later"), &p);
+        assert_eq!(e.next.as_deref(), Some(format!("retry later. If the block is old: {want}").as_str()));
         let e = archive_hint(Error::new(ErrorCode::NameConflict, "taken"), &p);
         assert_eq!(e.code, ErrorCode::NameConflict);
     }

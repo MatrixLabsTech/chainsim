@@ -49,9 +49,10 @@ pub fn permissions() -> Value {
     json!({
         "claude": {
             "file": "~/.claude/settings.json",
-            "permissions": { "allow": ["Bash(chainsim *)"], "ask": ["Bash(chainsim down --all)"] },
+            "permissions": { "allow": ["Bash(chainsim *)"], "ask": ["Bash(chainsim down --all)", "Bash(chainsim down --all *)"] },
         },
-        "note": "Add this to your settings to run chainsim without a prompt each time; `chainsim down --all` still asks.",
+        "codex": "no per-command rule: Codex asks according to its approval policy",
+        "note": "Add the claude rule to your settings to run chainsim without a prompt each time; `chainsim down --all` still asks.",
     })
 }
 
