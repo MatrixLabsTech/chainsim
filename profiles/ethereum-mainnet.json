@@ -1,0 +1,33 @@
+{
+  "key": "ethereum-mainnet",
+  "id": "eip155:1",
+  "name": "Ethereum Mainnet",
+  "family": "evm",
+  "engine": "foundry",
+  "upstream": { "default": "https://ethereum-rpc.publicnode.com", "env": "CHAINSIM_ETHEREUM_MAINNET_RPC" },
+  "ports": { "rpc": 8545, "ws": 8545 },
+  "maturity": "stable",
+  "fork": {
+    "default": "latest",
+    "flags": ["--retries", "20", "--fork-retry-backoff", "1500", "--compute-units-per-second", "1000"]
+  },
+  "native": { "symbol": "ETH", "decimals": 18 },
+  "overrides": [],
+  "tokens": [
+    { "symbol": "USDC", "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "decimals": 6 },
+    { "symbol": "WETH", "address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "decimals": 18 }
+  ],
+  "warmup": [
+    { "action": "native-transfer" },
+    { "action": "approve", "token": "USDC" }
+  ],
+  "selftest": { "token": "USDC", "extras": [] },
+  "limits": [
+    "This is a private copy of Ethereum Mainnet: transactions confirm on the copy only and never appear on Ethereum Mainnet or its explorers.",
+    "The copy keeps chain id 1, so a transaction signed for it is also valid on Ethereum Mainnet. Use test keys that hold no mainnet assets.",
+    "The engine is Foundry anvil v1.8.5. Blocks are mined on demand, not every 12 seconds, and there is no beacon chain, blob data or MEV.",
+    "Accounts and storage the copy has not written are read from the upstream RPC at the fork block on first access, so the first read of each account is slower and depends on the upstream's rate limit.",
+    "The default upstream is a public endpoint that rate-limits bursts. Set CHAINSIM_ETHEREUM_MAINNET_RPC to a provider URL for heavier runs.",
+    "App indexers and explorers read the public chain, so they do not show what happens on the copy."
+  ]
+}

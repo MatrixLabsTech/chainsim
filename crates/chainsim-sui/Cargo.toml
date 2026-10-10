@@ -1,0 +1,9 @@
+[package]
+name = "chainsim-sui"
+description = "Sui adapter for chainsim (phase 1b, stream B)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

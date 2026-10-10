@@ -1,0 +1,51 @@
+{
+  "engines": {
+    "foundry": {
+      "version": "v1.8.5",
+      "user": "foundry",
+      "home": "/home/foundry/.foundry",
+      "pull": {
+        "image": "ghcr.io/foundry-rs/foundry:v1.8.5",
+        "digest": "sha256:32c8ea9ef052a440cb1620175987a3f49eff8b068a0c6a3d09ebf7f5f9a0e043",
+        "platforms": {
+          "amd64": "sha256:f00b023f65e3aab6b7f994dd13b9faff1441aba92df60a53850cb644a4b8b3b5",
+          "arm64": "sha256:07b00590675e98c3b2d3d0733d96ed934186e5f6657af6d1ad91938a26d1ef07"
+        }
+      }
+    },
+    "arc-foundry": {
+      "version": "v0.8.0-2",
+      "user": "chainsim",
+      "home": "/home/chainsim/.foundry",
+      "build": {
+        "image": "chainsim/arc-foundry:v0.8.0-2",
+        "context": "arc-foundry",
+        "base": "ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55",
+        "tarballs": {
+          "amd64": {
+            "url": "https://github.com/circlefin/arc-foundry/releases/download/v0.8.0-2/arc-foundry-v0.8.0-2-x86_64-unknown-linux-gnu.tar.gz",
+            "sha256_url": "https://github.com/circlefin/arc-foundry/releases/download/v0.8.0-2/arc-foundry-v0.8.0-2-x86_64-unknown-linux-gnu.tar.gz.sha256",
+            "sha256": "088bdb96a84418b757f9825d491e702792f1d1d1e29a9145af305a6600a79556"
+          },
+          "arm64": {
+            "url": "https://github.com/circlefin/arc-foundry/releases/download/v0.8.0-2/arc-foundry-v0.8.0-2-aarch64-unknown-linux-gnu.tar.gz",
+            "sha256_url": "https://github.com/circlefin/arc-foundry/releases/download/v0.8.0-2/arc-foundry-v0.8.0-2-aarch64-unknown-linux-gnu.tar.gz.sha256",
+            "sha256": "6508a6425bfeab62188698702771478619d4229fda1db038fb01c1050476c805"
+          }
+        }
+      }
+    },
+    "control-curl": {
+      "version": "8.16.0",
+      "user": "curl_user",
+      "pull": {
+        "image": "curlimages/curl:8.16.0",
+        "digest": "sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6",
+        "platforms": {
+          "amd64": "sha256:5a91ea0c9c3ee27b4abe657b68cf6bf0676afa13b236b3bda34283cb3924d4f6",
+          "arm64": "sha256:b949ec80877077def1544f0727d3e3101dd687fe20a5bf74997e557f7e3ac961"
+        }
+      }
+    }
+  }
+}

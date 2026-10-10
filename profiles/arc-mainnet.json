@@ -1,0 +1,33 @@
+{
+  "key": "arc-mainnet",
+  "id": "eip155:5042",
+  "name": "Arc Mainnet",
+  "family": "evm",
+  "engine": "arc-foundry",
+  "upstream": { "default": "https://rpc.mainnet.arc.io", "env": "CHAINSIM_ARC_MAINNET_RPC" },
+  "ports": { "rpc": 8545, "ws": 8545 },
+  "maturity": "stable",
+  "fork": {
+    "default": "latest",
+    "flags": ["--retries", "20", "--fork-retry-backoff", "1500", "--compute-units-per-second", "1000"]
+  },
+  "native": { "symbol": "USDC", "decimals": 18 },
+  "overrides": [],
+  "tokens": [
+    { "symbol": "USDC", "address": "0x3600000000000000000000000000000000000000", "decimals": 6, "nativeView": true }
+  ],
+  "warmup": [
+    { "action": "native-transfer" },
+    { "action": "approve", "token": "USDC" }
+  ],
+  "selftest": { "token": "USDC", "extras": ["dual-usdc-view"] },
+  "limits": [
+    "This is a private copy of Arc Mainnet: transactions confirm on the copy only and never appear on Arc Mainnet or its explorer.",
+    "The copy keeps chain id 5042, so a transaction signed for it is also valid on Arc Mainnet. Use test keys that hold no mainnet assets.",
+    "USDC is the native gas token with 18 decimals. The USDC ERC-20 at 0x3600000000000000000000000000000000000000 is a 6-decimal view of the same balance.",
+    "The engine is Circle's arc-foundry v0.8.0-2 (anvil 1.7.1-dev), which runs Arc's own USDC system contract and precompiles. It is built on an older Foundry than v1.8.5, so some newer anvil RPC methods may be missing.",
+    "Accounts and storage the copy has not written are read from the upstream RPC at the fork block on first access, so the first read of each account is slower and depends on the upstream's rate limit.",
+    "The --gas-limit and --disable-block-gas-limit options are not available, and there are no blob transactions.",
+    "App indexers and explorers read the public chain, so they do not show what happens on the copy."
+  ]
+}

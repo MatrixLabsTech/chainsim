@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/chainsim", "crates/chainsim-core", "crates/chainsim-evm", "crates/chainsim-sui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+async-trait = "0.1"
+bollard = "0.21"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = "0.4"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+chainsim-core = { path = "crates/chainsim-core" }
+chainsim-evm = { path = "crates/chainsim-evm" }
