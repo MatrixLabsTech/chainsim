@@ -4,6 +4,9 @@
 //! go to stderr. The exit code says what happened (design section 9).
 
 use std::io::IsTerminal;
+use std::path::PathBuf;
+
+mod install;
 
 use chainsim_core::docker::Docker;
 use chainsim_core::fork::{FundRequest, TokenAmount, UpRequest};
@@ -86,6 +89,12 @@ enum Command {
     },
     /// Chain-level checks; exit 6 when any fails, with every check in data.
     Selftest { name: String },
+    /// Write the chainsim plugin to a local folder and add it to Claude Code and Codex.
+    Install {
+        /// The folder (default: $CHAINSIM_HOME/marketplace, else ~/.chainsim/marketplace).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 }
 
 /// The adapter for a profile family.
@@ -115,7 +124,7 @@ fn describe_profile(p: &Profile, lock: &EngineLock) -> Value {
         "engine": format!("{}@{}", p.engine, engine.map_or("?", |e| e.version.as_str())),
         "maturity": p.maturity,
         "operations": match p.family.as_str() { "evm" => chainsim_evm::OPERATIONS, "sui" => chainsim_sui::OPERATIONS, _ => &[] },
-        "upstream": { "default": p.upstream.default, "env": p.upstream.env, "fromEnv": p.upstream_is_secret() },
+        "upstream": p.upstream_info(),
         "native": p.native,
         "tokens": p.tokens,
         "overrides": p.overrides.iter().map(|o| json!({ "kind": o.kind, "target": o.target, "note": o.note })).collect::<Vec<_>>(),
@@ -145,6 +154,7 @@ fn describe(chain: Option<&str>) -> Result<Value> {
             "revert <name> <id>",
             "call <name> <method> [<params-json>] [--from <address>]",
             "selftest <name>",
+            "install [--dir <folder>]",
         ],
         "exitCodes": { "0": "ok", "1": "error", "2": "usage", "3": "unsupported on this engine", "4": "not found", "5": "upstream failure", "6": "selftest failed", "7": "refused for safety", "8": "conflict" },
         "errors": errors,
@@ -220,6 +230,7 @@ async fn run(command: Command) -> Result<Value> {
             adapter_of(&name).await?.call(&name, &method, params, from.as_deref()).await
         }
         Command::Selftest { name } => to_value(adapter_of(&name).await?.selftest(&name).await),
+        Command::Install { dir } => install::install(dir),
     }
 }
 

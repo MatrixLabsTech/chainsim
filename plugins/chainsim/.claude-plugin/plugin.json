@@ -1,0 +1,9 @@
+{
+  "name": "chainsim",
+  "description": "Local mainnet forks of Ethereum, Arc, Robinhood Chain, Solana and Sui in Docker, driven through the chainsim JSON CLI.",
+  "version": "0.1.0",
+  "author": {
+    "name": "0xasun"
+  },
+  "license": "MIT OR Apache-2.0"
+}

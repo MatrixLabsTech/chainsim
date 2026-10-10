@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "chainsim",
+  "owner": {
+    "name": "0xasun"
+  },
+  "metadata": {
+    "description": "chainsim: local mainnet forks in Docker for agents.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "chainsim",
+      "source": "./plugins/chainsim",
+      "description": "Local mainnet forks of Ethereum, Arc, Robinhood Chain, Solana and Sui in Docker, driven through the chainsim JSON CLI."
+    }
+  ]
+}
