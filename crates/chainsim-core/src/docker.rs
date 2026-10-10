@@ -16,7 +16,7 @@ use futures_util::StreamExt;
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::fork::{Fork, ForkPoint};
-use crate::lock::{Engine, EngineLock};
+use crate::lock::{host_arch, Engine, EngineLock};
 use crate::profile::Profile;
 
 pub const LABEL_FORK: &str = "org.chainsim.fork";
@@ -124,6 +124,10 @@ pub struct ContainerSpec {
     pub memory: i64,
     /// Publish this container port on a free `127.0.0.1` port.
     pub publish: Option<u16>,
+    /// Named volumes and their mount paths. Each is created if missing and
+    /// labeled with the fork (the `org.chainsim.fork` label of the spec), so
+    /// it outlives a container restart and `remove_fork` removes it.
+    pub mounts: Vec<(String, String)>,
 }
 
 /// The output of one `docker exec`.
@@ -144,13 +148,6 @@ fn docker_err(e: bollard::errors::Error) -> Error {
 
 fn is_not_found(e: &bollard::errors::Error) -> bool {
     matches!(e, bollard::errors::Error::DockerResponseServerError { status_code: 404, .. })
-}
-
-fn host_arch() -> &'static str {
-    match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        _ => "amd64",
-    }
 }
 
 impl Docker {
@@ -189,9 +186,9 @@ impl Docker {
         if self.image_exists(&reference).await? {
             return Ok(reference);
         }
-        if let Some(pull) = &engine.pull {
+        if engine.pull.is_some() {
             eprintln!("chainsim: pulling {id} {}", engine.version);
-            let opts = CreateImageOptionsBuilder::default().from_image(&format!("{}@{}", pull.image, pull.digest)).build();
+            let opts = CreateImageOptionsBuilder::default().from_image(&reference).build();
             let mut stream = self.inner.create_image(Some(opts), None, None);
             while let Some(item) = stream.next().await {
                 item.map_err(|e| Error::new(ErrorCode::EngineFailed, format!("pull {id}: {e}")).next(format!("docker pull {reference}")))?;
@@ -265,8 +262,41 @@ impl Docker {
         }
     }
 
+    /// Creates a named volume labeled with the fork, unless it exists.
+    pub async fn ensure_volume(&self, volume: &str, fork: &str) -> Result<()> {
+        match self.inner.inspect_volume(volume).await {
+            Ok(_) => return Ok(()),
+            Err(e) if is_not_found(&e) => {}
+            Err(e) => return Err(docker_err(e)),
+        }
+        let req = bollard::models::VolumeCreateRequest {
+            name: Some(volume.to_string()),
+            labels: Some(HashMap::from([(LABEL_FORK.to_string(), fork.to_string())])),
+            ..Default::default()
+        };
+        self.inner.create_volume(req).await.map_err(docker_err)?;
+        Ok(())
+    }
+
+    /// True when the volume exists.
+    pub async fn volume_exists(&self, volume: &str) -> Result<bool> {
+        match self.inner.inspect_volume(volume).await {
+            Ok(_) => Ok(true),
+            Err(e) if is_not_found(&e) => Ok(false),
+            Err(e) => Err(docker_err(e)),
+        }
+    }
+
     /// Creates and starts a hardened container.
     pub async fn run(&self, spec: &ContainerSpec) -> Result<String> {
+        let mut binds = Vec::new();
+        if !spec.mounts.is_empty() {
+            let fork = spec.labels.get(LABEL_FORK).ok_or_else(|| Error::new(ErrorCode::Internal, format!("{} mounts volumes but has no {LABEL_FORK} label", spec.name)))?;
+            for (volume, path) in &spec.mounts {
+                self.ensure_volume(volume, fork).await?;
+                binds.push(format!("{volume}:{path}"));
+            }
+        }
         let mut port_bindings = None;
         let mut exposed = None;
         if let Some(port) = spec.publish {
@@ -282,6 +312,7 @@ impl Docker {
             memory: Some(spec.memory),
             network_mode: Some(spec.network.clone()),
             port_bindings,
+            binds: (!binds.is_empty()).then_some(binds),
             ..Default::default()
         };
         let endpoint = EndpointSettings { aliases: (!spec.aliases.is_empty()).then(|| spec.aliases.clone()), ..Default::default() };
@@ -480,6 +511,7 @@ impl Docker {
             tmpfs: vec![("/tmp".into(), "rw,noexec,nosuid,size=16m".into())],
             memory: CONTROL_MEMORY,
             publish: None,
+            mounts: vec![],
         };
         self.run(&spec).await
     }

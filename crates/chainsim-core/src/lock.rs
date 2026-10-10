@@ -31,9 +31,13 @@ pub struct Engine {
 pub struct Pull {
     /// `repo:tag`. Never `latest`.
     pub image: String,
-    /// The multi-arch index digest; the reference run is `image@digest`.
+    /// The multi-arch index digest; the reference run is `image@digest`
+    /// unless `platforms` pins the host architecture.
     pub digest: String,
-    /// Per-architecture manifest digests, for reference.
+    /// Per architecture (`amd64`, `arm64`). A full `repo:tag@sha256:…`
+    /// value is the reference run on that architecture, for images published
+    /// as single-arch tags with no multi-arch index (mysten/sui-tools). A bare
+    /// `sha256:…` value only records the manifest digest inside the index.
     #[serde(default)]
     pub platforms: BTreeMap<String, String>,
 }
@@ -71,13 +75,30 @@ impl EngineLock {
 }
 
 impl Engine {
-    /// The image reference a container runs.
+    /// The image reference a container runs on this host.
     pub fn reference(&self) -> String {
+        self.reference_for(host_arch())
+    }
+
+    /// The image reference for an architecture (`amd64` or `arm64`): its
+    /// platform pin when the lock has one, else `image@digest`.
+    pub fn reference_for(&self, arch: &str) -> String {
         match (&self.pull, &self.build) {
-            (Some(p), _) => format!("{}@{}", p.image, p.digest),
+            (Some(p), _) => match p.platforms.get(arch).filter(|v| v.contains('@')) {
+                Some(pinned) => pinned.clone(),
+                None => format!("{}@{}", p.image, p.digest),
+            },
             (None, Some(b)) => b.image.clone(),
             (None, None) => String::new(),
         }
+    }
+}
+
+/// The host architecture in Docker's naming: `arm64` or `amd64`.
+pub fn host_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        _ => "amd64",
     }
 }
 
@@ -97,6 +118,14 @@ mod tests {
             if let Some(p) = &e.pull {
                 assert!(!p.image.ends_with(":latest") && p.image.contains(':'), "{id}: tag must be pinned");
                 assert!(p.digest.starts_with("sha256:") && p.digest.len() == 71, "{id}: digest");
+                for (arch, v) in &p.platforms {
+                    assert!(arch == "amd64" || arch == "arm64", "{id}: arch {arch}");
+                    let digest = v.rsplit_once('@').map_or(v.as_str(), |(image, d)| {
+                        assert!(image.contains(':') && !image.ends_with(":latest"), "{id}/{arch}: tag must be pinned");
+                        d
+                    });
+                    assert!(digest.starts_with("sha256:") && digest.len() == 71, "{id}/{arch}: digest");
+                }
             }
             if let Some(b) = &e.build {
                 assert!(b.base.contains("@sha256:"), "{id}: base must be pinned by digest");
@@ -107,5 +136,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn pull(platforms: &[(&str, &str)]) -> Engine {
+        Engine {
+            version: "v1".into(),
+            user: None,
+            home: None,
+            pull: Some(Pull {
+                image: "repo/x:v1".into(),
+                digest: format!("sha256:{}", "a".repeat(64)),
+                platforms: platforms.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            }),
+            build: None,
+        }
+    }
+
+    #[test]
+    fn platform_pins_pick_the_host_architecture() {
+        let index = format!("repo/x:v1@sha256:{}", "a".repeat(64));
+        let amd = format!("repo/x:v1@sha256:{}", "b".repeat(64));
+        let arm = format!("repo/x:v1-arm64@sha256:{}", "c".repeat(64));
+        let e = pull(&[("amd64", &amd), ("arm64", &arm)]);
+        assert_eq!(e.reference_for("arm64"), arm);
+        assert_eq!(e.reference_for("amd64"), amd);
+        // No map: image@digest, as before.
+        assert_eq!(pull(&[]).reference_for("arm64"), index);
+        // A bare digest records the manifest inside the index and is not run.
+        let bare = format!("sha256:{}", "d".repeat(64));
+        assert_eq!(pull(&[("arm64", &bare)]).reference_for("arm64"), index);
+        // An architecture missing from the map falls back too.
+        assert_eq!(pull(&[("amd64", &amd)]).reference_for("arm64"), index);
     }
 }

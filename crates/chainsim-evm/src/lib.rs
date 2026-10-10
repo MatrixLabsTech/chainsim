@@ -246,6 +246,7 @@ impl EvmAdapter {
             tmpfs,
             memory: docker::ENGINE_MEMORY,
             publish: req.publish.then_some(profile.ports.rpc),
+            mounts: vec![],
         };
         self.docker.run(&spec).await?;
 
