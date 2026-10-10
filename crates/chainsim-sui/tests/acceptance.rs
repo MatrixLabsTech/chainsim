@@ -38,8 +38,7 @@ async fn balance(a: &SuiAdapter, name: &str, owner: &str) -> u64 {
     v["balance"]["balance"].as_str().unwrap().parse().unwrap()
 }
 
-/// The engine and sidecar run hardened; the engine runs as root only
-/// because its data volume is root-owned (a profile limit).
+/// The engine and sidecar run hardened and as non-root users.
 fn check_hardening(name: &str, published: bool) {
     for c in [format!("chainsim-{name}"), format!("chainsim-{name}-control")] {
         assert_eq!(inspect(&c, "{{.HostConfig.ReadonlyRootfs}}"), "true", "{c}");
@@ -51,7 +50,10 @@ fn check_hardening(name: &str, published: bool) {
     let engine = format!("chainsim-{name}");
     assert_eq!(inspect(&engine, "{{.HostConfig.Memory}}"), (1u64 << 30).to_string());
     assert!(inspect(&engine, "{{json .HostConfig.Binds}}").contains(&format!("{}:/data", data_volume(name))));
-    assert_ne!(inspect(&format!("chainsim-{name}-control"), "{{.Config.User}}"), "", "the sidecar runs as non-root");
+    for c in [engine.clone(), format!("chainsim-{name}-control")] {
+        let user = inspect(&c, "{{.Config.User}}");
+        assert!(!user.is_empty() && user != "root" && !user.starts_with("0:") && user != "0", "{c} user {user:?}");
+    }
     let ports = inspect(&engine, "{{json .NetworkSettings.Ports}}");
     let bindings = inspect(&engine, "{{json .HostConfig.PortBindings}}");
     if published {

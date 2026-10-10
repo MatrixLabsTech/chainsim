@@ -240,6 +240,10 @@ impl SuiAdapter {
             (docker::LABEL_NETWORK_CREATED.to_string(), created.to_string()),
         ]);
         // sui-fork takes "mainnet" or a GraphQL URL; a provider URL replaces the keyword.
+        // The fork volume is created owned by the engine user, so sui-fork runs as non-root.
+        if let Some(owner) = &engine.user {
+            self.docker.ensure_volume_owned(&self.lock, &data_volume(name), name, owner).await?;
+        }
         let mut env = vec![format!("HOME={DATA}")];
         if secret {
             env.push(format!("{UPSTREAM_ENV}={upstream}"));

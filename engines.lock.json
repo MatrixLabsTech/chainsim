@@ -37,6 +37,7 @@
     },
     "sui-tools": {
       "version": "mainnet-v1.81.1",
+      "user": "65534:65534",
       "pull": {
         "image": "mysten/sui-tools:mainnet-v1.81.1",
         "digest": "sha256:5336a71e37812bd6609a73a07bb99c267b3861c7670b7c49e20a6c9e5d5f1de6",

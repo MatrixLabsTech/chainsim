@@ -28,7 +28,6 @@
     "On Sui, fund only raises a balance: an address that already holds more than the amount asked is refused.",
     "Each selftest run moves 1 SUI from the funder to the fixed throwaway receiver 0x000000000000000000000000000000000000000000000000000000000000c5e2 on the copy, and leaves that transfer in place.",
     "Snapshot and revert each stop and restart the engine to copy its data directory, so each takes a few seconds.",
-    "The engine runs as root inside its container, with all capabilities dropped, because the fork's data volume is root-owned and the sui-tools image has no other user.",
     "There is no gas estimation: every transaction needs an explicit gas budget.",
     "Objects the copy has not touched are read from the upstream GraphQL service on first access, so the first read of each object is slower.",
     "With a provider GraphQL URL in CHAINSIM_SUI_MAINNET_GRAPHQL, sui-fork treats the chain as unknown instead of mainnet (inferred from sui-fork's source, untested), which may change protocol behavior.",
