@@ -17,7 +17,7 @@ use chainsim_core::profile::{self, Profile};
 use chainsim_core::{Adapter, Error, ErrorCode, Result};
 use serde_json::{json, Value};
 
-use grpc::Grpc;
+use grpc::{upstream_next, Grpc};
 use units::*;
 
 /// How long `up` waits for gRPC health. A cold fork measured 4 to 22 s.
@@ -148,7 +148,7 @@ impl SuiAdapter {
     /// The control path of a fork.
     pub fn grpc<'a>(&'a self, handle: &ForkHandle, profile: &Profile) -> Grpc<'a> {
         let secret = profile.upstream_is_secret().then(|| profile.upstream_url());
-        Grpc { docker: &self.docker, container: handle.control_container.clone(), target: format!("{}:{}", handle.alias, profile.ports.rpc), secret }
+        Grpc { docker: &self.docker, container: handle.control_container.clone(), target: format!("{}:{}", handle.alias, profile.ports.rpc), secret, upstream_env: profile.upstream.env.clone() }
     }
 
     async fn open(&self, name: &str) -> Result<(ForkHandle, Profile)> {
@@ -167,9 +167,9 @@ impl SuiAdapter {
         let lower = log.to_lowercase();
         let tail: String = log.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
         if lower.contains("429") || lower.contains("rate limit") || lower.contains("too many requests") {
-            Error::new(ErrorCode::RateLimited, format!("the upstream rate-limited the engine at startup: {tail}")).next("retry later, or set the profile's upstream env variable to a provider URL")
+            Error::new(ErrorCode::RateLimited, format!("the upstream rate-limited the engine at startup: {tail}")).next(upstream_next(&g.upstream_env))
         } else if lower.contains("graphql") || lower.contains("error sending request") || lower.contains("connect") {
-            Error::new(ErrorCode::UpstreamUnavailable, format!("the engine could not fork from the upstream: {tail}")).next("check the upstream, or set the profile's upstream env variable to a provider URL (chainsim describe <chain>)")
+            Error::new(ErrorCode::UpstreamUnavailable, format!("the engine could not fork from the upstream: {tail}")).next(upstream_next(&g.upstream_env))
         } else {
             Error::new(ErrorCode::EngineFailed, format!("the engine did not start: {tail}"))
         }
@@ -216,7 +216,7 @@ impl SuiAdapter {
 
         // The control sidecar: grpcurl (the profile's control engine), with the upstream URL in its environment only.
         self.docker.run_control(&self.lock, profile.control_engine(), name, &network, &upstream).await?;
-        let probe = Grpc { docker: &self.docker, container: docker::control_container(name), target: format!("{alias}:{}", profile.ports.rpc), secret: secret.then(|| upstream.clone()) };
+        let probe = Grpc { docker: &self.docker, container: docker::control_container(name), target: format!("{alias}:{}", profile.ports.rpc), secret: secret.then(|| upstream.clone()), upstream_env: profile.upstream.env.clone() };
 
         // The fork point: the asked checkpoint, or the upstream head now, so
         // the label records the exact checkpoint sui-fork starts from.
@@ -291,7 +291,7 @@ impl SuiAdapter {
     }
 
     /// The funder's largest SUI coin on the fork, as a gas object reference.
-    async fn funder_coin(&self, g: &Grpc<'_>, funder: &str) -> Result<(Value, u64)> {
+    async fn funder_coin(&self, g: &Grpc<'_>, funder: &str, fork: &ForkHandle) -> Result<(Value, u64)> {
         let body = json!({ "owner": funder, "objectType": "0x2::coin::Coin<0x2::sui::SUI>", "pageSize": 50, "readMask": { "paths": ["object_id", "version", "digest", "balance"] } });
         let v = g.call("sui.rpc.v2.StateService/ListOwnedObjects", &body, CALL_TIMEOUT).await?;
         v["objects"]
@@ -300,17 +300,14 @@ impl SuiAdapter {
             .flatten()
             .filter_map(|o| Some((json!({ "objectId": o["objectId"], "version": o["version"], "digest": o["digest"] }), u64_field(&o["balance"])?)))
             .max_by_key(|(_, b)| *b)
-            .ok_or_else(|| {
-                Error::new(ErrorCode::EngineFailed, format!("the funder {funder} has no SUI coins on this fork: seeding works only for fork points within about an hour of the upstream head"))
-                    .next("chainsim down <name>, then chainsim up sui-mainnet without --block")
-            })
+            .ok_or_else(|| too_old(&fork.name, fork.fork_point.number))
     }
 
     /// Sends `amount` MIST from the profile's funder to `to` by impersonation:
     /// a transaction with no signatures, which sui-fork executes as its sender.
-    async fn send_from_funder(&self, g: &Grpc<'_>, profile: &Profile, to: &str, amount: u64) -> Result<()> {
+    async fn send_from_funder(&self, g: &Grpc<'_>, profile: &Profile, fork: &ForkHandle, to: &str, amount: u64) -> Result<()> {
         let funder = profile.funder.as_deref().ok_or_else(|| Error::new(ErrorCode::Unsupported, format!("{} names no funder address", profile.key)).next("chainsim describe sui-mainnet"))?;
-        let (coin, coin_balance) = self.funder_coin(g, funder).await?;
+        let (coin, coin_balance) = self.funder_coin(g, funder, fork).await?;
         if coin_balance < amount.saturating_add(GAS_BUDGET) {
             return Err(Error::new(ErrorCode::EngineFailed, format!("the funder's largest coin holds {} SUI, less than the {} SUI asked plus gas", format_amount(coin_balance as u128, 9), format_amount(amount as u128, 9))));
         }
@@ -357,7 +354,7 @@ impl SuiAdapter {
         let t = Instant::now();
         let unit = 10u64.pow(9);
         let before = self.balance(g, ST_RECEIVER).await.ok();
-        let sent = self.send_from_funder(g, profile, ST_RECEIVER, unit).await.is_ok();
+        let sent = self.send_from_funder(g, profile, handle, ST_RECEIVER, unit).await.is_ok();
         let after = self.balance(g, ST_RECEIVER).await.ok();
         let moved = matches!((before, after), (Some(b), Some(a)) if a == b + unit);
         let elapsed = t.elapsed();
@@ -373,6 +370,16 @@ impl SuiAdapter {
         });
         parts
     }
+}
+
+/// The funder holds no coins on the fork: its coins were not seeded, because
+/// the upstream keeps owned objects only for about the last hour of checkpoints.
+pub fn too_old(name: &str, fork_point: u64) -> Error {
+    Error::new(
+        ErrorCode::Unsupported,
+        format!("fund needs a fork point within about an hour of the upstream head, and checkpoint {fork_point} is older: the upstream GraphQL keeps owned objects only for about the last hour, so the funder's coins were not seeded at up"),
+    )
+    .next(format!("chainsim down {name}, then chainsim up sui-mainnet --name {name} without --block, which forks from the upstream head"))
 }
 
 /// An ExecuteTransaction request with no signatures: SplitCoins from the gas
@@ -485,7 +492,7 @@ impl Adapter for SuiAdapter {
                 .next(format!("chainsim revert {name} <snapshot>, or fund a fresh address")));
         }
         if current < target {
-            self.send_from_funder(&g, &profile, &who, target - current).await?;
+            self.send_from_funder(&g, &profile, &handle, &who, target - current).await?;
         }
         let read = self.balance(&g, &who).await?;
         if read != target {
@@ -590,6 +597,14 @@ mod tests {
         assert!(!valid_snapshot_id("../x"));
         assert!(revert_script("s1", "s2").starts_with("D=/data; [ -d $D/snap/s1 ] || exit 4;"));
         assert!(snapshot_script("s1").contains("trap 'rm -f $D/hold' EXIT"));
+    }
+
+    #[test]
+    fn too_old_names_the_fork_point_and_the_fix() {
+        let e = too_old("f", 42);
+        assert_eq!(e.code, ErrorCode::Unsupported);
+        assert!(e.message.contains("checkpoint 42") && e.message.contains("about an hour"), "{}", e.message);
+        assert!(e.next.as_deref().is_some_and(|n| n.starts_with("chainsim down f,") && n.contains("without --block")));
     }
 
     #[test]
