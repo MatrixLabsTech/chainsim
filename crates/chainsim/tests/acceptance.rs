@@ -295,11 +295,12 @@ fn contract_exit_codes() {
     let out = chainsim_env(&["up", "arc-mainnet", "--name", "acc-bad"], &[("CHAINSIM_ARC_MAINNET_RPC", bad)]);
     assert_eq!(out.code, 5, "{}", out.stdout);
     assert!(!out.stdout.contains("secret-key-123"), "{}", out.stdout);
-    assert!(out.json["error"]["next"].is_string());
+    assert_eq!(out.json["error"]["next"], "retry, or export CHAINSIM_ARC_MAINNET_RPC=<provider URL>");
+    assert!(!out.stdout.contains("127.0.0.1"), "{}", out.stdout);
     assert_gone("acc-bad");
     // describe never prints a provider URL.
     let out = chainsim_env(&["describe", "arc-mainnet"], &[("CHAINSIM_ARC_MAINNET_RPC", bad)]);
     assert_eq!(out.code, 0);
     assert!(!out.stdout.contains("secret-key-123"));
-    assert_eq!(out.json["data"]["upstream"]["fromEnv"], true);
+    assert_eq!(out.json["data"]["upstream"]["set"], true);
 }
