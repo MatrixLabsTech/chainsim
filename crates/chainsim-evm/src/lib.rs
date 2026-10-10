@@ -207,7 +207,7 @@ impl EvmAdapter {
         };
         let alias = req.alias.clone().unwrap_or_else(|| name.clone());
 
-        self.docker.run_control(&self.lock, name, &network, &upstream).await?;
+        self.docker.run_control(&self.lock, profile.control_engine(), name, &network, &upstream).await?;
         let control = Control::new(&self.docker, docker::control_container(name), secret);
 
         // The fork point: the asked block, or the upstream head now, so the
@@ -219,13 +219,6 @@ impl EvmAdapter {
 
         let engine = self.lock.engine(&profile.engine)?;
         let image = self.docker.ensure_engine(&profile.engine, engine).await?;
-        let mut script = vec![
-            "exec anvil --host 0.0.0.0".to_string(),
-            format!("--port {}", profile.ports.rpc),
-            format!("--fork-url \"${UPSTREAM_ENV}\""),
-            format!("--fork-block-number {block}"),
-        ];
-        script.extend(profile.fork.flags.iter().map(|f| shell_quote(f)));
         let mut tmpfs = vec![("/tmp".to_string(), "rw,nosuid,size=256m".to_string())];
         if let Some(home) = &engine.home {
             tmpfs.push((home.clone(), "rw,nosuid,size=512m,mode=1777".to_string()));
@@ -245,7 +238,7 @@ impl EvmAdapter {
             image,
             user: engine.user.clone(),
             entrypoint: Some(vec!["/bin/sh".into(), "-c".into()]),
-            cmd: vec![script.join(" ")],
+            cmd: vec![anvil_command(profile, block)],
             env: vec![format!("{UPSTREAM_ENV}={upstream}")],
             labels,
             network: network.clone(),
@@ -469,6 +462,19 @@ impl EvmAdapter {
     }
 }
 
+/// The engine's `sh -c` command line. The upstream URL stays in the
+/// environment, so it is never in the container's arguments.
+pub fn anvil_command(profile: &Profile, block: u64) -> String {
+    let mut script = vec![
+        "exec anvil --host 0.0.0.0".to_string(),
+        format!("--port {}", profile.ports.rpc),
+        format!("--fork-url \"${UPSTREAM_ENV}\""),
+        format!("--fork-block-number {block}"),
+    ];
+    script.extend(profile.fork.flags.iter().map(|f| shell_quote(f)));
+    script.join(" ")
+}
+
 fn ms(t: Instant) -> u64 {
     t.elapsed().as_millis() as u64
 }
@@ -645,5 +651,26 @@ impl Adapter for EvmAdapter {
         let parts = self.checks(&eng, &profile).await;
         let _ = eng.rpc("evm_revert", json!([outer])).await;
         selftest_result(SelftestReport { ok: parts.iter().all(|c| c.ok), parts })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anvil_command_keeps_the_upstream_in_the_environment() {
+        let arc = profile::get("arc-mainnet").unwrap();
+        assert_eq!(
+            anvil_command(&arc, 25177865),
+            "exec anvil --host 0.0.0.0 --port 8545 --fork-url \"$CHAINSIM_UPSTREAM\" --fork-block-number 25177865 \
+             '--retries' '20' '--fork-retry-backoff' '1500' '--compute-units-per-second' '1000'"
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let eth = profile::get("ethereum-mainnet").unwrap();
+        assert!(!anvil_command(&eth, 1).contains("https://"));
+        assert_eq!(arc.control_engine(), "control-curl");
     }
 }

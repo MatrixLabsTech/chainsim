@@ -16,7 +16,7 @@ use futures_util::StreamExt;
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::fork::{Fork, ForkPoint};
-use crate::lock::{Engine, EngineLock, CONTROL_ENGINE};
+use crate::lock::{Engine, EngineLock};
 use crate::profile::Profile;
 
 pub const LABEL_FORK: &str = "org.chainsim.fork";
@@ -464,9 +464,9 @@ impl Docker {
 
     /// Starts the control sidecar on the fork network. It holds the upstream
     /// URL in its environment for the upstream checks, and nothing else.
-    pub async fn run_control(&self, lock: &EngineLock, fork: &str, network: &str, upstream: &str) -> Result<String> {
-        let engine = lock.engine(CONTROL_ENGINE)?;
-        let image = self.ensure_engine(CONTROL_ENGINE, engine).await?;
+    pub async fn run_control(&self, lock: &EngineLock, engine_id: &str, fork: &str, network: &str, upstream: &str) -> Result<String> {
+        let engine = lock.engine(engine_id)?;
+        let image = self.ensure_engine(engine_id, engine).await?;
         let spec = ContainerSpec {
             name: control_container(fork),
             image,

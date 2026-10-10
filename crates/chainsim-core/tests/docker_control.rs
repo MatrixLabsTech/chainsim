@@ -17,7 +17,7 @@ async fn sidecar_reaches_the_upstream_and_down_cleans_up() {
     docker.remove_fork(name).await.unwrap();
     let network = docker::default_network(name);
     assert!(docker.ensure_network(&network, name).await.unwrap());
-    docker.run_control(&lock, name, &network, "https://rpc.mainnet.arc.io").await.unwrap();
+    docker.run_control(&lock, chainsim_core::lock::CONTROL_ENGINE, name, &network, "https://rpc.mainnet.arc.io").await.unwrap();
 
     let control = Control::new(&docker, docker::control_container(name), Some("https://rpc.mainnet.arc.io".into()));
     let id = control.rpc(&Target::Upstream, "eth_chainId", serde_json::json!([]), Duration::from_secs(20)).await.unwrap();

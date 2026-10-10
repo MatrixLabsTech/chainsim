@@ -115,6 +115,9 @@ pub struct Profile {
     pub selftest: SelftestSettings,
     /// Sui only: the seeded address that impersonation draws from.
     pub funder: Option<String>,
+    /// The control sidecar's engine ID in the lock (default `control-curl`),
+    /// for a family whose engine needs another client, such as grpcurl.
+    pub control: Option<String>,
     pub limits: Vec<String>,
 }
 
@@ -128,6 +131,10 @@ impl Profile {
     /// True when the upstream comes from the environment (a secret).
     pub fn upstream_is_secret(&self) -> bool {
         std::env::var(&self.upstream.env).is_ok_and(|v| !v.trim().is_empty())
+    }
+
+    pub fn control_engine(&self) -> &str {
+        self.control.as_deref().unwrap_or(crate::lock::CONTROL_ENGINE)
     }
 
     pub fn token(&self, symbol_or_address: &str) -> Option<&Token> {
@@ -178,6 +185,7 @@ mod tests {
             assert!(p.id.contains(':'), "{} id is not CAIP-2", p.key);
             assert!(!p.limits.is_empty(), "{} has no limits", p.key);
             assert!(!p.upstream.env.is_empty());
+            assert!(lock.engines.contains_key(p.control_engine()), "{} names control engine {} not in the lock", p.key, p.control_engine());
             for o in &p.overrides {
                 asset(&o.file).unwrap();
             }
