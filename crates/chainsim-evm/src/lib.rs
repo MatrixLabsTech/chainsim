@@ -35,6 +35,11 @@ const ST_RECEIVER: &str = "0x000000000000000000000000000000000000c5e2";
 const ST_SPENDER: &str = "0x000000000000000000000000000000000000c5e3";
 const ST_DUAL: &str = "0x000000000000000000000000000000000000c5e4";
 const ST_DUAL_TO: &str = "0x000000000000000000000000000000000000c5e5";
+const ARB_SYS: &str = "0x0000000000000000000000000000000000000064";
+const ARB_GAS_INFO: &str = "0x000000000000000000000000000000000000006C";
+/// What the ArbGasInfo mock returns for getL1BaseFeeEstimate()
+/// (profiles/assets/src/ArbGasInfoMock.sol).
+const MOCK_L1_BASE_FEE: u64 = 255074;
 
 pub const OPERATIONS: &[&str] = &["describe", "up", "down", "ls", "status", "fund", "snapshot", "revert", "call", "selftest"];
 
@@ -443,11 +448,38 @@ impl EvmAdapter {
         });
 
         for extra in &profile.selftest.extras {
-            if extra == "dual-usdc-view" {
-                parts.push(self.dual_usdc_view(eng, profile).await);
+            match extra.as_str() {
+                "dual-usdc-view" => parts.push(self.dual_usdc_view(eng, profile).await),
+                "arbgasinfo" => parts.push(self.arbgasinfo(eng).await),
+                // A typo in a profile must not pass as green.
+                _ => parts.push(Check { part: "extras", ok: false, reason: "the profile names a selftest extra the EVM adapter does not have", ms: 0 }),
             }
         }
         parts
+    }
+
+    /// Arbitrum chains: the ArbGasInfo mock at 0x6C answers, and anvil's own
+    /// ArbSys at 0x64 still does, so the override did not clobber it.
+    async fn arbgasinfo(&self, eng: &Engine<'_>) -> Check {
+        let t = Instant::now();
+        let call = |to: &'static str, sig: &str| eng.rpc("eth_call", json!([{ "to": to, "data": selector(sig) }, "latest"]));
+        let ok = async {
+            let fee = parse_qty(&call(ARB_GAS_INFO, "getL1BaseFeeEstimate()").await?)?;
+            let block = parse_qty(&call(ARB_SYS, "arbBlockNumber()").await?)?;
+            Ok::<bool, Error>(fee == U256::from(MOCK_L1_BASE_FEE) && block > U256::ZERO)
+        }
+        .await
+        .unwrap_or(false);
+        Check {
+            part: "arbgasinfo",
+            ok,
+            reason: if ok {
+                "ArbGasInfo.getL1BaseFeeEstimate() at 0x6C returned the mock value and ArbSys.arbBlockNumber() at 0x64 answered"
+            } else {
+                "ArbGasInfo at 0x6C did not return the mock value, or ArbSys at 0x64 did not answer"
+            },
+            ms: ms(t),
+        }
     }
 
     /// Arc: one USDC balance, two views. Native 18 decimals and the ERC-20 at

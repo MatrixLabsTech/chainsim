@@ -77,6 +77,11 @@ pub fn approve(spender: Address, amount: U256) -> String {
 
 pub const DECIMALS: &str = "0x313ce567";
 
+/// The 4-byte calldata of a function with no arguments: `selector("arbBlockNumber()")`.
+pub fn selector(signature: &str) -> String {
+    format!("0x{}", alloy_primitives::hex::encode(&alloy_primitives::keccak256(signature.as_bytes())[..4]))
+}
+
 /// The storage slot of `mapping(address => uint256)` at `slot`: Solidity
 /// hashes key then slot, Vyper hashes slot then key.
 pub fn mapping_slot(owner: Address, slot: u64, vyper: bool) -> String {
@@ -89,6 +94,12 @@ pub fn mapping_slot(owner: Address, slot: u64, vyper: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selectors() {
+        assert_eq!(selector("decimals()"), DECIMALS);
+        assert_eq!(selector("arbBlockNumber()"), "0xa3b1b31d");
+    }
 
     #[test]
     fn amounts_round_trip() {

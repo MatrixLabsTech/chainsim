@@ -1,0 +1,43 @@
+{
+  "key": "robinhood-mainnet",
+  "id": "eip155:4663",
+  "name": "Robinhood Chain Mainnet",
+  "family": "evm",
+  "engine": "foundry",
+  "upstream": { "default": "https://rpc.mainnet.chain.robinhood.com", "env": "CHAINSIM_ROBINHOOD_MAINNET_RPC" },
+  "ports": { "rpc": 8545, "ws": 8545 },
+  "maturity": "stable",
+  "fork": {
+    "default": "latest",
+    "flags": ["--retries", "20", "--fork-retry-backoff", "1500", "--compute-units-per-second", "1000"]
+  },
+  "native": { "symbol": "ETH", "decimals": 18 },
+  "overrides": [
+    {
+      "kind": "code",
+      "target": "0x000000000000000000000000000000000000006C",
+      "file": "arbgasinfo-mock.hex",
+      "note": "ArbGasInfo at 0x6C is a chainsim mock: it returns fixed gas prices measured on Robinhood Chain Mainnet at block 85104168 on 2026-10-10 (for example getL1BaseFeeEstimate 255074 and getMinimumGasPrice 20000000), not live values."
+    }
+  ],
+  "tokens": [
+    { "symbol": "USDG", "address": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168", "decimals": 6 },
+    { "symbol": "WETH", "address": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73", "decimals": 18 }
+  ],
+  "warmup": [
+    { "action": "native-transfer" },
+    { "action": "approve", "token": "USDG" }
+  ],
+  "selftest": { "token": "USDG", "extras": ["arbgasinfo"] },
+  "limits": [
+    "This is a private copy of Robinhood Chain Mainnet: transactions confirm on the copy only and never appear on Robinhood Chain or its explorers.",
+    "The copy keeps chain id 4663, so a transaction signed for it is also valid on Robinhood Chain Mainnet. Use test keys that hold no mainnet assets.",
+    "The engine is Foundry anvil v1.8.5. It answers ArbSys at 0x64 with Arbitrum block numbers, and mines blocks on demand instead of following the sequencer.",
+    "ArbGasInfo at 0x6C is a chainsim mock with fixed values measured on 2026-10-10 at block 85104168, so gas prices do not move with the chain. Functions outside the common pricing getters revert.",
+    "There is no L1 data fee, so gas costs and estimates on the copy are lower than on the chain. Retryable tickets and L1-to-L2 address aliasing do not exist on the copy.",
+    "Accounts and storage the copy has not written are read from the upstream RPC at the fork block on first access, so the first read of each account is slower and depends on the upstream's rate limit.",
+    "The default upstream is a public endpoint documented as rate-limited. Set CHAINSIM_ROBINHOOD_MAINNET_RPC to a provider URL for heavier runs.",
+    "An old --block needs an archive upstream: the default public endpoint is not guaranteed to keep old state, so set CHAINSIM_ROBINHOOD_MAINNET_RPC to an archive provider URL to fork far behind the head.",
+    "App indexers and explorers read the public chain, so they do not show what happens on the copy."
+  ]
+}

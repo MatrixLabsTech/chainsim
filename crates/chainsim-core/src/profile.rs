@@ -206,6 +206,18 @@ mod tests {
     }
 
     #[test]
+    fn robinhood_installs_the_arbgasinfo_mock() {
+        let p = get("robinhood-mainnet").unwrap();
+        assert_eq!((p.id.as_str(), p.engine.as_str()), ("eip155:4663", "foundry"));
+        let o = p.overrides.iter().find(|o| o.target.eq_ignore_ascii_case("0x000000000000000000000000000000000000006c")).expect("ArbGasInfo override");
+        let code = asset(&o.file).unwrap();
+        assert!(code.starts_with("0x6080") && code.trim() == code && code[2..].bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(!p.overrides.iter().any(|o| o.target.ends_with("64")), "anvil answers ArbSys at 0x64 itself");
+        assert!(p.selftest.extras.iter().any(|e| e == "arbgasinfo"));
+        assert!(p.limits.iter().any(|l| l.contains("ArbGasInfo")));
+    }
+
+    #[test]
     fn unknown_profile_is_exit_4() {
         let e = get("no-such-chain").unwrap_err();
         assert_eq!(e.code.exit_code(), 4);
