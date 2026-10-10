@@ -5,6 +5,7 @@
 pub mod adapter;
 pub mod control;
 pub mod docker;
+pub mod engines;
 pub mod envelope;
 pub mod error;
 pub mod fork;

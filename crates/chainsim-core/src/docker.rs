@@ -177,7 +177,8 @@ impl Docker {
         &self.inner
     }
 
-    async fn image_exists(&self, reference: &str) -> Result<bool> {
+    /// True when the image is on this host.
+    pub async fn image_exists(&self, reference: &str) -> Result<bool> {
         match self.inner.inspect_image(reference).await {
             Ok(_) => Ok(true),
             Err(e) if is_not_found(&e) => Ok(false),
@@ -187,10 +188,31 @@ impl Docker {
 
     /// Pulls or builds an engine on first use and returns the image reference.
     pub async fn ensure_engine(&self, id: &str, engine: &Engine) -> Result<String> {
+        self.pull_engine(id, engine).await.map(|(reference, _)| reference)
+    }
+
+    /// Pulls or builds an engine unless it is here, tags it
+    /// `chainsim/<id>:<version>` so prune can find it, and returns the image
+    /// reference with `present`, `pulled` or `built`.
+    pub async fn pull_engine(&self, id: &str, engine: &Engine) -> Result<(String, &'static str)> {
         let reference = engine.reference();
-        if self.image_exists(&reference).await? {
-            return Ok(reference);
+        let status = if self.image_exists(&reference).await? {
+            "present"
+        } else {
+            self.fetch_engine(id, engine, &reference).await?;
+            if engine.pull.is_some() { "pulled" } else { "built" }
+        };
+        let tag = crate::engines::owned_tag(id, &engine.version);
+        if tag != reference {
+            let (repo, version) = tag.rsplit_once(':').expect("owned tags have a version");
+            let opts = bollard::query_parameters::TagImageOptionsBuilder::default().repo(repo).tag(version).build();
+            self.inner.tag_image(&reference, Some(opts)).await.map_err(docker_err)?;
         }
+        Ok((reference, status))
+    }
+
+    async fn fetch_engine(&self, id: &str, engine: &Engine, reference: &str) -> Result<()> {
+        let reference = reference.to_string();
         if engine.pull.is_some() {
             eprintln!("chainsim: pulling {id} {}", engine.version);
             let opts = CreateImageOptionsBuilder::default().from_image(&reference).build();
@@ -238,7 +260,40 @@ impl Docker {
         if !self.image_exists(&reference).await? {
             return Err(Error::new(ErrorCode::EngineFailed, format!("{id} image {reference} is missing after pull or build")));
         }
-        Ok(reference)
+        Ok(())
+    }
+
+    /// The local `chainsim/*` image tags.
+    pub async fn owned_tags(&self) -> Result<Vec<String>> {
+        let filters = HashMap::from([("reference".to_string(), vec![format!("{}*", crate::engines::OWNED_REPO)])]);
+        let opts = bollard::query_parameters::ListImagesOptionsBuilder::default().filters(&filters).build();
+        let images = self.inner.list_images(Some(opts)).await.map_err(docker_err)?;
+        Ok(images.into_iter().flat_map(|i| i.repo_tags).filter(|t| t.starts_with(crate::engines::OWNED_REPO)).collect())
+    }
+
+    /// Volumes labeled with a fork, with that fork's name.
+    pub async fn fork_volumes(&self) -> Result<Vec<(String, String)>> {
+        let filters = HashMap::from([("label".to_string(), vec![LABEL_FORK.to_string()])]);
+        let vols = self.inner.list_volumes(Some(bollard::query_parameters::ListVolumesOptionsBuilder::default().filters(&filters).build())).await.map_err(docker_err)?;
+        Ok(vols.volumes.unwrap_or_default().into_iter().filter_map(|v| v.labels.get(LABEL_FORK).cloned().map(|f| (v.name, f))).collect())
+    }
+
+    /// Forks that have a container of any role, running or not.
+    pub async fn live_forks(&self) -> Result<std::collections::HashSet<String>> {
+        let filters = HashMap::from([("label".to_string(), vec![LABEL_FORK.to_string()])]);
+        let opts = ListContainersOptionsBuilder::default().all(true).filters(&filters).build();
+        let list = self.inner.list_containers(Some(opts)).await.map_err(docker_err)?;
+        Ok(list.into_iter().filter_map(|c| c.labels.and_then(|l| l.get(LABEL_FORK).cloned())).collect())
+    }
+
+    /// Removes an image tag or reference, never by force: an image in use stays.
+    pub async fn remove_image(&self, image: &str) -> std::result::Result<(), String> {
+        self.inner.remove_image(image, None::<bollard::query_parameters::RemoveImageOptions>, None).await.map(|_| ()).map_err(|e| e.to_string())
+    }
+
+    /// Removes a volume. A volume in use stays.
+    pub async fn remove_volume(&self, volume: &str) -> std::result::Result<(), String> {
+        self.inner.remove_volume(volume, None::<bollard::query_parameters::RemoveVolumeOptions>).await.map_err(|e| e.to_string())
     }
 
     /// Creates the network unless it exists. Returns true when chainsim created it.

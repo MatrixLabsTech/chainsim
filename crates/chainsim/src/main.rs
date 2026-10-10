@@ -89,6 +89,12 @@ enum Command {
     },
     /// Chain-level checks; exit 6 when any fails, with every check in data.
     Selftest { name: String },
+    /// Pull or build engines from the lock ahead of time (default: every engine).
+    Pull { engine: Option<String> },
+    /// List the lock's engines, whether each is on this host, and the chains that use it.
+    Engines,
+    /// Remove chainsim engine images no profile runs and fork volumes no fork owns.
+    Prune,
     /// Write the chainsim plugin to a local folder and add it to Claude Code and Codex.
     Install {
         /// The folder (default: $CHAINSIM_HOME/marketplace, else ~/.chainsim/marketplace).
@@ -154,6 +160,9 @@ fn describe(chain: Option<&str>) -> Result<Value> {
             "revert <name> <id>",
             "call <name> <method> [<params-json>] [--from <address>]",
             "selftest <name>",
+            "pull [<engine>]",
+            "engines",
+            "prune",
             "install [--dir <folder>]",
         ],
         "exitCodes": { "0": "ok", "1": "error", "2": "usage", "3": "unsupported on this engine", "4": "not found", "5": "upstream failure", "6": "selftest failed", "7": "refused for safety", "8": "conflict" },
@@ -174,6 +183,67 @@ async fn ls() -> Result<Value> {
         out.push(v);
     }
     Ok(json!(out))
+}
+
+async fn pull(only: Option<&str>) -> Result<Value> {
+    let lock = EngineLock::embedded()?;
+    if let Some(id) = only.filter(|id| !lock.engines.contains_key(*id)) {
+        return Err(Error::new(ErrorCode::Usage, format!("no engine {id} in the lock")).next("chainsim engines"));
+    }
+    let docker = Docker::connect().await?;
+    let mut done = Vec::new();
+    let mut failed = Vec::new();
+    for (id, engine) in lock.engines.iter().filter(|(id, _)| only.is_none_or(|o| o == id.as_str())) {
+        match docker.pull_engine(id, engine).await {
+            Ok((image, status)) => done.push(json!({ "engine": id, "version": engine.version, "image": image, "status": status })),
+            Err(e) => failed.push(json!({ "engine": id, "code": e.code.as_str(), "message": e.message })),
+        }
+    }
+    let data = json!({ "engines": done, "failed": failed });
+    if !failed.is_empty() {
+        return Err(Error::new(ErrorCode::EngineFailed, format!("{} engine(s) did not pull or build", failed.len())).next("chainsim pull <engine> to retry one").data(data));
+    }
+    Ok(data)
+}
+
+async fn engines() -> Result<Value> {
+    let lock = EngineLock::embedded()?;
+    let profiles = profile::all()?;
+    let docker = Docker::connect().await?;
+    let mut present = std::collections::HashSet::new();
+    for e in lock.engines.values() {
+        if docker.image_exists(&e.reference()).await? {
+            present.insert(e.reference());
+        }
+    }
+    Ok(json!(chainsim_core::engines::rows(&lock, &profiles, |image| present.contains(image))))
+}
+
+async fn prune() -> Result<Value> {
+    let lock = EngineLock::embedded()?;
+    let profiles = profile::all()?;
+    let docker = Docker::connect().await?;
+    let mut present = std::collections::HashSet::new();
+    for e in lock.engines.values() {
+        if docker.image_exists(&e.reference()).await? {
+            present.insert(e.reference());
+        }
+    }
+    let plan = chainsim_core::engines::prune_plan(&lock, &profiles, &docker.owned_tags().await?, |r| present.contains(r), &docker.fork_volumes().await?, &docker.live_forks().await?);
+    let (mut images, mut volumes, mut skipped) = (Vec::new(), Vec::new(), Vec::new());
+    for image in plan.images {
+        match docker.remove_image(&image).await {
+            Ok(()) => images.push(image),
+            Err(reason) => skipped.push(json!({ "image": image, "reason": reason })),
+        }
+    }
+    for volume in plan.volumes {
+        match docker.remove_volume(&volume).await {
+            Ok(()) => volumes.push(volume),
+            Err(reason) => skipped.push(json!({ "volume": volume, "reason": reason })),
+        }
+    }
+    Ok(json!({ "removedImages": images, "removedVolumes": volumes, "skipped": skipped }))
 }
 
 async fn down_all() -> Result<Value> {
@@ -230,6 +300,9 @@ async fn run(command: Command) -> Result<Value> {
             adapter_of(&name).await?.call(&name, &method, params, from.as_deref()).await
         }
         Command::Selftest { name } => to_value(adapter_of(&name).await?.selftest(&name).await),
+        Command::Pull { engine } => pull(engine.as_deref()).await,
+        Command::Engines => engines().await,
+        Command::Prune => prune().await,
         Command::Install { dir } => install::install(dir),
     }
 }
