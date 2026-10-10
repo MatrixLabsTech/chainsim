@@ -115,12 +115,7 @@ impl<'a> Control<'a> {
     /// output. The host goes too: some providers put the key in a subdomain,
     /// and curl names the host on its own.
     pub fn scrub_secret(&self, s: &str) -> String {
-        let Some(secret) = self.secret.as_deref().filter(|x| !x.is_empty()) else { return s.to_string() };
-        let s = s.replace(secret, "<upstream>");
-        match url_host(secret) {
-            Some(host) => s.replace(host, "<upstream host>"),
-            None => s,
-        }
+        scrub_secret(self.secret.as_deref(), s)
     }
 
     /// Removes the upstream URL, its host, and any other http(s) URL from a message.
@@ -164,6 +159,16 @@ pub fn redact_urls(s: &str) -> String {
                 rest = &tail[end..];
             }
         }
+    }
+}
+
+/// Removes `secret` (the provider URL) and its host from `s`.
+fn scrub_secret(secret: Option<&str>, s: &str) -> String {
+    let Some(secret) = secret.filter(|x| !x.is_empty()) else { return s.to_string() };
+    let s = s.replace(secret, "<upstream>");
+    match url_host(secret) {
+        Some(host) => s.replace(host, "<upstream host>"),
+        None => s,
     }
 }
 
@@ -214,6 +219,16 @@ mod tests {
         assert_eq!(url_host("https://abc123.quiknode.pro/KEY/"), Some("abc123.quiknode.pro"));
         assert_eq!(url_host("http://u:p@127.0.0.1:9/v2/K"), Some("127.0.0.1"));
         assert_eq!(url_host("nope"), None);
+    }
+
+    #[test]
+    fn scrubs_the_bare_provider_host() {
+        let secret = Some("https://key123.chainsim-unreachable.invalid/v2/K");
+        let msg = "curl: (6) Could not resolve host: key123.chainsim-unreachable.invalid";
+        assert_eq!(redact_urls(&scrub_secret(secret, msg)), "curl: (6) Could not resolve host: <upstream host>");
+        let msg = "failed https://key123.chainsim-unreachable.invalid/v2/K: boom";
+        assert_eq!(scrub_secret(secret, msg), "failed <upstream>: boom");
+        assert_eq!(scrub_secret(None, msg), msg);
     }
 
     #[test]
