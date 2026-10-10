@@ -88,7 +88,7 @@ enum Command {
     Selftest { name: String },
 }
 
-/// The adapter for a profile family. The `sui` arm lands once chainsim-sui exposes its adapter (phase 1b).
+/// The adapter for a profile family.
 async fn adapter(family: &str) -> Result<Box<dyn Adapter>> {
     match family {
         "evm" => Ok(Box::new(EvmAdapter::connect().await?)),
