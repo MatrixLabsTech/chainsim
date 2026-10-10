@@ -28,6 +28,7 @@
     "The engine is Foundry anvil v1.8.5. Blocks are mined on demand, not every 12 seconds, and there is no beacon chain, blob data or MEV.",
     "Accounts and storage the copy has not written are read from the upstream RPC at the fork block on first access, so the first read of each account is slower and depends on the upstream's rate limit.",
     "The default upstream is a public endpoint that rate-limits bursts. Set CHAINSIM_ETHEREUM_MAINNET_RPC to a provider URL for heavier runs.",
-    "App indexers and explorers read the public chain, so they do not show what happens on the copy."
+    "App indexers and explorers read the public chain, so they do not show what happens on the copy.",
+    "An old --block needs an archive upstream: the default public endpoint is not guaranteed to keep old state, so set CHAINSIM_ETHEREUM_MAINNET_RPC to an archive provider URL to fork far behind the head."
   ]
 }

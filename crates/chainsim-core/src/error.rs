@@ -133,3 +133,23 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// `error.next` for an upstream failure (exit 5). It names the variable that
+/// takes a provider URL, never its value. Without the name (a caller that has
+/// no profile) it points at `describe`.
+pub fn upstream_next(env: Option<&str>, rate_limited: bool) -> String {
+    let set = match env {
+        Some(env) => format!("export {env}=<provider URL>"),
+        None => "set the chain's upstream env variable (chainsim describe <chain>) to a provider URL".to_string(),
+    };
+    if rate_limited {
+        format!("retry later, or {set} for a higher rate limit")
+    } else {
+        format!("retry, or {set}")
+    }
+}
+
+/// `error.next` when a fork point is older than the upstream keeps state for.
+pub fn archive_next(env: &str) -> String {
+    format!("an old --block needs an archive upstream: export {env}=<archive provider URL>, or drop --block to fork at the head")
+}

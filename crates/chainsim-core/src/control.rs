@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::docker::{Docker, UPSTREAM_ENV};
-use crate::error::{Error, ErrorCode, Result};
+use crate::error::{upstream_next, Error, ErrorCode, Result};
 
 /// Where a call goes.
 #[derive(Debug, Clone)]
@@ -27,6 +27,8 @@ pub struct Control<'a> {
     pub container: String,
     /// The upstream URL, only to scrub it from messages.
     pub secret: Option<String>,
+    /// The profile's upstream variable, named in `error.next` on exit 5.
+    pub env: Option<String>,
 }
 
 /// A raw HTTP answer from the control path.
@@ -38,7 +40,13 @@ pub struct Reply {
 
 impl<'a> Control<'a> {
     pub fn new(docker: &'a Docker, container: impl Into<String>, secret: Option<String>) -> Self {
-        Self { docker, container: container.into(), secret }
+        Self { docker, container: container.into(), secret, env: None }
+    }
+
+    /// Names the profile's upstream variable in exit-5 advice.
+    pub fn with_env(mut self, env: impl Into<String>) -> Self {
+        self.env = Some(env.into());
+        self
     }
 
     /// POSTs a JSON body to the target and returns the HTTP status and body.
@@ -71,7 +79,7 @@ impl<'a> Control<'a> {
             let what = if upstream { "upstream" } else { "engine" };
             let mut e = Error::new(code, format!("{what} call failed (curl exit {}): {msg}", out.exit_code));
             if code == ErrorCode::UpstreamUnavailable {
-                e = e.next("retry, or set the profile's upstream env variable to a provider URL (chainsim describe <chain>)");
+                e = e.next(upstream_next(self.env.as_deref(), false));
             }
             return Err(e);
         }
@@ -85,48 +93,53 @@ impl<'a> Control<'a> {
         let reply = self.post(target, &body, timeout).await?;
         let upstream = matches!(target, Target::Upstream);
         if reply.status == 429 {
-            return Err(Error::new(ErrorCode::RateLimited, format!("{method}: rate limited (HTTP 429)")).next("retry later, or set the profile's upstream env variable to a provider URL"));
+            return Err(Error::new(ErrorCode::RateLimited, format!("{method}: rate limited (HTTP 429)")).next(upstream_next(self.env.as_deref(), true)));
         }
         let v: Value = serde_json::from_str(&reply.body).map_err(|_| {
             let code = if upstream || reply.status >= 500 { ErrorCode::UpstreamUnavailable } else { ErrorCode::EngineFailed };
-            Error::new(code, format!("{method}: HTTP {} with a body that is not JSON-RPC", reply.status))
+            let e = Error::new(code, format!("{method}: HTTP {} with a body that is not JSON-RPC", reply.status));
+            if code == ErrorCode::UpstreamUnavailable {
+                e.next(upstream_next(self.env.as_deref(), false))
+            } else {
+                e
+            }
         })?;
         if let Some(err) = v.get("error") {
             let message = self.scrub(err.get("message").and_then(Value::as_str).unwrap_or("error"));
-            return Err(classify_rpc_error(method, &message, err.get("code").and_then(Value::as_i64)));
+            return Err(classify_rpc_error(method, &message, err.get("code").and_then(Value::as_i64), self.env.as_deref()));
         }
         Ok(v.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    /// Removes the provider URL, and nothing else, from engine output.
+    /// Removes the provider URL and its host, and nothing else, from engine
+    /// output. The host goes too: some providers put the key in a subdomain,
+    /// and curl names the host on its own.
     pub fn scrub_secret(&self, s: &str) -> String {
-        match self.secret.as_deref().filter(|x| !x.is_empty()) {
-            Some(secret) => s.replace(secret, "<upstream>"),
-            None => s.to_string(),
+        let Some(secret) = self.secret.as_deref().filter(|x| !x.is_empty()) else { return s.to_string() };
+        let s = s.replace(secret, "<upstream>");
+        match url_host(secret) {
+            Some(host) => s.replace(host, "<upstream host>"),
+            None => s,
         }
     }
 
-    /// Removes the upstream URL and any other http(s) URL from a message.
+    /// Removes the upstream URL, its host, and any other http(s) URL from a message.
     pub fn scrub(&self, s: &str) -> String {
-        let mut s = s.to_string();
-        if let Some(secret) = self.secret.as_deref().filter(|x| !x.is_empty()) {
-            s = s.replace(secret, "<upstream>");
-        }
-        redact_urls(&s)
+        redact_urls(&self.scrub_secret(s))
     }
 }
 
 /// Maps an engine's JSON-RPC error to the contract's codes. Upstream trouble
 /// surfaces through the engine as text, so it is matched on the message.
-pub fn classify_rpc_error(method: &str, message: &str, code: Option<i64>) -> Error {
+pub fn classify_rpc_error(method: &str, message: &str, code: Option<i64>, env: Option<&str>) -> Error {
     let lower = message.to_lowercase();
     let rpc_code = code.map(|c| format!(" ({c})")).unwrap_or_default();
     if lower.contains("429") || lower.contains("rate limit") || lower.contains("too many requests") || code == Some(-32005) {
-        return Error::new(ErrorCode::RateLimited, format!("{method}: {message}{rpc_code}")).next("retry later, or set the profile's upstream env variable to a provider URL");
+        return Error::new(ErrorCode::RateLimited, format!("{method}: {message}{rpc_code}")).next(upstream_next(env, true));
     }
     let upstream_words = ["error sending request", "failed to get", "timed out", "timeout", "connection", "fork", "upstream", "-32014"];
     if upstream_words.iter().any(|w| lower.contains(w)) && !lower.contains("revert") {
-        return Error::new(ErrorCode::UpstreamUnavailable, format!("{method}: {message}{rpc_code}")).next("retry, or set the profile's upstream env variable to a provider URL");
+        return Error::new(ErrorCode::UpstreamUnavailable, format!("{method}: {message}{rpc_code}")).next(upstream_next(env, false));
     }
     Error::new(ErrorCode::RpcError, format!("{method}: {message}{rpc_code}"))
 }
@@ -154,6 +167,15 @@ pub fn redact_urls(s: &str) -> String {
     }
 }
 
+/// The host of a URL, without user info or port.
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host.split(':').next()?;
+    (!host.is_empty()).then_some(host)
+}
+
 /// Quotes one argument for `sh -c`.
 pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -172,9 +194,26 @@ mod tests {
 
     #[test]
     fn classifies() {
-        assert_eq!(classify_rpc_error("m", "HTTP 429 Too Many Requests", None).code, ErrorCode::RateLimited);
-        assert_eq!(classify_rpc_error("m", "error sending request for url", None).code, ErrorCode::UpstreamUnavailable);
-        assert_eq!(classify_rpc_error("m", "execution reverted", Some(3)).code, ErrorCode::RpcError);
+        assert_eq!(classify_rpc_error("m", "HTTP 429 Too Many Requests", None, None).code, ErrorCode::RateLimited);
+        assert_eq!(classify_rpc_error("m", "error sending request for url", None, None).code, ErrorCode::UpstreamUnavailable);
+        assert_eq!(classify_rpc_error("m", "execution reverted", Some(3), None).code, ErrorCode::RpcError);
+    }
+
+    #[test]
+    fn exit_5_next_names_the_profile_variable() {
+        let env = Some("CHAINSIM_ARC_MAINNET_RPC");
+        let rate = classify_rpc_error("m", "HTTP 429 Too Many Requests", None, env);
+        assert_eq!(rate.next.as_deref(), Some("retry later, or export CHAINSIM_ARC_MAINNET_RPC=<provider URL> for a higher rate limit"));
+        let down = classify_rpc_error("m", "error sending request for url", None, env);
+        assert_eq!(down.next.as_deref(), Some("retry, or export CHAINSIM_ARC_MAINNET_RPC=<provider URL>"));
+        assert_eq!(down.code.exit_code(), 5);
+    }
+
+    #[test]
+    fn hosts() {
+        assert_eq!(url_host("https://abc123.quiknode.pro/KEY/"), Some("abc123.quiknode.pro"));
+        assert_eq!(url_host("http://u:p@127.0.0.1:9/v2/K"), Some("127.0.0.1"));
+        assert_eq!(url_host("nope"), None);
     }
 
     #[test]

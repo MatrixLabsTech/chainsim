@@ -48,6 +48,7 @@ impl Adapter for Fake {
             ws_url: None,
             host_rpc_url: None,
             dev_accounts: None,
+            upstream: profile.upstream_info(),
             limits: profile.limits.clone(),
         };
         forks.insert(req.name.clone(), fork.clone());

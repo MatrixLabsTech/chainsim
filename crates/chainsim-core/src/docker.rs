@@ -103,6 +103,7 @@ impl ForkHandle {
             ws_url: profile.ports.ws.map(|p| format!("ws://{}:{p}", self.alias)),
             host_rpc_url: self.host_port.map(|p| format!("http://127.0.0.1:{p}")),
             dev_accounts,
+            upstream: profile.upstream_info(),
             limits: profile.limits.clone(),
         }
     }

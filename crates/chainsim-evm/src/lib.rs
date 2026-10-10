@@ -15,6 +15,7 @@ use chainsim_core::docker::{self, ContainerSpec, Docker, ForkHandle, UPSTREAM_EN
 use chainsim_core::fork::*;
 use chainsim_core::lock::EngineLock;
 use chainsim_core::profile::{self, Profile, Token, Warmup};
+use chainsim_core::error::{archive_next, upstream_next};
 use chainsim_core::{Adapter, Error, ErrorCode, Result};
 use serde_json::{json, Value};
 
@@ -149,6 +150,21 @@ struct FundToken {
     native_view: bool,
 }
 
+/// An `up --block` failure that reads like missing history: the upstream is
+/// not an archive node. Upstream failures (exit 5) on an old block get the
+/// same advice, since a pruned node often answers with a generic error.
+pub fn archive_hint(e: Error, profile: &Profile) -> Error {
+    let lower = e.message.to_lowercase();
+    let history = ["missing trie node", "pruned", "historical state", "header not found", "state not available", "state is not available", "archive", "unknown block", "state histories"];
+    if history.iter().any(|w| lower.contains(w)) {
+        return Error { code: ErrorCode::UpstreamUnavailable, next: Some(archive_next(&profile.upstream.env)), ..e };
+    }
+    if e.code.exit_code() == 5 {
+        return Error { next: Some(archive_next(&profile.upstream.env)), ..e };
+    }
+    e
+}
+
 impl EvmAdapter {
     pub async fn connect() -> Result<Self> {
         Ok(Self { docker: Docker::connect().await?, lock: EngineLock::embedded()? })
@@ -160,7 +176,7 @@ impl EvmAdapter {
 
     fn engine<'a>(&'a self, handle: &ForkHandle, profile: &Profile) -> Engine<'a> {
         let secret = profile.upstream_is_secret().then(|| profile.upstream_url());
-        Engine { control: Control::new(&self.docker, handle.control_container.clone(), secret), url: Target::Engine(handle.rpc_url(profile)) }
+        Engine { control: Control::new(&self.docker, handle.control_container.clone(), secret).with_env(&profile.upstream.env), url: Target::Engine(handle.rpc_url(profile)) }
     }
 
     /// The fork, its profile, and a running engine, or an error an agent can act on.
@@ -180,9 +196,9 @@ impl EvmAdapter {
         let lower = log.to_lowercase();
         let tail: String = log.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
         if lower.contains("429") || lower.contains("rate limit") || lower.contains("too many requests") {
-            Error::new(ErrorCode::RateLimited, format!("the upstream rate-limited the engine at startup: {tail}")).next("retry later, or set the profile's upstream env variable to a provider URL")
+            Error::new(ErrorCode::RateLimited, format!("the upstream rate-limited the engine at startup: {tail}")).next(upstream_next(control.env.as_deref(), true))
         } else if lower.contains("fork") || lower.contains("error sending request") || lower.contains("failed to") || lower.contains("connect") {
-            Error::new(ErrorCode::UpstreamUnavailable, format!("the engine could not fork from the upstream: {tail}")).next("check the upstream, or set the profile's upstream env variable to a provider URL (chainsim describe <chain>)")
+            Error::new(ErrorCode::UpstreamUnavailable, format!("the engine could not fork from the upstream: {tail}")).next(upstream_next(control.env.as_deref(), false))
         } else {
             Error::new(ErrorCode::EngineFailed, format!("the engine did not start: {tail}"))
         }
@@ -208,7 +224,7 @@ impl EvmAdapter {
         let alias = req.alias.clone().unwrap_or_else(|| name.clone());
 
         self.docker.run_control(&self.lock, profile.control_engine(), name, &network, &upstream).await?;
-        let control = Control::new(&self.docker, docker::control_container(name), secret);
+        let control = Control::new(&self.docker, docker::control_container(name), secret).with_env(&profile.upstream.env);
 
         // The fork point: the asked block, or the upstream head now, so the
         // label records the exact block.
@@ -520,7 +536,7 @@ impl Adapter for EvmAdapter {
             Ok(fork) => Ok(fork),
             Err(e) => {
                 let _ = self.docker.remove_fork(&req.name).await;
-                Err(e)
+                Err(if req.block.is_some() { archive_hint(e, profile) } else { e })
             }
         }
     }
@@ -658,6 +674,18 @@ impl Adapter for EvmAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_block_failures_point_at_an_archive_upstream() {
+        let p = profile::get("ethereum-mainnet").unwrap();
+        let want = "an old --block needs an archive upstream: export CHAINSIM_ETHEREUM_MAINNET_RPC=<archive provider URL>, or drop --block to fork at the head";
+        let e = archive_hint(Error::new(ErrorCode::RpcError, "eth_getBalance: missing trie node abc"), &p);
+        assert_eq!((e.code, e.next.as_deref()), (ErrorCode::UpstreamUnavailable, Some(want)));
+        let e = archive_hint(Error::new(ErrorCode::UpstreamUnavailable, "the engine could not fork").next("x"), &p);
+        assert_eq!(e.next.as_deref(), Some(want));
+        let e = archive_hint(Error::new(ErrorCode::NameConflict, "taken"), &p);
+        assert_eq!(e.code, ErrorCode::NameConflict);
+    }
 
     #[test]
     fn anvil_command_keeps_the_upstream_in_the_environment() {

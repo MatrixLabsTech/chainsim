@@ -29,6 +29,7 @@
     "The engine is Circle's arc-foundry v0.8.0-2 (anvil 1.7.1-dev), which runs Arc's own USDC system contract and precompiles. It is built on an older Foundry than v1.8.5, so some newer anvil RPC methods may be missing.",
     "Accounts and storage the copy has not written are read from the upstream RPC at the fork block on first access, so the first read of each account is slower and depends on the upstream's rate limit.",
     "The --gas-limit and --disable-block-gas-limit options are not available, and there are no blob transactions.",
-    "App indexers and explorers read the public chain, so they do not show what happens on the copy."
+    "App indexers and explorers read the public chain, so they do not show what happens on the copy.",
+    "An old --block needs an archive upstream: the default public endpoint is not guaranteed to keep old state, so set CHAINSIM_ARC_MAINNET_RPC to an archive provider URL to fork far behind the head."
   ]
 }

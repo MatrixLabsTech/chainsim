@@ -14,6 +14,16 @@ pub struct ForkPoint {
     pub number: u64,
 }
 
+/// Where a fork reads mainnet state: the public default and the variable
+/// that overrides it. The variable's value is never shown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UpstreamInfo {
+    pub default: String,
+    pub env: String,
+    /// True when the variable is set, so the fork reads from a provider.
+    pub set: bool,
+}
+
 /// What `up` returns and every later step reads.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +46,7 @@ pub struct Fork {
     pub host_rpc_url: Option<String>,
     /// Unlocked accounts on the engine (EVM).
     pub dev_accounts: Option<Vec<String>>,
+    pub upstream: UpstreamInfo,
     /// What differs from the real chain, word for word from the profile.
     pub limits: Vec<String>,
 }

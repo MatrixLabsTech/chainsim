@@ -133,6 +133,11 @@ impl Profile {
         std::env::var(&self.upstream.env).is_ok_and(|v| !v.trim().is_empty())
     }
 
+    /// The upstream as `describe` and the fork object show it.
+    pub fn upstream_info(&self) -> crate::fork::UpstreamInfo {
+        crate::fork::UpstreamInfo { default: self.upstream.default.clone(), env: self.upstream.env.clone(), set: self.upstream_is_secret() }
+    }
+
     pub fn control_engine(&self) -> &str {
         self.control.as_deref().unwrap_or(crate::lock::CONTROL_ENGINE)
     }
