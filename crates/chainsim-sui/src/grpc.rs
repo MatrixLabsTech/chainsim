@@ -17,6 +17,13 @@ pub struct Grpc<'a> {
     pub target: String,
     /// A provider URL from the environment, only to scrub it from messages.
     pub secret: Option<String>,
+    /// The profile's upstream variable, named in `next` on upstream failures.
+    pub upstream_env: String,
+}
+
+/// The `next` for an upstream failure (exit 5): the variable to set, never its value.
+pub fn upstream_next(upstream_env: &str) -> String {
+    format!("retry, or set {upstream_env} to a provider GraphQL URL; the public endpoint rate-limits heavy runs (chainsim describe sui-mainnet)")
 }
 
 impl<'a> Grpc<'a> {
@@ -40,7 +47,7 @@ impl<'a> Grpc<'a> {
             }
             return serde_json::from_str(text).map_err(|_| Error::new(ErrorCode::EngineFailed, format!("{method}: the reply is not JSON")));
         }
-        Err(classify(method, out.exit_code, &self.scrub(&out.stderr)))
+        Err(classify(method, out.exit_code, &self.scrub(&out.stderr), &self.upstream_env))
     }
 
     /// True when `grpc.health.v1.Health/Check` answers SERVING.
@@ -65,13 +72,13 @@ impl<'a> Grpc<'a> {
         let script = format!("exec wget -q -O - -T {} --header 'content-type: application/json' --post-data \"$1\" \"${UPSTREAM_ENV}\"", timeout.as_secs().max(1));
         let argv: Vec<String> = vec!["sh".into(), "-c".into(), script, "sh".into(), body];
         let out = self.docker.exec(&self.container, &argv).await?;
-        let next = "retry, or set the profile's upstream env variable to a provider URL (chainsim describe <chain>)";
+        let next = upstream_next(&self.upstream_env);
         if out.exit_code != 0 {
             let msg = self.scrub(out.stderr.trim());
             let code = if msg.contains("429") { ErrorCode::RateLimited } else { ErrorCode::UpstreamUnavailable };
-            return Err(Error::new(code, format!("upstream GraphQL failed (wget exit {}): {msg}", out.exit_code)).next(next));
+            return Err(Error::new(code, format!("upstream GraphQL failed (wget exit {}): {msg}", out.exit_code)).next(next.clone()));
         }
-        let v: Value = serde_json::from_str(out.stdout.trim()).map_err(|_| Error::new(ErrorCode::UpstreamUnavailable, "upstream GraphQL reply is not JSON").next(next))?;
+        let v: Value = serde_json::from_str(out.stdout.trim()).map_err(|_| Error::new(ErrorCode::UpstreamUnavailable, "upstream GraphQL reply is not JSON").next(next.clone()))?;
         if let Some(errors) = v.get("errors").filter(|e| e.as_array().is_some_and(|a| !a.is_empty())) {
             return Err(Error::new(ErrorCode::UpstreamUnavailable, format!("upstream GraphQL error: {}", self.scrub(&errors.to_string()))).next(next));
         }
@@ -79,28 +86,46 @@ impl<'a> Grpc<'a> {
     }
 
     pub fn scrub(&self, s: &str) -> String {
-        let mut s = s.to_string();
-        if let Some(secret) = self.secret.as_deref().filter(|x| !x.is_empty()) {
-            s = s.replace(secret, "<upstream>");
-        }
-        redact_urls(&s)
+        scrub(s, self.secret.as_deref())
     }
+}
+
+/// Removes a provider URL and its host from a message, then every other URL.
+pub fn scrub(s: &str, secret: Option<&str>) -> String {
+    let mut s = s.to_string();
+    if let Some(secret) = secret.filter(|x| !x.is_empty()) {
+        s = s.replace(secret, "<upstream>");
+        // Tools such as wget name only the host, and a provider may put its key there.
+        if let Some(host) = url_host(secret) {
+            s = s.replace(host, "<upstream-host>");
+        }
+    }
+    redact_urls(&s)
+}
+
+/// The host of a URL, without scheme, credentials, port or path.
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host.split(':').next()?;
+    (!host.is_empty()).then_some(host)
 }
 
 /// Maps a failed grpcurl run to the contract's codes. grpcurl exits with
 /// 64 plus the gRPC status code when the server answered with an error, and
 /// with 1 when it could not reach the server or build the request.
-pub fn classify(method: &str, exit_code: i64, stderr: &str) -> Error {
+pub fn classify(method: &str, exit_code: i64, stderr: &str, upstream_env: &str) -> Error {
     let message = stderr.lines().find_map(|l| l.trim().strip_prefix("Message: ")).unwrap_or(stderr.trim());
     match exit_code {
         // ResourceExhausted
-        72 => Error::new(ErrorCode::RateLimited, format!("{method}: {message}")).next("retry later, or set the profile's upstream env variable to a provider URL"),
+        72 => Error::new(ErrorCode::RateLimited, format!("{method}: {message}")).next(upstream_next(upstream_env)),
         // Unavailable, DeadlineExceeded
         78 | 68 => Error::new(ErrorCode::EngineFailed, format!("{method}: {message}")).next("chainsim status <name>; if the engine stopped, chainsim down <name> then chainsim up <chain>"),
         c if c > 64 => {
             let lower = message.to_lowercase();
             if lower.contains("error sending request") || lower.contains("graphql") || lower.contains("upstream") {
-                Error::new(ErrorCode::UpstreamUnavailable, format!("{method}: {message}")).next("retry, or set the profile's upstream env variable to a provider URL")
+                Error::new(ErrorCode::UpstreamUnavailable, format!("{method}: {message}")).next(upstream_next(upstream_env))
             } else {
                 Error::new(ErrorCode::RpcError, format!("{method}: {message}"))
             }
@@ -132,13 +157,25 @@ mod tests {
     #[test]
     fn classifies_grpcurl_exits() {
         let not_found = "ERROR:\n  Code: NotFound\n  Message: Object 0x1234 not found\n";
-        let e = classify("m", 69, not_found);
+        let e = classify("m", 69, not_found, "ENV");
         assert_eq!(e.code, ErrorCode::RpcError);
         assert_eq!(e.message, "m: Object 0x1234 not found");
-        assert_eq!(classify("m", 72, "ERROR:\n  Code: ResourceExhausted\n  Message: slow down").code, ErrorCode::RateLimited);
-        assert_eq!(classify("m", 78, "").code, ErrorCode::EngineFailed);
-        assert_eq!(classify("m", 1, "Failed to dial target host \"sui:9001\": connection refused").code, ErrorCode::EngineFailed);
-        assert_eq!(classify("m", 1, "service \"x\" does not include a method named \"NoSuch\"").code, ErrorCode::Usage);
+        let limited = classify("m", 72, "ERROR:\n  Code: ResourceExhausted\n  Message: slow down", "ENV");
+        assert_eq!(limited.code, ErrorCode::RateLimited);
+        assert!(limited.next.as_deref().is_some_and(|n| n.contains("set ENV to a provider")), "{limited:?}");
+        let upstream = classify("m", 77, "ERROR:\n  Code: Internal\n  Message: error sending request for url", "ENV");
+        assert_eq!(upstream.code, ErrorCode::UpstreamUnavailable);
+        assert!(upstream.next.as_deref().is_some_and(|n| n.contains("ENV")));
+        assert_eq!(classify("m", 78, "", "ENV").code, ErrorCode::EngineFailed);
+        assert_eq!(classify("m", 1, "Failed to dial target host \"sui:9001\": connection refused", "ENV").code, ErrorCode::EngineFailed);
+        assert_eq!(classify("m", 1, "service \"x\" does not include a method named \"NoSuch\"", "ENV").code, ErrorCode::Usage);
+    }
+
+    #[test]
+    fn scrub_hides_the_provider_host() {
+        assert_eq!(url_host("https://k3y.sui.example.com:443/graphql?x=1"), Some("k3y.sui.example.com"));
+        assert_eq!(url_host("https://u:p@h.example/x"), Some("h.example"));
+        assert_eq!(scrub("wget: bad address 'k3y.sui.example.com'", Some("https://k3y.sui.example.com/graphql")), "wget: bad address '<upstream-host>'");
     }
 
     #[test]
