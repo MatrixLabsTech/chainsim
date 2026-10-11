@@ -1,4 +1,6 @@
-# <img src="../../assets/chains/ethereum.svg" height="40" alt=""> Ethereum mainnet
+<p align="center"><img src="../../assets/chains/ethereum.svg" height="96" alt="Ethereum"></p>
+
+# Ethereum mainnet
 
 `ethereum-mainnet` forks Ethereum mainnet with stock Foundry anvil. It is the reference EVM
 chain: what this page says about `fund`, `send`, `set` and `selftest` also holds for Arc and

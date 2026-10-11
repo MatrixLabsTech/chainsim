@@ -12,6 +12,16 @@ needs a different engine with its own flags, readiness signal and funding method
 them behind one CLI, so `up`, `fund`, `snapshot`, `revert`, `send` and `down` work the same way
 on every supported chain.
 
+<p align="center">
+  <a href="chains/ethereum/README.md"><img src="assets/chains/ethereum.svg" height="48" alt="Ethereum"></a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="chains/arc/README.md"><img src="assets/chains/arc.svg" height="48" alt="Arc"></a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="chains/robinhood/README.md"><img src="assets/chains/robinhood-chain.png" height="48" alt="Robinhood Chain"></a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="chains/sui/README.md"><img src="assets/chains/sui.svg" height="48" alt="Sui"></a>
+</p>
+
 ## Features
 
 - One CLI for Ethereum, Arc, Robinhood Chain and Sui mainnet forks, each running in Docker.
@@ -95,12 +105,12 @@ The full contract, with every error code, is in [docs/agent-contract.md](docs/ag
 
 ## Supported chains
 
-| | Chain | Maturity | Engine |
+| Chain | Maturity | Engine | Details |
 | --- | --- | --- | --- |
-| <img src="assets/chains/ethereum.svg" height="20" alt="Ethereum"> | [Ethereum mainnet](chains/ethereum/README.md) | stable | Foundry anvil v1.8.5 |
-| <img src="assets/chains/arc.svg" height="20" alt="Arc"> | [Arc mainnet](chains/arc/README.md) | stable | Circle arc-foundry v0.8.0-2 |
-| <img src="assets/chains/robinhood-chain.png" height="20" alt="Robinhood Chain"> | [Robinhood Chain mainnet](chains/robinhood/README.md) | stable | Foundry anvil v1.8.5 with an ArbGasInfo mock |
-| <img src="assets/chains/sui.svg" height="20" alt="Sui"> | [Sui mainnet](chains/sui/README.md) | experimental | Mysten sui-fork, mainnet-v1.81.1 |
+| <img src="assets/chains/ethereum.svg" height="32" alt="Ethereum"> &nbsp;**Ethereum mainnet** | stable | Foundry anvil v1.8.5 | [chains/ethereum](chains/ethereum/README.md) |
+| <img src="assets/chains/arc.svg" height="32" alt="Arc"> &nbsp;**Arc mainnet** | stable | Circle arc-foundry v0.8.0-2 | [chains/arc](chains/arc/README.md) |
+| <img src="assets/chains/robinhood-chain.png" height="32" alt="Robinhood Chain"> &nbsp;**Robinhood Chain mainnet** | stable | Foundry anvil v1.8.5 with an ArbGasInfo mock | [chains/robinhood](chains/robinhood/README.md) |
+| <img src="assets/chains/sui.svg" height="32" alt="Sui"> &nbsp;**Sui mainnet** | experimental | Mysten sui-fork, mainnet-v1.81.1 | [chains/sui](chains/sui/README.md) |
 
 The chain logos are trademarks of their owners and identify the chains only.
 

@@ -1,4 +1,6 @@
-# <img src="../../assets/chains/arc.svg" height="40" alt=""> Arc mainnet
+<p align="center"><img src="../../assets/chains/arc.svg" height="96" alt="Arc"></p>
+
+# Arc mainnet
 
 `arc-mainnet` forks Arc, Circle's L1 where USDC is the gas token. Stock anvil cannot run Arc's
 USDC system contract, so chainsim runs Circle's own arc-foundry build of anvil, which does.
