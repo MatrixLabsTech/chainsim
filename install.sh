@@ -1,12 +1,15 @@
 #!/bin/sh
-# Install the chainsim CLI from a release.
+# Install the chainsim CLI from a GitHub release.
 #
-#   sh install.sh --from dist            # artifacts from scripts/release.sh
-#   sh install.sh --version v0.1.0       # a GitHub release, through gh (the repo is private)
-#   sh install.sh                        # the latest GitHub release
+#   curl -fsSL https://raw.githubusercontent.com/MatrixLabsTech/chainsim/main/install.sh | sh
+#   curl -fsSL .../install.sh | sh -s -- --version v0.1.0
+#   sh install.sh --from dist        # archives built by scripts/release.sh
+#   sh install.sh --gh               # download through the GitHub CLI instead of curl
 #
-# Options: --dir <bin dir> (default $CHAINSIM_BIN_DIR, else ~/.local/bin).
-# Then run `chainsim install` to add the plugin to Claude Code and Codex.
+# Options: --version <tag> (default: the latest release), --dir <bin dir>
+# (default $CHAINSIM_BIN_DIR, else ~/.local/bin). CHAINSIM_RELEASE_URL replaces
+# the release download URL, for a mirror.
+# Then run `chainsim doctor` to check the setup.
 
 set -eu
 
@@ -14,12 +17,14 @@ repo=MatrixLabsTech/chainsim
 bin_dir=${CHAINSIM_BIN_DIR:-$HOME/.local/bin}
 from=""
 version=""
-usage() { echo "usage: install.sh [--from <dist dir> | --version <tag>] [--dir <bin dir>]" >&2; exit 2; }
+use_gh=""
+usage() { echo "usage: install.sh [--version <tag>] [--from <dist dir>] [--gh] [--dir <bin dir>]" >&2; exit 2; }
 while [ $# -gt 0 ]; do
     case $1 in
         --from) [ $# -ge 2 ] || usage; from=$2; shift 2 ;;
         --version) [ $# -ge 2 ] || usage; version=$2; shift 2 ;;
         --dir) [ $# -ge 2 ] || usage; bin_dir=$2; shift 2 ;;
+        --gh) use_gh=1; shift ;;
         *) usage ;;
     esac
 done
@@ -41,11 +46,27 @@ trap 'rm -rf "$tmp"' EXIT
 if [ -n "$from" ]; then
     [ -f "$from/$name" ] || { echo "chainsim: $from/$name not found; build it with scripts/release.sh" >&2; exit 1; }
     cp "$from/$name" "$from/checksums.txt" "$tmp/"
-else
-    command -v gh >/dev/null 2>&1 || { echo "chainsim: the repo is private, so a GitHub install needs gh (https://cli.github.com) logged in" >&2; exit 1; }
-    echo "downloading $name from $repo ${version:-latest}"
+elif [ -n "$use_gh" ]; then
+    command -v gh >/dev/null 2>&1 || { echo "chainsim: --gh needs the GitHub CLI (https://cli.github.com)" >&2; exit 1; }
+    echo "downloading $name from $repo ${version:-latest} with gh"
     # shellcheck disable=SC2086
     gh release download $version -R "$repo" -p "$name" -p checksums.txt -D "$tmp"
+else
+    command -v curl >/dev/null 2>&1 || { echo "chainsim: curl is needed to download a release" >&2; exit 1; }
+    if [ -n "${CHAINSIM_RELEASE_URL:-}" ]; then
+        base=$CHAINSIM_RELEASE_URL
+    elif [ -n "$version" ]; then
+        base=https://github.com/$repo/releases/download/$version
+    else
+        base=https://github.com/$repo/releases/latest/download
+    fi
+    echo "downloading $name from $base"
+    for f in "$name" checksums.txt; do
+        curl -fsSL -o "$tmp/$f" "$base/$f" || {
+            echo "chainsim: could not download $base/$f; check the version at https://github.com/$repo/releases" >&2
+            exit 1
+        }
+    done
 fi
 
 want=$(awk -v n="$name" '$2 == n { print $1 }' "$tmp/checksums.txt")
@@ -72,6 +93,7 @@ echo "installed chainsim ${installed:-?} to $bin_dir/chainsim"
 
 case ":$PATH:" in
     *":$bin_dir:"*) ;;
-    *) echo "note: $bin_dir is not on your PATH; add it to your shell profile" ;;
+    *) echo "note: $bin_dir is not on your PATH; add this line to your shell profile:"
+       echo "  export PATH=\"$bin_dir:\$PATH\"" ;;
 esac
-echo "next: run 'chainsim install' to add the plugin to Claude Code and Codex"
+echo "next: run 'chainsim doctor' to check Docker, the plugin and the upstreams"
