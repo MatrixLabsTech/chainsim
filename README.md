@@ -1,5 +1,8 @@
 # chainsim
 
+[![release](https://img.shields.io/github/v/release/MatrixLabsTech/chainsim)](https://github.com/MatrixLabsTech/chainsim/releases)
+[![ci](https://github.com/MatrixLabsTech/chainsim/actions/workflows/ci.yml/badge.svg)](https://github.com/MatrixLabsTech/chainsim/actions/workflows/ci.yml)
+
 chainsim runs local mainnet forks in Docker for testing. One command starts a private copy of a
 real chain that reads live mainnet state on demand, so tests can use real contracts, pools and
 tokens with test wallets and no real money. Every command prints one JSON object and exits with
@@ -36,9 +39,31 @@ Each chain has its own folder with a README on what is specific to it: engine, t
 
 ## Install
 
-chainsim needs Docker and, to build it, a Rust toolchain. Every engine runs as a pinned
-container image that chainsim pulls or builds on first use, so nothing else is installed on the
-host.
+chainsim needs Docker. Every engine runs as a pinned container image that chainsim pulls or
+builds on first use, so nothing else is installed on the host.
+
+Install the latest release on Linux (x86_64 or arm64) or macOS (Apple silicon):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/MatrixLabsTech/chainsim/main/install.sh | sh
+```
+
+The script picks the archive for the host from the
+[latest release](https://github.com/MatrixLabsTech/chainsim/releases/latest), checks its
+SHA-256 against the release's `checksums.txt`, and copies `chainsim` to `~/.local/bin`. It
+prints the line to add to your shell profile when that folder is not on `PATH`. For a given
+version, pass `sh -s -- --version v0.1.0`, and `--dir <folder>` installs elsewhere. Then check
+the setup:
+
+```sh
+chainsim doctor
+```
+
+`doctor` prints one JSON object with Docker's version, the engine images present, whether the
+plugin is installed in Claude Code and Codex, and each chain's upstream variable. It exits 1
+with `docker_unavailable` when Docker is not reachable.
+
+To build from source instead, with a Rust toolchain (1.88 or later):
 
 ```sh
 git clone https://github.com/MatrixLabsTech/chainsim
@@ -46,21 +71,34 @@ cd chainsim
 cargo install --locked --path crates/chainsim
 ```
 
-Release binaries are not published yet. `scripts/release.sh` builds the archives (Linux in
-Docker, macOS with cargo on a Mac) into `dist/`, and `sh install.sh --from dist` checks one
-against `dist/checksums.txt` and copies it to `~/.local/bin`.
+`scripts/release.sh` builds the same archives as a release (Linux in Docker, macOS with cargo
+on a Mac) into `dist/`, and `sh install.sh --from dist` installs one of them.
 
-To add the plugin to Claude Code and Codex:
+## Claude Code and Codex plugin
+
+The plugin adds a `chainsim` skill that walks an agent through the setup checks and the fork
+workflow. Install it from GitHub, with no clone. In Claude Code:
 
 ```sh
-chainsim install
+claude plugin marketplace add MatrixLabsTech/chainsim
+claude plugin install chainsim@chainsim
 ```
 
-It writes the plugin to `~/.chainsim/marketplace` (or `--dir`), adds that folder as a local
-marketplace in each CLI found on `PATH`, and prints a suggested Claude Code permission rule:
-allow `chainsim *`, but keep asking for `chainsim down --all` and `chainsim prune`. Codex's
-default sandbox blocks the Docker socket, so in Codex chainsim commands must run outside it:
-approve the escalation when Codex asks, or use a sandbox setting that allows the Docker socket.
+In Codex:
+
+```sh
+codex plugin marketplace add MatrixLabsTech/chainsim
+codex plugin add chainsim@chainsim
+```
+
+Offline, `chainsim install` writes the copy of the plugin built into the binary to
+`~/.chainsim/marketplace` (or `--dir`) and adds that folder as a local marketplace in each CLI
+found on `PATH`.
+
+`chainsim install` also prints a suggested Claude Code permission rule: allow `chainsim *`, but
+keep asking for `chainsim down --all` and `chainsim prune`. Codex's default sandbox blocks the
+Docker socket, so in Codex chainsim commands must run outside it. Approve the escalation when
+Codex asks, or use a sandbox setting that allows the Docker socket.
 
 ## Quick start
 
@@ -112,7 +150,7 @@ A fork is reachable from containers on its network. From the host, use
   `balance`, `token`, `storage`, `code` or `owner`. `chainsim describe <chain>` and the chain
   pages say which kinds each chain supports.
 - Engines: `pull [<engine>]`, `engines`, `prune`.
-- Plugin: `install`.
+- Setup: `doctor`, and `install` for the plugin.
 
 ## The agent contract
 
