@@ -7,7 +7,7 @@ Robinhood Chain unless their pages say otherwise.
 `profiles/ethereum-mainnet.json` is the source of truth for everything below. Run
 `chainsim describe ethereum-mainnet` to read it from the binary.
 
-## At a glance
+## Chain facts
 
 - Chain id: `eip155:1`. The fork keeps chain id 1.
 - Engine: `ghcr.io/foundry-rs/foundry:v1.8.5` (anvil), pinned by digest in `engines.lock.json`.

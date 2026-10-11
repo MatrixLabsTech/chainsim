@@ -41,8 +41,8 @@ socket.
 
 ## Quick start
 
-A fork of Ethereum mainnet, a funded test wallet, an admin call made without the admin's key,
-and cleanup:
+This session forks Ethereum mainnet, funds a test wallet, pauses USDC as its pauser without the
+pauser's key, and cleans up:
 
 ```sh
 chainsim describe ethereum-mainnet
@@ -93,12 +93,12 @@ A fork is reachable from containers on its network. From the host, use
 
 ## The agent contract
 
-- **One JSON object on stdout**, when stdout is not a terminal or with `--json`, even on error.
+- stdout carries one JSON object when it is not a terminal, or with `--json`, even on error.
   Logs go to stderr. The shape is `{"ok": true, "data": ...}` or
   `{"ok": false, "error": {"code", "message", "next"}, "data"?}`.
-- **`error.next`** is the command that fixes or works around the error, such as setting a
-  provider URL after a rate limit. Run it instead of guessing.
-- **Exit codes:**
+- `error.next` is the command that fixes or works around the error, such as setting a provider
+  URL after a rate limit. Run it instead of guessing.
+- Exit codes:
   - 0 ok
   - 1 error (`docker_unavailable`, `engine_failed`, `rpc_error`, `readback_mismatch`,
     `tx_reverted`, `internal`)
@@ -109,59 +109,77 @@ A fork is reachable from containers on its network. From the host, use
   - 6 selftest failed
   - 7 refused for safety (`mainnet_address`)
   - 8 conflict (`name_conflict`)
-- **Idempotent:** `up` returns a running fork of the same name and chain as is, `down` on a
-  missing fork exits 0, and `fund` sets balances to the asked amounts and reads them back.
-- **Honest limits:** `describe` and the `fork` object carry each chain's `limits`, plain
-  sentences on how the fork differs from the real chain, to copy into a report word for word.
+- Repeating a command is safe: `up` returns a running fork of the same name and chain as is,
+  `down` on a missing fork exits 0, and `fund` sets balances to the asked amounts and reads
+  them back.
+- `describe` and the `fork` object carry each chain's `limits`: plain sentences on how the fork
+  differs from the real chain, to copy into a report word for word.
 
 ## How it works
 
-- **One engine per chain family, in Docker.** EVM chains run Foundry's anvil (Arc runs Circle's
-  arc-foundry build of it), and Sui runs chainsim's patched build of `sui-fork` (see
-  [chains/sui.md](chains/sui.md)). No engine is linked into the binary. chainsim drives Docker through its API.
-- **A fork is two containers on its own network.** `up` creates the network
-  `chainsim-<name>`, the engine container, and a control sidecar (`curlimages/curl`, or
-  `fullstorydev/grpcurl` for Sui). Every engine call chainsim makes runs as a `docker exec` in
-  that sidecar, so a fork needs no host port. Docker labels on the containers are the fork
-  registry: chainsim keeps no state file.
-- **Joining a caller's network.** A test harness in containers can put the fork on its own
-  network under a host name of its choice:
+### One engine per chain family
 
-  ```sh
-  docker network create qa-net
-  chainsim up ethereum-mainnet --name eth-qa --network qa-net --alias eth
-  docker run --rm --network qa-net curlimages/curl:8.16.0 -s -H 'content-type: application/json' \
-    -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' http://eth:8545
-  chainsim down eth-qa
-  docker network rm qa-net
-  ```
+EVM chains run Foundry's anvil, and Arc runs Circle's arc-foundry build of it. Sui runs
+chainsim's patched build of `sui-fork` (see [chains/sui.md](chains/sui.md)). Each engine is a
+container. No engine is linked into the binary: chainsim drives Docker through its API.
 
-- **`--publish`** binds a free port on `127.0.0.1` only and reports it as `fork.hostRpcUrl`,
-  for a tool on the host such as `forge`, a script or a browser wallet:
+### Two containers per fork
 
-  ```sh
-  chainsim up ethereum-mainnet --name eth-host --publish
-  chainsim down eth-host
-  ```
+`up` creates the network `chainsim-<name>`, the engine container, and a control sidecar
+(`curlimages/curl`, or `fullstorydev/grpcurl` for Sui). chainsim runs every engine call as a
+`docker exec` in that sidecar, so a fork needs no host port. Docker labels on the containers
+are the fork registry: chainsim keeps no state file.
 
-- **The engine lock.** `engines.lock.json` pins every engine image by tag and digest per
-  architecture, or the source of an engine chainsim builds, such as arc-foundry's release
-  tarball and its checksum. `up` pulls or builds an engine on first use, and tags it
-  `chainsim/<engine>:<version>`. `chainsim pull`, `chainsim engines` and `chainsim prune` manage them ahead of time:
+### Joining a caller's network
 
-  ```sh
-  chainsim pull foundry
-  chainsim engines
-  ```
+A test harness in containers can put the fork on its own network under a host name of its
+choice:
 
-- **Upstreams.** Each chain reads mainnet state from a public RPC by default. For heavier runs,
-  or to fork an old block, set the chain's variable (for example
-  `CHAINSIM_ETHEREUM_MAINNET_RPC`) to a provider URL. chainsim passes it to the engine through
-  the container environment and never writes it to files, logs or output: errors scrub the
-  host. `chainsim describe <chain>` shows the variable and whether it is set.
-- **Profiles.** Each chain is one file, `profiles/<chain>.json`, embedded in the binary: chain
-  id, engine, upstream, tokens, overrides, warm-up, selftest extras and limits. Adding an EVM
-  chain is a new profile, not new code.
+```sh
+docker network create qa-net
+chainsim up ethereum-mainnet --name eth-qa --network qa-net --alias eth
+docker run --rm --network qa-net curlimages/curl:8.16.0 -s -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' http://eth:8545
+chainsim down eth-qa
+docker network rm qa-net
+```
+
+### Reaching a fork from the host
+
+`--publish` binds a free port on `127.0.0.1` only and reports it as `fork.hostRpcUrl`, for a
+tool on the host such as `forge`, a script or a browser wallet:
+
+```sh
+chainsim up ethereum-mainnet --name eth-host --publish
+chainsim down eth-host
+```
+
+### The engine lock
+
+`engines.lock.json` pins every engine image by tag and digest per architecture. For an engine
+chainsim builds, it pins the source instead, such as arc-foundry's release tarball and its
+checksum. `up` pulls or builds an engine on first use and tags it
+`chainsim/<engine>:<version>`. `chainsim pull`, `chainsim engines` and `chainsim prune` manage
+engines ahead of time:
+
+```sh
+chainsim pull foundry
+chainsim engines
+```
+
+### Upstreams
+
+Each chain reads mainnet state from a public RPC by default. For heavier runs, or to fork an
+old block, set the chain's variable (for example `CHAINSIM_ETHEREUM_MAINNET_RPC`) to a provider
+URL. chainsim passes it to the engine through the container environment and never writes it to
+files, logs or output: errors scrub the host. `chainsim describe <chain>` shows the variable and
+whether it is set.
+
+### Profiles
+
+Each chain is one file, `profiles/<chain>.json`, embedded in the binary: chain id, engine,
+upstream, tokens, overrides, warm-up, selftest extras and limits. Adding an EVM chain takes a
+new profile, not new code.
 
 ## Chains
 

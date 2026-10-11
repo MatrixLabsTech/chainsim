@@ -7,7 +7,7 @@ Everything not covered here works as on [Ethereum](ethereum.md).
 `profiles/arc-mainnet.json` is the source of truth for everything below. Run
 `chainsim describe arc-mainnet` to read it from the binary.
 
-## At a glance
+## Chain facts
 
 - Chain id: `eip155:5042`. The fork keeps chain id 5042.
 - Engine: `chainsim/arc-foundry:v0.8.0-2`, which reports `anvil 1.7.1-dev`.

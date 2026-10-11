@@ -8,7 +8,7 @@ here works as on Ethereum.
 `profiles/robinhood-mainnet.json` is the source of truth for everything below. Run
 `chainsim describe robinhood-mainnet` to read it from the binary.
 
-## At a glance
+## Chain facts
 
 - Chain id: `eip155:4663`. The fork keeps chain id 4663.
 - Engine: `ghcr.io/foundry-rs/foundry:v1.8.5` (anvil). v1.8.3 or later is needed for ArbSys.
@@ -33,9 +33,9 @@ chainsim fund robinhood-mainnet 0xd8d244aF69B839999883F9f32a68C7F184012e8a --nat
 
 ## ArbSys and the ArbGasInfo mock
 
-- **ArbSys at `0x64`** is answered by anvil itself: `arbBlockNumber()` returns the Arbitrum
-  block number, and `block.number` keeps Arbitrum semantics.
-- **ArbGasInfo at `0x6C`** reverts on stock anvil. At `up`, chainsim installs a mock there with
+- anvil itself answers ArbSys at `0x64`: `arbBlockNumber()` returns the Arbitrum block number,
+  and `block.number` keeps Arbitrum semantics.
+- ArbGasInfo at `0x6C` reverts on stock anvil. At `up`, chainsim installs a mock there with
   `anvil_setCode`, from `profiles/assets/arbgasinfo-mock.hex` (the profile's `overrides`). The
   mock returns fixed values measured on Robinhood Chain at block 85104168 on 2026-10-10, for
   example `getL1BaseFeeEstimate()` 255074 and `getMinimumGasPrice()` 20000000. Gas prices do

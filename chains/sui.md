@@ -97,12 +97,12 @@ signature list as its sender. Nothing is sent on Sui Mainnet.
 - `fund` refuses an address that owns any object on Sui Mainnet (exit 7), so you fund only fresh
   test addresses.
 - `fund --token` exits 3 on Sui. Use `set token` for tokens.
-- **The one-hour window.** `up` seeds the funder's coins into the copy's owned-object index. That
-  works only when the fork point is within about an hour of the upstream head, because the public
-  GraphQL endpoint keeps owned-object listings for about the last hour (57 minutes, measured on
-  2026-10-10). On an older `--block`, `fund` exits 3 and `next` says to fork again without
-  `--block`. No public endpoint with a longer window was found, and provider endpoints with longer
-  retention are untested.
+
+`fund` works only on a fork point within about an hour of the upstream head. `up` seeds the
+funder's coins into the copy's owned-object index, and the public GraphQL endpoint keeps
+owned-object listings for about the last hour (57 minutes, measured on 2026-10-10). On an older
+`--block`, `fund` exits 3 and `next` says to fork again without `--block`. We found no public
+endpoint with a longer window, and we have not tested provider endpoints with longer retention.
 
 ## Snapshot and revert
 
@@ -130,9 +130,9 @@ chainsim send sui-mainnet --as 0xcf5455078123a7f42f98f237301f6def64a077af7f6bdb8
 This mints 1000 units of a mainnet coin as the address that holds its TreasuryCap. The cap and its
 owner were checked on 2026-10-11. If either moves on mainnet after that, this example needs new IDs.
 
-- **Target.** `package::module::function`, with type arguments in `<...>` when the function has
-  them.
-- **Arguments.** chainsim reads the function's parameter types from the fork
+- The target is `package::module::function`, with type arguments in `<...>` when the function
+  has them.
+- chainsim reads the function's parameter types from the fork
   (`MovePackageService/GetFunction`) and encodes each argument to match:
   - integers `u8` to `u256` as decimal or `0x` hex, `bool` as `true` or `false`, and `address` and
     `ID` as `0x` hex
@@ -142,15 +142,15 @@ owner were checked on 2026-10-11. If either moves on mainnet after that, this ex
     owned and immutable objects by version and digest, and shared objects by their initial shared
     version, mutable when the parameter is `&mut` or by value.
   - leave out the trailing `&mut TxContext`, which the runtime passes.
-- **Owner check.** Before sending, chainsim checks that the sender owns every owned object it
-  passes. If not, it exits 2 with no gas spent, and `next` names the owner to use with `--as`.
-- **Raw PTB.** `--data` takes a programmable transaction as protobuf JSON,
-  `{"inputs": [...], "commands": [...]}`, instead of a Move function. An object input given by
-  `objectId` alone gets its version, digest or initial shared version from the fork. `--to` is then
-  only a label.
-- **Result.** The digest, `status`, `gasUsed` (net, computation, storage and rebate), and the
-  objects the transaction `created`, `mutated` and `deleted`, with the funder's gas coin left out.
-- **Abort.** A Move abort exits 1 with `tx_reverted`, and `data.error.abort` holds the package,
+- Before sending, chainsim checks that the sender owns every owned object it passes. If not, it
+  exits 2 with no gas spent, and `next` names the owner to use with `--as`.
+- `--data` takes a raw programmable transaction as protobuf JSON,
+  `{"inputs": [...], "commands": [...]}`, instead of a Move function. For an object input given
+  by `objectId` alone, chainsim fills in its version, digest or initial shared version from the
+  fork. `--to` is then only a label.
+- The result holds the digest, `status`, `gasUsed` (net, computation, storage and rebate), and
+  the objects the transaction `created`, `mutated` and `deleted`, without the funder's gas coin.
+- A Move abort exits 1 with `tx_reverted`, and `data.error.abort` holds the package,
   module, function, instruction and abort code. Because there is no dry run on Sui, the failed
   transaction still executes: it uses gas and bumps the versions of the shared objects it touched.
 - `--sig` and `--value` are EVM-only and exit 2 on Sui.
@@ -168,18 +168,18 @@ chainsim set sui-mainnet owner 0x89c1a321291d15ddae5a086c9abc533dff697fde3d89e0c
 
 The last line moves Cetus's CLMM `AdminCap` (checked on 2026-10-11) to `0xc0ffee` on the copy.
 
-- **balance** sets SUI exactly. It raises with a transfer from the funder, and lowers by sending
-  the excess back to the funder as the address.
-- **token** sets a coin balance. With no `--from`, it mints as the coin's TreasuryCap owner, when an
+- `set balance` sets SUI exactly. It raises a balance with a transfer from the funder, and lowers
+  one by sending the excess back to the funder as the address.
+- `set token` sets a coin balance. With no `--from`, it mints as the coin's TreasuryCap owner, when an
   address holds the cap. When the cap cannot be found or is not held by an address, as for USDC,
   it exits 3 and `next` says to name a holder with `--from <holder>`, which moves the amount out
   of that holder's coins. Lowering sends the excess to the funder.
-- **owner** transfers an object as its current owner. Only address-owned objects whose type has
+- `set owner` transfers an object as its current owner. Only address-owned objects whose type has
   `store` can move this way. Shared, immutable and object-owned objects, and types with `key` but
   not `store`, exit 3 with a reason and a `next`: such objects change only through their own
   module, with `send --as`.
-- **storage** and **code** have no meaning on Sui and exit 3.
-- **Contents.** `set` cannot write an object's fields directly. That needs a `SetObject` RPC that
+- `set storage` and `set code` have no meaning on Sui and exit 3.
+- `set` cannot write an object's fields directly. That needs a `SetObject` RPC that
   stock `sui-fork` lacks. A patch that adds it was built and measured as a dev tool on the
   research branch `stream-b3` (`research/sui-send-set/`), but chainsim does not ship it: change an
   object through its own module with `send --as` instead.
