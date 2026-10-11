@@ -1,7 +1,7 @@
 //! `chainsim install`: writes the embedded plugin to a local folder and adds
 //! it as a local-path marketplace to Claude Code and Codex (design section 9).
-//! The repo is private, so a GitHub marketplace would need git credentials on
-//! every host; the binary carries the plugin instead.
+//! It is the offline path: the binary carries the plugin, so no network is
+//! needed. Online, both CLIs also add the marketplace from GitHub.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 /// The marketplace and plugin name, in both CLIs.
 const NAME: &str = "chainsim";
 const PLUGIN: &str = "chainsim@chainsim";
-/// The fallback when a CLI refuses the local folder.
+/// The GitHub marketplace, and the fallback when a CLI refuses the local folder.
 const GITHUB: &str = "MatrixLabsTech/chainsim";
 
 /// The plugin tree, as published under `plugins/chainsim/`, plus the root marketplace.
@@ -90,6 +90,30 @@ fn register(cli: &str, dir: &str) -> std::result::Result<(), String> {
     }
 }
 
+/// Whether each CLI is on PATH and lists the plugin as installed, from its
+/// own `plugin list`. Codex also lists plugins it has not installed.
+pub fn plugin_status() -> Value {
+    let mut out = serde_json::Map::new();
+    for cli in ["claude", "codex"] {
+        let entry = if !on_path(cli) {
+            json!({ "onPath": false, "installed": false })
+        } else {
+            let listed = Command::new(cli).args(["plugin", "list"]).stdin(Stdio::null()).stderr(Stdio::null()).output();
+            match listed {
+                Ok(o) if o.status.success() => json!({ "onPath": true, "installed": lists_installed(&String::from_utf8_lossy(&o.stdout)) }),
+                _ => json!({ "onPath": true, "installed": null, "reason": format!("`{cli} plugin list` failed") }),
+            }
+        };
+        out.insert(cli.to_string(), entry);
+    }
+    Value::Object(out)
+}
+
+/// A `plugin list` line that names the plugin and does not say it is not installed.
+fn lists_installed(text: &str) -> bool {
+    text.lines().any(|l| l.contains(PLUGIN) && !l.contains("not installed"))
+}
+
 pub fn install(dir: Option<PathBuf>) -> Result<Value> {
     let dir = match dir {
         Some(d) => d,
@@ -117,7 +141,7 @@ pub fn install(dir: Option<PathBuf>) -> Result<Value> {
     if !failed.is_empty() {
         let first = failed[0];
         return Err(Error::new(ErrorCode::Internal, format!("the plugin did not install in {}", failed.join(" and ")))
-            .next(format!("{first} plugin marketplace add {GITHUB}, the GitHub install (needs git access to the repo)"))
+            .next(format!("{first} plugin marketplace add {GITHUB}, the GitHub install"))
             .data(data));
     }
     Ok(data)
@@ -131,7 +155,7 @@ mod tests {
     fn the_embedded_plugin_is_one_skill_named_chainsim() {
         let skill = FILES.iter().find(|(p, _)| p.ends_with("SKILL.md")).unwrap().1;
         assert!(skill.starts_with("---\nname: chainsim\ndescription: Local mainnet forks of Ethereum, Arc, Robinhood Chain, Solana and Sui."));
-        for word in ["chainsim describe", "chainsim up", "chainsim selftest", "chainsim fund", "chainsim snapshot", "chainsim revert", "chainsim down", "chainsim send", "--as", "chainsim set", "modifications", "error.next", "`fork`"] {
+        for word in ["chainsim doctor", "install.sh | sh", "docker_unavailable", "upstream.env", "chainsim describe", "chainsim up", "chainsim selftest", "chainsim fund", "chainsim snapshot", "chainsim revert", "chainsim down", "chainsim send", "--as", "chainsim set", "modifications", "error.next", "`fork`"] {
             assert!(skill.contains(word), "{word}");
         }
         let market: Value = serde_json::from_str(FILES[0].1).unwrap();
@@ -139,6 +163,15 @@ mod tests {
         assert_eq!(market["plugins"][0]["source"], "./plugins/chainsim");
         assert_eq!((market["name"].as_str(), plugin["name"].as_str()), (Some(NAME), Some(NAME)));
         assert_eq!(plugin["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn reads_plugin_lists_from_both_clis() {
+        // Measured output of `claude plugin list` (2.1.296) and `codex plugin list` (0.162.1).
+        assert!(lists_installed("Installed plugins:\n\n  ❯ chainsim@chainsim\n    Version: 0.1.0\n"));
+        assert!(lists_installed("PLUGIN             STATUS              VERSION  SOURCE\nchainsim@chainsim  installed, enabled  0.1.0    /root/x\n"));
+        assert!(!lists_installed("Installed plugins:\n\n  ❯ other@market\n"));
+        assert!(!lists_installed("PLUGIN             STATUS         VERSION  SOURCE\nchainsim@chainsim  not installed           /root/x\n"));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! stdout carries exactly one JSON envelope per command, even on error; logs
 //! go to stderr. The exit code says what happened (design section 9).
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 mod install;
@@ -120,6 +120,8 @@ enum Command {
     Pull { engine: Option<String> },
     /// List the lock's engines, whether each is on this host, and the chains that use it.
     Engines,
+    /// Check the setup: Docker, engines, the plugin in Claude Code and Codex, and each chain's upstream variable.
+    Doctor,
     /// Remove chainsim engine images no profile runs and fork volumes no fork owns.
     Prune,
     /// Write the chainsim plugin to a local folder and add it to Claude Code and Codex.
@@ -276,6 +278,29 @@ async fn engines() -> Result<Value> {
     Ok(json!(chainsim_core::engines::rows(&lock, &profiles, |image| present.contains(image))))
 }
 
+/// The setup in one object. Exit 1 (`docker_unavailable`) when Docker is not
+/// reachable, with the rest of the report in `data`.
+async fn doctor() -> Result<Value> {
+    let lock = EngineLock::embedded()?;
+    let profiles = profile::all()?;
+    let chains: Vec<Value> = profiles.iter().map(|p| json!({ "chain": p.key, "maturity": p.maturity, "upstream": p.upstream_info() })).collect();
+    let chainsim = json!({ "version": env!("CARGO_PKG_VERSION"), "path": std::env::current_exe().ok() });
+    let plugin = install::plugin_status();
+    let docker = match Docker::connect().await {
+        Ok(d) => d,
+        Err(e) => return Err(e.data(json!({ "docker": { "reachable": false }, "chainsim": chainsim, "plugin": plugin, "chains": chains }))),
+    };
+    let version = docker.api().version().await.ok().and_then(|v| v.version);
+    let mut present = std::collections::HashSet::new();
+    for e in lock.engines.values() {
+        if docker.image_exists(&e.reference()).await? {
+            present.insert(e.reference());
+        }
+    }
+    let engines = chainsim_core::engines::rows(&lock, &profiles, |image| present.contains(image));
+    Ok(json!({ "docker": { "reachable": true, "version": version }, "chainsim": chainsim, "engines": engines, "plugin": plugin, "chains": chains }))
+}
+
 async fn prune() -> Result<Value> {
     let lock = EngineLock::embedded()?;
     let profiles = profile::all()?;
@@ -385,17 +410,18 @@ async fn run(command: Command) -> Result<Value> {
         Command::Selftest { name } => to_value(adapter_of(&name).await?.selftest(&name).await),
         Command::Pull { engine } => pull(engine.as_deref()).await,
         Command::Engines => engines().await,
+        Command::Doctor => doctor().await,
         Command::Prune => prune().await,
         Command::Install { dir } => install::install(dir),
     }
 }
 
+/// Writes the envelope. A closed stdout, such as `chainsim describe | head`,
+/// is not an error: the reader has what it wanted.
 fn print(value: &Value, pretty: bool) {
-    if pretty {
-        println!("{}", serde_json::to_string_pretty(value).expect("json"));
-    } else {
-        println!("{value}");
-    }
+    let text = if pretty { serde_json::to_string_pretty(value).expect("json") } else { value.to_string() };
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{text}").and_then(|()| out.flush());
 }
 
 #[tokio::main]
