@@ -1,4 +1,4 @@
-# Robinhood Chain mainnet
+# <img src="../../assets/chains/robinhood-chain.png" height="40" alt=""> Robinhood Chain mainnet
 
 `robinhood-mainnet` forks Robinhood Chain, an Arbitrum Nitro L2 with gas in ETH. It runs the
 same Foundry anvil as [Ethereum](../ethereum/README.md), which handles Arbitrum's ArbSys, and chainsim

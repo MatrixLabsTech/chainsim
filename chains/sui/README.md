@@ -1,4 +1,4 @@
-# Sui
+# <img src="../../assets/chains/sui.svg" height="40" alt=""> Sui
 
 chainsim runs a private copy of Sui Mainnet in Docker as the chain `sui-mainnet`. This page covers
 what differs from the EVM chains: the engine, how each command works on Sui, and what the copy
