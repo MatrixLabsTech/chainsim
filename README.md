@@ -85,7 +85,9 @@ A fork is reachable from containers on its network. From the host, use
 - Discover: `describe [<chain>]` lists the chains, or one chain's engine, maturity, operations,
   tokens, limits and error codes.
 - Run: `up <chain>`, `ls`, `status <name>`, `down <name> | --all`.
-- Use: `fund`, `snapshot`, `revert`, `call`, `send`, `set`, `selftest`.
+- Use: `fund`, `snapshot`, `revert`, `call`, `send`, `set`, `selftest`. `set` takes a kind:
+  `balance`, `token`, `storage`, `code`, `owner` or `object`. `chainsim describe <chain>` and
+  the chain pages say which kinds each chain supports.
 - Engines: `pull [<engine>]`, `engines`, `prune`.
 - Plugin: `install`.
 
@@ -115,8 +117,8 @@ A fork is reachable from containers on its network. From the host, use
 ## How it works
 
 - **One engine per chain family, in Docker.** EVM chains run Foundry's anvil (Arc runs Circle's
-  arc-foundry build of it), and Sui runs `sui-fork` from `mysten/sui-tools`. No engine is
-  linked into the binary. chainsim drives Docker through its API.
+  arc-foundry build of it), and Sui runs chainsim's patched build of `sui-fork` (see
+  [chains/sui.md](chains/sui.md)). No engine is linked into the binary. chainsim drives Docker through its API.
 - **A fork is two containers on its own network.** `up` creates the network
   `chainsim-<name>`, the engine container, and a control sidecar (`curlimages/curl`, or
   `fullstorydev/grpcurl` for Sui). Every engine call chainsim makes runs as a `docker exec` in
@@ -143,9 +145,9 @@ A fork is reachable from containers on its network. From the host, use
   ```
 
 - **The engine lock.** `engines.lock.json` pins every engine image by tag and digest per
-  architecture, or, for arc-foundry, a release tarball and its checksum. `up` pulls or builds
-  an engine on first use, and tags it `chainsim/<engine>:<version>`. `chainsim pull`,
-  `chainsim engines` and `chainsim prune` manage them ahead of time:
+  architecture, or the source of an engine chainsim builds, such as arc-foundry's release
+  tarball and its checksum. `up` pulls or builds an engine on first use, and tags it
+  `chainsim/<engine>:<version>`. `chainsim pull`, `chainsim engines` and `chainsim prune` manage them ahead of time:
 
   ```sh
   chainsim pull foundry
@@ -168,7 +170,7 @@ A fork is reachable from containers on its network. From the host, use
 | `ethereum-mainnet` | [chains/ethereum.md](chains/ethereum.md) | stable | Foundry anvil v1.8.5 |
 | `arc-mainnet` | [chains/arc.md](chains/arc.md) | stable | Circle arc-foundry v0.8.0-2 |
 | `robinhood-mainnet` | [chains/robinhood.md](chains/robinhood.md) | stable | Foundry anvil v1.8.5 with an ArbGasInfo mock |
-| `sui-mainnet` | [chains/sui.md](chains/sui.md) | experimental | sui-fork from sui-tools mainnet-v1.81.1 |
+| `sui-mainnet` | [chains/sui.md](chains/sui.md) | experimental | chainsim's patched build of sui-fork |
 
 Solana (Surfpool) is planned. `chainsim describe` is the live list.
 
