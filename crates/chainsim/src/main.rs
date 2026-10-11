@@ -222,6 +222,7 @@ fn describe(chain: Option<&str>) -> Result<Value> {
             "pull [<engine>]",
             "engines",
             "prune",
+            "doctor",
             "install [--dir <folder>]",
         ],
         "exitCodes": { "0": "ok", "1": "error", "2": "usage", "3": "unsupported on this engine", "4": "not found", "5": "upstream failure", "6": "selftest failed", "7": "refused for safety", "8": "conflict" },
