@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The workspace rust-version, so clippy lints do not drift with stable.
+      - name: Install Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component clippy
+          rustup default 1.88.0
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # Acceptance tests that start forks are #[ignore]d and run by hand.
+      - name: Test
+        run: cargo test --locked --workspace

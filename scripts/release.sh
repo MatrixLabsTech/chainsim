@@ -29,7 +29,6 @@ git --no-pager diff --stat -- plugins .claude-plugin
 
 rm -rf dist
 mkdir -p dist
-docker_arch=$(docker version --format '{{.Server.Arch}}')
 built=""
 failed=""
 
@@ -38,8 +37,9 @@ gcc_pkg() { case $1 in amd64) echo gcc-x86-64-linux-gnu ;; arm64) echo gcc-aarch
 gcc_bin() { case $1 in amd64) echo x86_64-linux-gnu-gcc ;; arm64) echo aarch64-linux-gnu-gcc ;; esac; }
 
 build_linux() {
-  local arch=$1 t script
+  local arch=$1 t script docker_arch
   t=$(triple "$arch")
+  docker_arch=$(docker version --format '{{.Server.Arch}}') || return 1
   if [ "$arch" = "$docker_arch" ]; then
     script="cargo build --release --locked -p chainsim --target $t"
   else
@@ -70,7 +70,7 @@ for target in $targets; do
     darwin) build_darwin "$arch" && ok=1 || ok=0 ;;
     *) echo "release: unknown target $target" >&2; ok=0 ;;
   esac
-  if [ $ok = 1 ]; then
+  if [ "$ok" = 1 ]; then
     # No macOS extended attributes in the archive: GNU tar warns on them.
     COPYFILE_DISABLE=1 tar --no-xattrs -czf "dist/chainsim_${os}_${arch}.tar.gz" -C dist chainsim
     rm dist/chainsim
