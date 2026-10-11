@@ -3,6 +3,7 @@
 //! call runs as grpcurl in the fork's control sidecar.
 
 pub mod grpc;
+pub mod ptb;
 pub mod units;
 
 use std::collections::HashMap;
@@ -29,6 +30,9 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const TX_TARGET: Duration = Duration::from_secs(10);
 /// sui-fork has no gas estimation, so every transaction names its budget (0.01 SUI).
 const GAS_BUDGET: u64 = 10_000_000;
+/// The gas budget for `send` and `set`, paid by the funder (0.5 SUI; unused gas is refunded).
+const SEND_BUDGET: u64 = 500_000_000;
+const EXECUTE: &str = "sui.rpc.v2.TransactionExecutionService/ExecuteTransaction";
 
 /// The engine's data root: the fork data directory, snapshots and the supervisor's files.
 const DATA: &str = "/data";
@@ -36,7 +40,14 @@ const DATA: &str = "/data";
 /// A throwaway receiver for the selftest transfer, never active on mainnet.
 const ST_RECEIVER: &str = "0x000000000000000000000000000000000000000000000000000000000000c5e2";
 
-pub const OPERATIONS: &[&str] = &["describe", "up", "down", "ls", "status", "fund", "snapshot", "revert", "call", "selftest"];
+pub const OPERATIONS: &[&str] = &["describe", "up", "down", "ls", "status", "fund", "send", "set", "snapshot", "revert", "call", "selftest"];
+
+/// One fork's control path, profile and handle, for the transaction helpers.
+struct On<'a> {
+    g: &'a Grpc<'a>,
+    profile: &'a Profile,
+    fork: &'a ForkHandle,
+}
 
 pub struct SuiAdapter {
     docker: Docker,
@@ -126,6 +137,26 @@ fn valid_snapshot_id(id: &str) -> bool {
 
 fn ms(t: Instant) -> u64 {
     t.elapsed().as_millis() as u64
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// An object as a PTB input, from a `GetObject` reply: owned and immutable
+/// objects by reference, shared ones by their initial shared version.
+pub fn object_input(object: &Value, mutable: bool) -> Result<Value> {
+    let id = &object["objectId"];
+    match object["owner"]["kind"].as_str() {
+        Some("SHARED" | "CONSENSUS_ADDRESS") => Ok(json!({ "kind": "SHARED", "objectId": id, "version": object["owner"]["version"], "mutable": mutable })),
+        Some("ADDRESS" | "OBJECT" | "IMMUTABLE") => Ok(json!({ "kind": "IMMUTABLE_OR_OWNED", "objectId": id, "version": object["version"], "digest": object["digest"] })),
+        other => Err(Error::new(ErrorCode::Internal, format!("object {id} has an unknown owner kind {other:?}"))),
+    }
+}
+
+/// The owner of an object for messages: an address, or the kind.
+fn owner_text(owner: &Value) -> String {
+    owner["address"].as_str().map(str::to_string).unwrap_or_else(|| owner["kind"].as_str().unwrap_or("unknown").to_lowercase())
 }
 
 fn u64_field(v: &Value) -> Option<u64> {
@@ -288,6 +319,201 @@ impl SuiAdapter {
     async fn balance(&self, g: &Grpc<'_>, owner: &str) -> Result<u64> {
         let v = g.call("sui.rpc.v2.StateService/GetBalance", &json!({ "owner": owner, "coinType": "0x2::sui::SUI" }), CALL_TIMEOUT).await?;
         Ok(u64_field(&v["balance"]["balance"]).unwrap_or(0))
+    }
+
+    async fn get_object(&self, g: &Grpc<'_>, id: &str) -> Result<Value> {
+        let body = json!({ "objectId": id, "readMask": { "paths": ["object_id", "version", "digest", "owner", "object_type"] } });
+        Ok(g.call("sui.rpc.v2.LedgerService/GetObject", &body, CALL_TIMEOUT).await?["object"].clone())
+    }
+
+    /// True when a Move struct type has the store ability, which `TransferObjects` needs.
+    async fn has_store(&self, g: &Grpc<'_>, ty: &str) -> Result<bool> {
+        let base = ty.split('<').next().unwrap_or(ty);
+        let parts: Vec<&str> = base.split("::").collect();
+        let [package, module, name] = parts[..] else { return Err(Error::new(ErrorCode::Internal, format!("{ty} is not a struct type"))) };
+        let d = g.call("sui.rpc.v2.MovePackageService/GetDatatype", &json!({ "packageId": package, "moduleName": module, "name": name }), CALL_TIMEOUT).await?;
+        Ok(d["datatype"]["abilities"].as_array().is_some_and(|a| a.iter().any(|x| x == "STORE")))
+    }
+
+    /// True when `who` owns any object on the upstream (Sui Mainnet).
+    async fn owns_mainnet_objects(&self, g: &Grpc<'_>, who: &str) -> Result<bool> {
+        let query = format!("{{ address(address: \"{who}\") {{ objects(first: 1) {{ nodes {{ address }} }} }} }}");
+        let data = g.upstream_graphql(&query, Duration::from_secs(30)).await?;
+        Ok(data["address"]["objects"]["nodes"].as_array().is_some_and(|n| !n.is_empty()))
+    }
+
+    async fn gas_price(&self, g: &Grpc<'_>) -> Result<u64> {
+        let epoch = g.call("sui.rpc.v2.LedgerService/GetEpoch", &json!({ "readMask": { "paths": ["reference_gas_price"] } }), CALL_TIMEOUT).await?;
+        u64_field(&epoch["epoch"]["referenceGasPrice"]).ok_or_else(|| Error::new(ErrorCode::EngineFailed, "the fork did not return a reference gas price"))
+    }
+
+    /// Runs a programmable transaction as `sender` with no signature, its gas
+    /// paid from the funder's largest coin. Returns the executed transaction
+    /// and the gas coin's ID.
+    async fn run_as(&self, on: &On<'_>, sender: &str, inputs: Vec<Value>, commands: Vec<Value>) -> Result<(Value, String)> {
+        let (g, profile, fork) = (on.g, on.profile, on.fork);
+        let funder = profile.funder.as_deref().ok_or_else(|| Error::new(ErrorCode::Unsupported, format!("{} names no funder to pay gas", profile.key)))?;
+        let (coin, _) = self.funder_coin(g, funder, fork).await?;
+        let gas_coin = coin["objectId"].as_str().unwrap_or_default().to_string();
+        let price = self.gas_price(g).await?;
+        let body = json!({
+            "transaction": {
+                "version": 1,
+                "sender": sender,
+                "kind": { "kind": "PROGRAMMABLE_TRANSACTION", "programmableTransaction": { "inputs": inputs, "commands": commands } },
+                "gasPayment": { "objects": [coin], "owner": funder, "price": price.to_string(), "budget": SEND_BUDGET.to_string() },
+                "expiration": { "kind": "NONE" },
+            },
+            "signatures": [],
+            "readMask": { "paths": ["digest", "checkpoint", "effects.status", "effects.gas_used", "effects.changed_objects"] },
+        });
+        let out = g.call(EXECUTE, &body, CALL_TIMEOUT).await?;
+        Ok((out["transaction"].clone(), gas_coin))
+    }
+
+    /// The inputs and the one MoveCall for `send --to package::module::function<T> args...`.
+    async fn move_call(&self, g: &Grpc<'_>, to: &str, args: &[String]) -> Result<(Vec<Value>, Vec<Value>)> {
+        let target = ptb::parse_target(to)?;
+        let f = g
+            .call("sui.rpc.v2.MovePackageService/GetFunction", &json!({ "packageId": target.package, "moduleName": target.module, "name": target.function }), CALL_TIMEOUT)
+            .await?;
+        let params: Vec<&Value> = f["function"]["parameters"].as_array().into_iter().flatten().filter(|p| !ptb::is_tx_context(p)).collect();
+        if params.len() != args.len() {
+            let types: Vec<String> = params.iter().map(|p| p["body"]["typeName"].as_str().map(|t| t.rsplit("::").next().unwrap_or(t).to_string()).unwrap_or_else(|| p["body"]["type"].as_str().unwrap_or("?").to_lowercase())).collect();
+            return Err(Error::new(ErrorCode::Usage, format!("{}::{} takes {} arguments ({}), {} given", target.module, target.function, params.len(), types.join(", "), args.len())));
+        }
+        let mut inputs = Vec::new();
+        for (p, arg) in params.iter().zip(args) {
+            inputs.push(match ptb::param(p, arg, &target.type_args)? {
+                ptb::Param::Pure(bytes) => ptb::pure_input(&bytes),
+                ptb::Param::Object { id, mutable } => object_input(&self.get_object(g, &id).await?, mutable)?,
+                ptb::Param::Receiving { id } => {
+                    let o = self.get_object(g, &id).await?;
+                    json!({ "kind": "RECEIVING", "objectId": o["objectId"], "version": o["version"], "digest": o["digest"] })
+                }
+            });
+        }
+        let call = json!({ "moveCall": {
+            "package": target.package, "module": target.module, "function": target.function,
+            "typeArguments": target.type_args, "arguments": (0..inputs.len()).map(ptb::input_arg).collect::<Vec<_>>(),
+        } });
+        Ok((inputs, vec![call]))
+    }
+
+    /// The inputs and commands of a raw PTB (`send --data`). Object inputs given
+    /// by ID alone get their version and digest, or initial shared version, from the fork.
+    async fn raw_ptb(&self, g: &Grpc<'_>, data: &str) -> Result<(Vec<Value>, Vec<Value>)> {
+        let usage = || Error::new(ErrorCode::Usage, "--data must be a programmable transaction as protobuf JSON: {\"inputs\": [...], \"commands\": [...]}");
+        let ptb: Value = serde_json::from_str(data).map_err(|_| usage())?;
+        let (Some(inputs), Some(commands)) = (ptb["inputs"].as_array(), ptb["commands"].as_array()) else { return Err(usage()) };
+        let mut resolved = Vec::new();
+        for i in inputs {
+            let kind = i["kind"].as_str().unwrap_or("");
+            let resolved_input = match (kind, i["objectId"].as_str(), i.get("version")) {
+                ("IMMUTABLE_OR_OWNED" | "SHARED", Some(id), None) => object_input(&self.get_object(g, &parse_address(id)?).await?, i["mutable"].as_bool().unwrap_or(true))?,
+                ("RECEIVING", Some(id), None) => {
+                    let o = self.get_object(g, &parse_address(id)?).await?;
+                    json!({ "kind": "RECEIVING", "objectId": o["objectId"], "version": o["version"], "digest": o["digest"] })
+                }
+                _ => i.clone(),
+            };
+            resolved.push(resolved_input);
+        }
+        Ok((resolved, commands.clone()))
+    }
+
+    /// The coins of `coin_type` the fork indexes for `owner`, as owned inputs with their balances.
+    async fn fork_coins(&self, g: &Grpc<'_>, owner: &str, coin_type: &str) -> Result<Vec<(Value, u64)>> {
+        let body = json!({ "owner": owner, "objectType": format!("0x2::coin::Coin<{coin_type}>"), "pageSize": 50, "readMask": { "paths": ["object_id", "version", "digest", "balance"] } });
+        Ok(g.call("sui.rpc.v2.StateService/ListOwnedObjects", &body, CALL_TIMEOUT).await?["objects"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|o| (json!({ "kind": "IMMUTABLE_OR_OWNED", "objectId": o["objectId"], "version": o["version"], "digest": o["digest"] }), u64_field(&o["balance"]).unwrap_or(0)))
+            .collect())
+    }
+
+    /// Moves `amount` of `coins` (owned by `sender`, as inputs) to `to` as `sender`: merge, split, transfer.
+    async fn move_coins(&self, on: &On<'_>, sender: &str, coins: Vec<Value>, amount: u64, to: &str) -> Result<()> {
+        if coins.is_empty() {
+            return Err(Error::new(ErrorCode::ReadbackMismatch, format!("{sender} holds no coins this fork can list, so nothing can be moved from it")));
+        }
+        let n = coins.len();
+        let mut inputs = coins;
+        inputs.push(ptb::pure_input(&amount.to_le_bytes()));
+        inputs.push(ptb::pure_input(&address_bytes(to)));
+        let mut commands = Vec::new();
+        if n > 1 {
+            commands.push(json!({ "mergeCoins": { "coin": ptb::input_arg(0), "coinsToMerge": (1..n).map(ptb::input_arg).collect::<Vec<_>>() } }));
+        }
+        let split = commands.len();
+        commands.push(json!({ "splitCoins": { "coin": ptb::input_arg(0), "amounts": [ptb::input_arg(n)] } }));
+        commands.push(json!({ "transferObjects": { "objects": [{ "kind": "RESULT", "result": split }], "address": ptb::input_arg(n + 1) } }));
+        let (tx, _) = self.run_as(on, sender, inputs, commands).await?;
+        let status = &tx["effects"]["status"];
+        if status["success"] != json!(true) {
+            return Err(Error::new(ErrorCode::RpcError, format!("moving coins from {sender} failed on the fork: {}", status["error"]["description"])));
+        }
+        Ok(())
+    }
+
+    /// Lowers `who`'s balance of `coin_type` by `excess`, sending it to the funder as `who`.
+    async fn lower_balance(&self, on: &On<'_>, who: &str, coin_type: &str, excess: u64) -> Result<()> {
+        let coins = self.fork_coins(on.g, who, coin_type).await?.into_iter().map(|(c, _)| c).collect();
+        self.move_coins(on, who, coins, excess, on.profile.funder.as_deref().unwrap_or_default()).await
+    }
+
+    /// The balance of any coin type the fork indexes for `owner`.
+    async fn coin_balance(&self, g: &Grpc<'_>, owner: &str, coin_type: &str) -> Result<u64> {
+        let v = g.call("sui.rpc.v2.StateService/GetBalance", &json!({ "owner": owner, "coinType": coin_type }), CALL_TIMEOUT).await?;
+        Ok(u64_field(&v["balance"]["balance"]).unwrap_or(0))
+    }
+
+    /// Adds `amount` of `coin_type` to `who`: by minting as the TreasuryCap's
+    /// owner, or with `from`, by moving coins out of that holder. Returns how.
+    async fn add_token(&self, on: &On<'_>, who: &str, coin_type: &str, amount: u64, from: Option<&str>) -> Result<Value> {
+        let g = on.g;
+        if let Some(holder) = from {
+            let holder = parse_address(holder)?;
+            let mut coins = self.fork_coins(g, &holder, coin_type).await?;
+            // Coins the holder had before the fork point are not indexed on the fork; find them upstream.
+            let query = format!("{{ address(address: \"{holder}\") {{ objects(first: 50, filter: {{ type: \"0x2::coin::Coin<{coin_type}>\" }}) {{ nodes {{ address }} }} }} }}");
+            let upstream = g.upstream_graphql(&query, Duration::from_secs(30)).await?;
+            for id in upstream["address"]["objects"]["nodes"].as_array().into_iter().flatten().filter_map(|n| n["address"].as_str()) {
+                if coins.iter().any(|(c, _)| c["objectId"].as_str() == Some(id)) {
+                    continue;
+                }
+                let body = json!({ "objectId": id, "readMask": { "paths": ["object_id", "version", "digest", "owner", "balance"] } });
+                // A coin created after the fork point does not exist on the fork.
+                let Ok(o) = g.call("sui.rpc.v2.LedgerService/GetObject", &body, CALL_TIMEOUT).await.map(|v| v["object"].clone()) else { continue };
+                if o["owner"]["address"].as_str() == Some(holder.as_str()) {
+                    coins.push((json!({ "kind": "IMMUTABLE_OR_OWNED", "objectId": o["objectId"], "version": o["version"], "digest": o["digest"] }), u64_field(&o["balance"]).unwrap_or(0)));
+                }
+            }
+            let held: u64 = coins.iter().map(|(_, b)| b).sum();
+            if held < amount {
+                return Err(Error::new(ErrorCode::Usage, format!("{holder} holds {held} units of {coin_type} on the fork, less than the {amount} needed")).next("name a larger holder with --from, or leave --from out to mint"));
+            }
+            self.move_coins(on, &holder, coins.into_iter().map(|(c, _)| c).collect(), amount, who).await?;
+            return Ok(json!({ "from": holder }));
+        }
+        let info = g.call("sui.rpc.v2.StateService/GetCoinInfo", &json!({ "coinType": coin_type }), CALL_TIMEOUT).await?;
+        let no_cap = |why: String| {
+            Error::new(ErrorCode::Unsupported, format!("cannot mint {coin_type}: {why}")).next("chainsim set <name> token <address> <coin type> <amount> --from <holder> moves it from an address that holds it")
+        };
+        let cap_id = info["treasury"]["id"].as_str().ok_or_else(|| no_cap("its TreasuryCap was not found".into()))?;
+        let cap = self.get_object(g, cap_id).await?;
+        let Some(cap_owner) = cap["owner"]["address"].as_str().filter(|_| cap["owner"]["kind"] == json!("ADDRESS")) else {
+            return Err(no_cap(format!("its TreasuryCap {cap_id} is {}, not held by an address", owner_text(&cap["owner"]))));
+        };
+        let inputs = vec![object_input(&cap, true)?, ptb::pure_input(&amount.to_le_bytes()), ptb::pure_input(&address_bytes(who))];
+        let call = json!({ "moveCall": { "package": "0x2", "module": "coin", "function": "mint_and_transfer", "typeArguments": [coin_type], "arguments": [ptb::input_arg(0), ptb::input_arg(1), ptb::input_arg(2)] } });
+        let (tx, _) = self.run_as(on, cap_owner, inputs, vec![call]).await?;
+        let status = &tx["effects"]["status"];
+        if status["success"] != json!(true) {
+            return Err(Error::new(ErrorCode::RpcError, format!("minting {coin_type} as the TreasuryCap owner failed on the fork: {}", status["error"]["description"])));
+        }
+        Ok(json!({ "minted": { "treasuryCap": cap_id, "capOwner": cap_owner } }))
     }
 
     /// The funder's largest SUI coin on the fork, as a gas object reference.
@@ -471,7 +697,7 @@ impl Adapter for SuiAdapter {
         let g = self.grpc(&handle, &profile);
         let who = parse_address(&req.address)?;
         if !req.tokens.is_empty() {
-            return Err(Error::new(ErrorCode::Unsupported, format!("{} funds SUI only", profile.key)).next(format!("chainsim fund {name} {who} --native <amount>")));
+            return Err(Error::new(ErrorCode::Unsupported, format!("{} funds SUI only", profile.key)).next(format!("chainsim set {name} token {who} <coin type> <amount> sets a token balance")));
         }
         let Some(native) = &req.native else {
             return Err(Error::new(ErrorCode::Usage, "nothing to fund: pass --native <amount>"));
@@ -480,9 +706,7 @@ impl Adapter for SuiAdapter {
         let target = u64::try_from(parse_amount(native, decimals)?).map_err(|_| Error::new(ErrorCode::Usage, format!("{native} SUI is more than a u64 of MIST")))?;
 
         // An address with any owned object on mainnet may hold real assets.
-        let query = format!("{{ address(address: \"{who}\") {{ objects(first: 1) {{ nodes {{ address }} }} }} }}");
-        let data = g.upstream_graphql(&query, Duration::from_secs(30)).await?;
-        if data["address"]["objects"]["nodes"].as_array().is_some_and(|n| !n.is_empty()) {
+        if self.owns_mainnet_objects(&g, &who).await? {
             return Err(Error::new(ErrorCode::MainnetAddress, format!("{who} owns objects on Sui Mainnet; fund only addresses of test keys that hold no mainnet assets")).next("use a fresh test address"));
         }
 
@@ -502,6 +726,150 @@ impl Adapter for SuiAdapter {
             address: who,
             balances: vec![Balance { asset: "native".into(), address: None, decimals, amount: format_amount(read as u128, decimals), raw: read.to_string() }],
         })
+    }
+
+    async fn send(&self, name: &str, req: &SendRequest) -> Result<Value> {
+        let (handle, profile) = self.open(name).await?;
+        let g = self.grpc(&handle, &profile);
+        let sender = parse_address(&req.from)?;
+        let move_form = "chainsim send <name> --as <address> --to 'package::module::function<T...>' <arg>..., or --data '<PTB JSON>'";
+        if req.sig.is_some() || req.value.is_some() {
+            return Err(Error::new(ErrorCode::Usage, "on Sui, --to names a Move function and the arguments follow it; --sig and --value are EVM-only").next(move_form));
+        }
+        let (inputs, commands, to) = match &req.data {
+            Some(_) if !req.args.is_empty() => return Err(Error::new(ErrorCode::Usage, "pass a Move function with its arguments, or --data alone").next(move_form)),
+            Some(data) => {
+                let (i, c) = self.raw_ptb(&g, data).await?;
+                (i, c, "ptb".to_string())
+            }
+            None => {
+                let (i, c) = self.move_call(&g, &req.to, &req.args).await?;
+                (i, c, req.to.trim().to_string())
+            }
+        };
+        let on = On { g: &g, profile: &profile, fork: &handle };
+        let (tx, gas_coin) = self.run_as(&on, &sender, inputs, commands).await?;
+        let mut out = ptb::summarize(&tx, &gas_coin);
+        let ok = out["status"] == json!(1);
+        let entry = json!({ "kind": "send-as", "from": sender, "to": to, "digest": out["digest"], "status": out["status"], "gasPaidBy": profile.funder, "at": now_secs() });
+        chainsim_core::mods::record(&self.docker, name, &entry).await?;
+        out["from"] = json!(sender);
+        out["to"] = json!(to);
+        out["gasPaidBy"] = json!(profile.funder);
+        out["note"] = json!(chainsim_core::mods::NOTE);
+        if !ok {
+            let e = &out["error"];
+            let message = match e.get("abort") {
+                Some(a) => format!("the transaction aborted in {}::{} with code {}", a["module"].as_str().unwrap_or("?"), a["function"].as_str().unwrap_or("?"), a["code"].as_str().unwrap_or("?")),
+                None => format!("the transaction failed: {}", e["description"].as_str().unwrap_or("unknown error")),
+            };
+            return Err(Error::new(ErrorCode::TxReverted, message).next("data.error holds the Move abort location and code; the failed transaction still used gas").data(out));
+        }
+        Ok(out)
+    }
+
+    async fn set(&self, name: &str, req: &SetRequest) -> Result<Value> {
+        let (handle, profile) = self.open(name).await?;
+        let g = self.grpc(&handle, &profile);
+        let on = On { g: &g, profile: &profile, fork: &handle };
+        let (mut out, mut entry) = match &req.kind {
+            SetKind::Balance => {
+                let who = parse_address(&req.address)?;
+                if profile.funder.as_deref().map(parse_address).transpose()?.as_deref() == Some(who.as_str()) {
+                    return Err(Error::new(ErrorCode::Usage, format!("{who} is the funder, which pays for every send and set on this fork")));
+                }
+                let decimals = profile.native.as_ref().map_or(9, |n| n.decimals);
+                let target = u64::try_from(parse_amount(&req.value, decimals)?).map_err(|_| Error::new(ErrorCode::Usage, format!("{} SUI is more than a u64 of MIST", req.value)))?;
+                let current = self.balance(&g, &who).await?;
+                if current < target {
+                    self.send_from_funder(&g, &profile, &handle, &who, target - current).await?;
+                } else if current > target {
+                    self.lower_balance(&on, &who, "0x2::sui::SUI", current - target).await?;
+                }
+                let read = self.balance(&g, &who).await?;
+                if read != target {
+                    return Err(Error::new(ErrorCode::ReadbackMismatch, format!("{who} reads {} SUI after setting {}", format_amount(read as u128, decimals), req.value)));
+                }
+                let amount = format_amount(read as u128, decimals);
+                let mut view = json!({ "kind": "balance", "address": who, "symbol": "SUI", "amount": amount, "raw": read.to_string() });
+                if self.owns_mainnet_objects(&g, &who).await? {
+                    view["warning"] = json!("this address owns objects on Sui Mainnet; the fork counts only coins it has seen, so coins the address held before the fork point are not in this balance but can still be spent");
+                }
+                (
+                    view,
+                    json!({ "kind": "set-balance", "address": who, "symbol": "SUI", "amount": amount }),
+                )
+            }
+            SetKind::Token { coin_type, from } => {
+                let who = parse_address(&req.address)?;
+                let info = g.call("sui.rpc.v2.StateService/GetCoinInfo", &json!({ "coinType": coin_type }), CALL_TIMEOUT).await?;
+                let decimals = info["metadata"]["decimals"].as_u64().map_or(0, |d| d as u8);
+                let target = u64::try_from(parse_amount(&req.value, decimals)?).map_err(|_| Error::new(ErrorCode::Usage, format!("{} is more than a u64 of {coin_type}", req.value)))?;
+                let current = self.coin_balance(&g, &who, coin_type).await?;
+                let source = if current < target {
+                    self.add_token(&on, &who, coin_type, target - current, from.as_deref()).await?
+                } else if current > target {
+                    self.lower_balance(&on, &who, coin_type, current - target).await?;
+                    json!({ "returnedTo": profile.funder })
+                } else {
+                    Value::Null
+                };
+                let read = self.coin_balance(&g, &who, coin_type).await?;
+                if read != target {
+                    return Err(Error::new(ErrorCode::ReadbackMismatch, format!("{who} reads {} of {coin_type} after setting {}", format_amount(read as u128, decimals), req.value)));
+                }
+                let amount = format_amount(read as u128, decimals);
+                let mut view = json!({ "kind": "token", "address": who, "coinType": coin_type, "decimals": decimals, "amount": amount, "raw": read.to_string(), "source": source });
+                if self.owns_mainnet_objects(&g, &who).await? {
+                    view["warning"] = json!("this address owns objects on Sui Mainnet; the fork counts only coins it has seen, so coins the address held before the fork point are not in this balance but can still be spent");
+                }
+                (view, json!({ "kind": "set-token", "address": who, "coinType": coin_type, "amount": amount, "source": source }))
+            }
+            SetKind::Owner => {
+                let id = parse_address(&req.address)?;
+                let to = parse_address(&req.value)?;
+                let object = self.get_object(&g, &id).await?;
+                let ty = object["objectType"].as_str().unwrap_or("").to_string();
+                let cannot = |why: &str, next: &str| Err(Error::new(ErrorCode::Unsupported, format!("object {id} cannot change owner: {why}")).next(next.to_string()));
+                let from = match object["owner"]["kind"].as_str() {
+                    Some("ADDRESS") => object["owner"]["address"].as_str().unwrap_or_default().to_string(),
+                    Some("SHARED" | "CONSENSUS_ADDRESS") => return cannot("it is shared, so it has no owner", "change it through its own module with chainsim send --as <an address its module allows>"),
+                    Some("IMMUTABLE") => return cannot("it is immutable", "an immutable object never changes"),
+                    _ => return cannot(&format!("it is owned by another object ({})", owner_text(&object["owner"])), "move the parent object, or change it through its module with chainsim send --as"),
+                };
+                if !ty.is_empty() && !self.has_store(&g, &ty).await? {
+                    return cannot(&format!("{ty} has key but not store, so only its own module can transfer it"), &format!("chainsim send {name} --as {from} --to '<package>::<module>::<its transfer function>' {id} {to}"));
+                }
+                if from != to {
+                    let inputs = vec![object_input(&object, true)?, ptb::pure_input(&address_bytes(&to))];
+                    let cmd = json!({ "transferObjects": { "objects": [ptb::input_arg(0)], "address": ptb::input_arg(1) } });
+                    let (tx, _) = self.run_as(&on, &from, inputs, vec![cmd]).await?;
+                    let status = &tx["effects"]["status"];
+                    if status["success"] != json!(true) {
+                        return Err(Error::new(ErrorCode::RpcError, format!("transferring {id} as {from} failed on the fork: {}", status["error"]["description"])));
+                    }
+                }
+                let read = self.get_object(&g, &id).await?;
+                let owner = read["owner"]["address"].as_str().unwrap_or_default();
+                if owner != to {
+                    return Err(Error::new(ErrorCode::ReadbackMismatch, format!("object {id} reads owner {} after setting {to}", owner_text(&read["owner"]))));
+                }
+                (
+                    json!({ "kind": "owner", "object": id, "type": ty, "previousOwner": from, "owner": owner, "version": read["version"] }),
+                    json!({ "kind": "set-owner", "object": id, "type": ty, "previousOwner": from, "owner": owner }),
+                )
+            }
+            SetKind::Storage { .. } | SetKind::Code => {
+                return Err(Error::unsupported(
+                    "set storage and set code on Sui",
+                    "Sui has no storage slots or contract code: change an object through its own module as its owner or admin with chainsim send --as; arbitrary object contents need a patched engine that chainsim does not ship",
+                ));
+            }
+        };
+        entry["at"] = json!(now_secs());
+        chainsim_core::mods::record(&self.docker, name, &entry).await?;
+        out["note"] = json!(chainsim_core::mods::NOTE);
+        Ok(out)
     }
 
     async fn snapshot(&self, name: &str) -> Result<Snapshot> {
@@ -597,6 +965,21 @@ mod tests {
         assert!(!valid_snapshot_id("../x"));
         assert!(revert_script("s1", "s2").starts_with("D=/data; [ -d $D/snap/s1 ] || exit 4;"));
         assert!(snapshot_script("s1").contains("trap 'rm -f $D/hold' EXIT"));
+    }
+
+    #[test]
+    fn object_inputs_resolve_by_owner_kind() {
+        let owned = json!({ "objectId": "0xa", "version": "7", "digest": "D", "owner": { "kind": "ADDRESS", "address": "0xb" } });
+        assert_eq!(object_input(&owned, true).unwrap(), json!({ "kind": "IMMUTABLE_OR_OWNED", "objectId": "0xa", "version": "7", "digest": "D" }));
+        let frozen = json!({ "objectId": "0x2", "version": "1", "digest": "P", "owner": { "kind": "IMMUTABLE" } });
+        assert_eq!(object_input(&frozen, false).unwrap()["kind"], "IMMUTABLE_OR_OWNED");
+        // A shared object goes by its initial shared version, not its current one.
+        let shared = json!({ "objectId": "0xc", "version": "1043929494", "digest": "S", "owner": { "kind": "SHARED", "version": "1574190" } });
+        assert_eq!(object_input(&shared, true).unwrap(), json!({ "kind": "SHARED", "objectId": "0xc", "version": "1574190", "mutable": true }));
+        assert_eq!(object_input(&shared, false).unwrap()["mutable"], false);
+        assert!(object_input(&json!({ "objectId": "0xd", "owner": {} }), true).is_err());
+        assert_eq!(owner_text(&json!({ "kind": "SHARED" })), "shared");
+        assert_eq!(owner_text(&json!({ "kind": "ADDRESS", "address": "0xb" })), "0xb");
     }
 
     #[test]

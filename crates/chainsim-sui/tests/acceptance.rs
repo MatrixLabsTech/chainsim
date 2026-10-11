@@ -6,7 +6,7 @@
 use std::process::Command;
 use std::time::Instant;
 
-use chainsim_core::fork::{FundRequest, UpRequest};
+use chainsim_core::fork::{FundRequest, SendRequest, SetKind, SetRequest, UpRequest};
 use chainsim_core::profile;
 use chainsim_core::{Adapter, ErrorCode};
 use chainsim_sui::{data_volume, grpc, SuiAdapter, FORKING_PROTO};
@@ -151,5 +151,71 @@ async fn sui_mainnet_published() {
     assert!(url.starts_with("http://127.0.0.1:"), "{url}");
     check_hardening(name, true);
     a.down(name).await.unwrap();
+    assert_gone(name);
+}
+
+/// send --as and set on objects that live on Sui Mainnet (design section 9,
+/// phase 2 Sui slice). The objects were checked on 2026-10-11: if a cap has
+/// moved on mainnet since, update the constants.
+mod mainnet_objects {
+    pub const VAULT: &str = "0x0000c7fa394e8abac7eb529e06bb2d90d11a775ee23db1b115a170f062b622f3::vault::VAULT";
+    pub const VAULT_CAP: &str = "0xef6752ebbb43af90e8abc41f763aeb5f2fdd7981072e403b2c3ffba4e266edfa";
+    pub const VAULT_CAP_OWNER: &str = "0xcf5455078123a7f42f98f237301f6def64a077af7f6bdb8ef57a7f301367209c";
+    pub const CETUS: &str = "0x260693ec785a6e6c9d81d58c7d2ff72f1288ae0fa6a9725abe05a6478b11f084";
+    pub const CETUS_CONFIG: &str = "0xdaa46292632c3c4d8f31f23ea0f9b36a28ff3677e9684980e4438403a67a3d8f";
+    pub const CETUS_ADMIN_CAP: &str = "0x89c1a321291d15ddae5a086c9abc533dff697fde3d89e0ca836c41af73e36a75";
+    pub const CETUS_ADMIN: &str = "0xdbfd0b17fa804c98f51d552b050fb7f850b85db96fa2a0d79e50119525814a47";
+    /// A DeepBook airdrop object: its type has key but not store.
+    pub const KEY_ONLY: &str = "0x253d4d235e6a00968c90d7ad79dc5e029dc9630802e09e15836f20bb51f61cca";
+}
+
+#[tokio::test]
+#[ignore]
+async fn sui_send_and_set() {
+    use mainnet_objects::*;
+    let a = SuiAdapter::connect().await.unwrap();
+    let p = profile::get("sui-mainnet").unwrap();
+    let name = "acc-sui-send";
+    a.down(name).await.unwrap();
+    a.up(&p, &UpRequest { name: name.into(), ..Default::default() }).await.unwrap();
+    let send = |from: &str, to: String, args: &[&str]| SendRequest { from: from.into(), to, args: args.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+    let member = fresh_address();
+
+    // Mint as the TreasuryCap owner, with no key.
+    let out = a.send(name, &send(VAULT_CAP_OWNER, format!("0x2::coin::mint_and_transfer<{VAULT}>"), &[VAULT_CAP, "1000", &member])).await.unwrap();
+    assert_eq!(out["status"], 1, "{out}");
+    assert_eq!(out["created"].as_array().unwrap().len(), 1, "{out}");
+
+    // A role-gated call from an address without the role aborts with its location and code.
+    let fee = format!("{CETUS}::config::update_protocol_fee_rate");
+    let e = a.send(name, &send(&member, fee.clone(), &[CETUS_CONFIG, "1500"])).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::TxReverted);
+    assert_eq!(e.data.as_ref().unwrap()["error"]["abort"]["function"], "check_pool_manager_role");
+    // The admin grants every role; then the same call succeeds.
+    let roles = u128::MAX.to_string();
+    let out = a.send(name, &send(CETUS_ADMIN, format!("{CETUS}::config::set_roles"), &[CETUS_ADMIN_CAP, CETUS_CONFIG, &member, &roles])).await.unwrap();
+    assert_eq!(out["status"], 1, "{out}");
+    assert_eq!(a.send(name, &send(&member, fee, &[CETUS_CONFIG, "1500"])).await.unwrap()["status"], 1);
+
+    // set balance up and down, set token by mint and back down, set owner.
+    let set = |kind, address: &str, value: &str| SetRequest { kind, address: address.into(), value: value.into() };
+    assert_eq!(a.set(name, &set(SetKind::Balance, &member, "12.5")).await.unwrap()["raw"], "12500000000");
+    assert_eq!(a.set(name, &set(SetKind::Balance, &member, "2")).await.unwrap()["raw"], "2000000000");
+    let token = || SetKind::Token { coin_type: VAULT.into(), from: None };
+    assert_eq!(a.set(name, &set(token(), &member, "5000")).await.unwrap()["raw"], "5000");
+    assert_eq!(a.set(name, &set(token(), &member, "3000")).await.unwrap()["raw"], "3000");
+    let receiver = fresh_address();
+    assert_eq!(a.set(name, &set(SetKind::Owner, CETUS_ADMIN_CAP, &receiver)).await.unwrap()["owner"], receiver);
+    // Objects that cannot move exit 3: key without store, shared, immutable.
+    for object in [KEY_ONLY, CETUS_CONFIG, "0x2"] {
+        assert_eq!(a.set(name, &set(SetKind::Owner, object, &receiver)).await.unwrap_err().code, ErrorCode::Unsupported, "{object}");
+    }
+
+    // Every send and set is in the modification log: 4 sends (one aborted), 2 balances, 2 tokens, 1 owner.
+    let mods = chainsim_core::mods::list(a.docker(), name).await.unwrap();
+    assert_eq!(mods.iter().filter(|m| m["kind"] == "send-as").count(), 4, "{mods:?}");
+    assert_eq!(mods.len(), 9, "{mods:?}");
+
+    assert!(a.down(name).await.unwrap().removed);
     assert_gone(name);
 }
