@@ -9,6 +9,17 @@ Robinhood Chain unless their pages say otherwise.
 [`profiles/ethereum-mainnet.json`](../../profiles/ethereum-mainnet.json) is the source of truth for everything below. Run
 `chainsim describe ethereum-mainnet` to read it from the binary.
 
+## What chainsim solves here
+
+- Funding an ERC-20 on a fork means writing the token's balance storage. `fund` tries anvil's
+  `anvil_dealERC20`, falls back to finding the balance mapping slot (Solidity and Vyper
+  layouts), and reads every balance back.
+- Calling an admin function as its real role holder takes impersonation plus gas for an
+  account that may hold none. `send --as` does both and returns the receipt, or the revert
+  reason without sending when the call would fail.
+- Forking an old block from a public endpoint fails with an error about pruned history.
+  chainsim exits 5 and names `CHAINSIM_ETHEREUM_MAINNET_RPC` and the need for an archive node.
+
 ## Chain facts
 
 - Chain id: `eip155:1`. The fork keeps chain id 1.

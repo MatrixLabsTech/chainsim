@@ -9,6 +9,17 @@ Everything not covered here works as on [Ethereum](../ethereum/README.md).
 [`profiles/arc-mainnet.json`](../../profiles/arc-mainnet.json) is the source of truth for everything below. Run
 `chainsim describe arc-mainnet` to read it from the binary.
 
+## What chainsim solves here
+
+- Stock anvil cannot run Arc's USDC system contract, so native USDC and the USDC ERC-20 at
+  `0x3600…0000` drift apart on a stock fork. Teams worked around it with a stand-in USDC
+  contract and a process that kept balances in sync. chainsim runs Circle's own arc-foundry
+  engine, where both views are one balance, and `selftest` checks that they stay one.
+- Circle ships arc-foundry as release tarballs that need glibc 2.38 or later, not as an image.
+  chainsim builds a pinned image from the checksummed tarball on first use.
+- Gas on Arc is paid in USDC. `fund`, `set balance` and the gas top-up of `send --as` all work
+  in native USDC.
+
 ## Chain facts
 
 - Chain id: `eip155:5042`. The fork keeps chain id 5042.

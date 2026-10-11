@@ -10,6 +10,15 @@ here works as on Ethereum.
 [`profiles/robinhood-mainnet.json`](../../profiles/robinhood-mainnet.json) is the source of truth for everything below. Run
 `chainsim describe robinhood-mainnet` to read it from the binary.
 
+## What chainsim solves here
+
+- Robinhood Chain is an Arbitrum Nitro L2. Stock anvil answers ArbSys at `0x64` but reverts on
+  ArbGasInfo at `0x6C`, so contracts and tools that read L1 gas pricing fail on a stock fork.
+  chainsim installs a mock at `0x6C` with values measured on the live chain, and `selftest`
+  checks both precompiles.
+- The chain has no USDC in its documented contracts. chainsim's profile uses USDG for `fund`
+  and the selftest token transfer.
+
 ## Chain facts
 
 - Chain id: `eip155:4663`. The fork keeps chain id 4663.

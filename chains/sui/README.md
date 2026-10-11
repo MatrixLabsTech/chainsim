@@ -11,6 +11,18 @@ The limits listed here are a summary. The source of truth is the `limits` list i
 [`profiles/sui-mainnet.json`](../../profiles/sui-mainnet.json), which `chainsim describe sui-mainnet`
 and every fork object report word for word.
 
+## What chainsim solves here
+
+- Sui has no anvil. Mysten's experimental `sui-fork` forks Sui mainnet, but it serves gRPC
+  only, prints no ready line, has no snapshot API and ships a separate image per architecture.
+  chainsim picks the image for the host, waits on gRPC health, and implements snapshot and
+  revert by copying the fork's data directory.
+- Funding a test address on a fork needs SUI from somewhere. chainsim transfers it from a
+  large mainnet holder as an unsigned transaction that only the fork accepts.
+- Acting as a TreasuryCap or AdminCap holder means building an unsigned programmable
+  transaction by hand and resolving every object reference. `send --as` takes a Move function
+  and plain arguments, encodes them from the function's signature, and sponsors the gas.
+
 ## Maturity: experimental
 
 `describe` and the fork object report `"maturity": "experimental"`. The engine is Mysten's

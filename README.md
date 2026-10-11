@@ -22,6 +22,25 @@ on every supported chain.
   <a href="chains/sui/README.md"><img src="assets/chains/sui.svg" height="48" alt="Sui"></a>
 </p>
 
+## What it solves
+
+- Every chain family forks with a different engine: anvil for Ethereum and Arbitrum chains,
+  Circle's arc-foundry tarballs for Arc, Mysten's gRPC-only `sui-fork` for Sui. Each has its own
+  flags, readiness signal and funding method. chainsim pins each engine, pulls or builds it on
+  first use, and puts all of them behind the same commands.
+- Testing admin-only paths of a deployed protocol normally needs keys nobody on the test team
+  holds. `send --as` sends as the admin on the fork, and `set` changes state directly.
+- Funding a test wallet with real tokens on a fork means finding each token's balance slot or
+  owned coins. `fund` and `set` do it per chain and read the result back.
+- A fork differs from mainnet in ways that are easy to miss. Each chain's `limits` list those
+  differences in plain sentences for a test report, and `selftest` checks a fork before a test
+  relies on it.
+- Fork tools print logs written for people. chainsim prints one JSON object per command with a
+  fixed exit code and the next command to run, so a script or an AI agent can act on it.
+- Public RPC endpoints rate-limit and keep only recent state, and the failures are hard to
+  read. chainsim reports them as upstream errors that name the variable to set and say when an
+  archive node is needed.
+
 ## Features
 
 - One CLI for Ethereum, Arc, Robinhood Chain and Sui mainnet forks, each running in Docker.
