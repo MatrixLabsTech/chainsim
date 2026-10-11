@@ -2,9 +2,9 @@
 
 `arc-mainnet` forks Arc, Circle's L1 where USDC is the gas token. Stock anvil cannot run Arc's
 USDC system contract, so chainsim runs Circle's own arc-foundry build of anvil, which does.
-Everything not covered here works as on [Ethereum](ethereum.md).
+Everything not covered here works as on [Ethereum](../ethereum/README.md).
 
-`profiles/arc-mainnet.json` is the source of truth for everything below. Run
+[`profiles/arc-mainnet.json`](../../profiles/arc-mainnet.json) is the source of truth for everything below. Run
 `chainsim describe arc-mainnet` to read it from the binary.
 
 ## Chain facts

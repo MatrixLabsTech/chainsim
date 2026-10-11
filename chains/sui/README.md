@@ -3,10 +3,10 @@
 chainsim runs a private copy of Sui Mainnet in Docker as the chain `sui-mainnet`. This page covers
 what differs from the EVM chains: the engine, how each command works on Sui, and what the copy
 cannot do. The commands and their JSON output are the same as on every chain. The
-[README](../README.md) covers the shared workflow.
+[README](../../README.md) covers the shared workflow.
 
 The limits listed here are a summary. The source of truth is the `limits` list in
-[`profiles/sui-mainnet.json`](../profiles/sui-mainnet.json), which `chainsim describe sui-mainnet`
+[`profiles/sui-mainnet.json`](../../profiles/sui-mainnet.json), which `chainsim describe sui-mainnet`
 and every fork object report word for word.
 
 ## Maturity: experimental
@@ -179,10 +179,11 @@ The last line moves Cetus's CLMM `AdminCap` (checked on 2026-10-11) to `0xc0ffee
   not `store`, exit 3 with a reason and a `next`: such objects change only through their own
   module, with `send --as`.
 - `set storage` and `set code` have no meaning on Sui and exit 3.
-- `set` cannot write an object's fields directly. That needs a `SetObject` RPC that
-  stock `sui-fork` lacks. A patch that adds it was built and measured as a dev tool on the
-  research branch `stream-b3` (`research/sui-send-set/`), but chainsim does not ship it: change an
-  object through its own module with `send --as` instead.
+- `set` cannot write an object's fields directly yet. That needs a `SetObject` RPC that stock
+  `sui-fork` lacks. We added one on the `chainsim/mainnet-v1.81.1` branch of
+  [Lucklyric/sui](https://github.com/Lucklyric/sui), a fork of MystenLabs/sui, and chainsim will
+  build its Sui engine from that branch to support `set object`. Until then, change an object
+  through its own module with `send --as`.
 
 ### Balances of mainnet addresses
 

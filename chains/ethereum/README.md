@@ -4,7 +4,7 @@
 chain: what this page says about `fund`, `send`, `set` and `selftest` also holds for Arc and
 Robinhood Chain unless their pages say otherwise.
 
-`profiles/ethereum-mainnet.json` is the source of truth for everything below. Run
+[`profiles/ethereum-mainnet.json`](../../profiles/ethereum-mainnet.json) is the source of truth for everything below. Run
 `chainsim describe ethereum-mainnet` to read it from the binary.
 
 ## Chain facts

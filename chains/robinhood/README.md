@@ -1,11 +1,11 @@
 # Robinhood Chain mainnet
 
 `robinhood-mainnet` forks Robinhood Chain, an Arbitrum Nitro L2 with gas in ETH. It runs the
-same Foundry anvil as [Ethereum](ethereum.md), which handles Arbitrum's ArbSys, and chainsim
+same Foundry anvil as [Ethereum](../ethereum/README.md), which handles Arbitrum's ArbSys, and chainsim
 installs a mock for the one precompile anvil cannot answer, ArbGasInfo. Everything not covered
 here works as on Ethereum.
 
-`profiles/robinhood-mainnet.json` is the source of truth for everything below. Run
+[`profiles/robinhood-mainnet.json`](../../profiles/robinhood-mainnet.json) is the source of truth for everything below. Run
 `chainsim describe robinhood-mainnet` to read it from the binary.
 
 ## Chain facts
