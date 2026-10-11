@@ -39,6 +39,10 @@ case $(uname -m) in
     arm64 | aarch64) arch=arm64 ;;
     *) echo "chainsim: unsupported architecture $(uname -m)" >&2; exit 1 ;;
 esac
+if [ "$os-$arch" = darwin-amd64 ]; then
+    echo "chainsim: there is no release build for Intel Macs; build from source with cargo install --locked --git https://github.com/$repo chainsim" >&2
+    exit 1
+fi
 name=chainsim_${os}_${arch}.tar.gz
 
 tmp=$(mktemp -d)
