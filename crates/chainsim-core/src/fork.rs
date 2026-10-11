@@ -133,6 +133,11 @@ pub enum SetKind {
     Code,
     /// The native balance: `value` is an amount in the native symbol's units.
     Balance,
+    /// A token balance of `coin_type`: `value` is an amount in the token's
+    /// units. `from` names a holder to take it from instead of minting.
+    Token { coin_type: String, from: Option<String> },
+    /// The owner of an object: `address` is the object, `value` the new owner.
+    Owner,
 }
 
 #[derive(Debug, Clone)]

@@ -93,6 +93,7 @@ enum Command {
         /// The sender to act as (impersonated; a mainnet-active address works).
         #[arg(long = "as", value_name = "ADDRESS")]
         from: String,
+        /// The contract address (EVM), or the Move function package::module::function<T...> (Sui).
         #[arg(long)]
         to: String,
         /// The function, such as "pause()" or "transfer(address,uint256)", followed by its arguments.
@@ -143,6 +144,18 @@ enum SetWhat {
     },
     /// The native balance, in whole units of the native symbol.
     Balance { address: String, amount: String },
+    /// A token balance, in whole units of the token, minted or taken from a holder.
+    Token {
+        address: String,
+        /// The token: a Sui coin type such as 0x...::usdc::USDC.
+        coin_type: String,
+        amount: String,
+        /// Take the amount from this holder instead of minting.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// The owner of an object, moved as its current owner.
+    Owner { object: String, owner: String },
 }
 
 /// The adapter for a profile family.
@@ -344,6 +357,8 @@ async fn run(command: Command) -> Result<Value> {
                     SetRequest { kind: SetKind::Code, address, value }
                 }
                 SetWhat::Balance { address, amount } => SetRequest { kind: SetKind::Balance, address, value: amount },
+                SetWhat::Token { address, coin_type, amount, from } => SetRequest { kind: SetKind::Token { coin_type, from }, address, value: amount },
+                SetWhat::Owner { object, owner } => SetRequest { kind: SetKind::Owner, address: object, value: owner },
             };
             adapter_of(&name).await?.set(&name, &req).await
         }

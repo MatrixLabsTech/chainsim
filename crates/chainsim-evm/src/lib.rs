@@ -700,6 +700,12 @@ impl Adapter for EvmAdapter {
         let eng = self.engine(&handle, &profile);
         let address = parse_address(&req.address)?.to_string();
         let (mut out, entry) = match &req.kind {
+            SetKind::Token { .. } => {
+                return Err(Error::unsupported("set token on EVM", "chainsim fund <name> <address> --token <symbol|address>:<amount> sets a token balance"));
+            }
+            SetKind::Owner => {
+                return Err(Error::unsupported("set owner on EVM", "EVM has no object owners: chainsim set <name> storage <contract> <slot> <value> changes the slot that records an owner"));
+            }
             SetKind::Storage { slot } => {
                 let (slot, value) = (word_hex(slot)?, word_hex(&req.value)?);
                 eng.rpc("anvil_setStorageAt", json!([address, slot, value])).await?;
