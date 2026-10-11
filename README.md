@@ -44,14 +44,18 @@ on every supported chain.
 ## Features
 
 - One CLI for Ethereum, Arc, Robinhood Chain and Sui mainnet forks, each running in Docker.
+- One-line install from GitHub releases for Linux and macOS, and `chainsim doctor` to check the
+  setup: Docker, engines, plugin and upstreams.
 - `send --as` acts as any account without its key, including a protocol's admin.
 - `set` overrides state directly: balance, token, storage, code or owner, as each chain supports.
 - `fund` gives a test wallet native and token balances and reads them back.
 - `snapshot` and `revert` reset a fork between scenarios.
 - `selftest` proves a fork is fit before a test spends anything on it.
 - Arc runs on Circle's own engine, so native USDC behaves as on Arc.
+- Robinhood Chain answers Arbitrum's ArbSys and ArbGasInfo precompiles.
 - JSON output, fixed exit codes and `error.next`, so an agent can branch on every result.
-- A Claude Code and Codex plugin teaches agents the setup and the workflow.
+- A Claude Code and Codex plugin, installed straight from GitHub, teaches agents the setup and
+  the workflow.
 - Forks publish no host ports by default, and provider keys never appear in output.
 
 ## Install
