@@ -160,15 +160,6 @@ the testing-only USDC stand-in and balance-sync process it uses today.
 - [docs/security.md](docs/security.md): replay risk, impersonation, provider keys and container
   isolation.
 
-## Roadmap
-
-- <img src="assets/chains/solana.svg" height="16" alt="Solana"> Solana, through Surfpool, with
-  `time` and `mine` commands for every chain family.
-- Sui object-content overrides (`set object`). The engine change lives on the
-  `chainsim/mainnet-v1.81.1` branch of [MatrixLabsTech/sui](https://github.com/MatrixLabsTech/sui),
-  a fork of MystenLabs/sui, and chainsim will build its Sui engine from it.
-- DeepQA's runner moves its fork handling onto chainsim.
-
 ## Contributing
 
 Issues and pull requests are welcome. `cargo test --workspace` runs the unit and contract
