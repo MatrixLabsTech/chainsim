@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 const NAME: &str = "chainsim";
 const PLUGIN: &str = "chainsim@chainsim";
 /// The fallback when a CLI refuses the local folder.
-const GITHUB: &str = "Lucklyric/chainsim";
+const GITHUB: &str = "MatrixLabsTech/chainsim";
 
 /// The plugin tree, as published under `plugins/chainsim/`, plus the root marketplace.
 pub const FILES: &[(&str, &str)] = &[

@@ -10,7 +10,7 @@
 
 set -eu
 
-repo=Lucklyric/chainsim
+repo=MatrixLabsTech/chainsim
 bin_dir=${CHAINSIM_BIN_DIR:-$HOME/.local/bin}
 from=""
 version=""

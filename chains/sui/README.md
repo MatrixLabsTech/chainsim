@@ -181,7 +181,7 @@ The last line moves Cetus's CLMM `AdminCap` (checked on 2026-10-11) to `0xc0ffee
 - `set storage` and `set code` have no meaning on Sui and exit 3.
 - `set` cannot write an object's fields directly yet. That needs a `SetObject` RPC that stock
   `sui-fork` lacks. We added one on the `chainsim/mainnet-v1.81.1` branch of
-  [Lucklyric/sui](https://github.com/Lucklyric/sui), a fork of MystenLabs/sui, and chainsim will
+  [MatrixLabsTech/sui](https://github.com/MatrixLabsTech/sui), a fork of MystenLabs/sui, and chainsim will
   build its Sui engine from that branch to support `set object`. Until then, change an object
   through its own module with `send --as`.
 

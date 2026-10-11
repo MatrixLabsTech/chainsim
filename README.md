@@ -41,7 +41,7 @@ container image that chainsim pulls or builds on first use, so nothing else is i
 host.
 
 ```sh
-git clone https://github.com/Lucklyric/chainsim
+git clone https://github.com/MatrixLabsTech/chainsim
 cd chainsim
 cargo install --locked --path crates/chainsim
 ```
@@ -229,7 +229,7 @@ A new chain family needs an adapter crate that implements the `Adapter` trait in
 
 - Solana, through Surfpool, with `time` and `mine` commands for every chain family.
 - Sui object-content overrides (`set object`). The engine change lives on the
-  `chainsim/mainnet-v1.81.1` branch of [Lucklyric/sui](https://github.com/Lucklyric/sui), a
+  `chainsim/mainnet-v1.81.1` branch of [MatrixLabsTech/sui](https://github.com/MatrixLabsTech/sui), a
   fork of MystenLabs/sui, and chainsim will build its Sui engine from it.
 - DeepQA's runner moves its fork handling onto chainsim (see Maintainers).
 - Published release binaries, so installing does not need a Rust toolchain.
