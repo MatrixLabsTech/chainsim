@@ -217,7 +217,7 @@ fn describe(chain: Option<&str>) -> Result<Value> {
             "revert <name> <id>",
             "call <name> <method> [<params-json>] [--from <address>]",
             "send <name> --as <address> --to <address> (--sig \"<fn(types)>\" [<arg>...] | --data <hex>) [--value <amount>]",
-            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount>",
+            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type> <amount> [--from <holder>] | owner <object> <new owner>",
             "selftest <name>",
             "pull [<engine>]",
             "engines",
