@@ -154,6 +154,22 @@ pub fn object_input(object: &Value, mutable: bool) -> Result<Value> {
     }
 }
 
+/// Refuses an owned input the sender does not own, before any gas is spent:
+/// the fork would reject it at execution. Shared and immutable inputs pass.
+pub fn check_owner(object: &Value, sender: &str, fork: &str) -> Result<()> {
+    let id = object["objectId"].as_str().unwrap_or("?");
+    match object["owner"]["kind"].as_str() {
+        Some("ADDRESS") => match object["owner"]["address"].as_str() {
+            Some(owner) if owner != sender => Err(Error::new(ErrorCode::Usage, format!("object {id} is owned by {owner}, not by the sender {sender}"))
+                .next(format!("rerun with --as {owner}, or chainsim set {fork} owner {id} {sender} first"))),
+            _ => Ok(()),
+        },
+        Some("OBJECT") => Err(Error::new(ErrorCode::Usage, format!("object {id} is owned by another object ({}), so it cannot be a transaction input", owner_text(&object["owner"])))
+            .next("pass its parent object, and let the parent's module reach it")),
+        _ => Ok(()),
+    }
+}
+
 /// The owner of an object for messages: an address, or the kind.
 fn owner_text(owner: &Value) -> String {
     owner["address"].as_str().map(str::to_string).unwrap_or_else(|| owner["kind"].as_str().unwrap_or("unknown").to_lowercase())
@@ -372,7 +388,7 @@ impl SuiAdapter {
     }
 
     /// The inputs and the one MoveCall for `send --to package::module::function<T> args...`.
-    async fn move_call(&self, g: &Grpc<'_>, to: &str, args: &[String]) -> Result<(Vec<Value>, Vec<Value>)> {
+    async fn move_call(&self, g: &Grpc<'_>, fork: &str, sender: &str, to: &str, args: &[String]) -> Result<(Vec<Value>, Vec<Value>)> {
         let target = ptb::parse_target(to)?;
         let f = g
             .call("sui.rpc.v2.MovePackageService/GetFunction", &json!({ "packageId": target.package, "moduleName": target.module, "name": target.function }), CALL_TIMEOUT)
@@ -386,7 +402,11 @@ impl SuiAdapter {
         for (p, arg) in params.iter().zip(args) {
             inputs.push(match ptb::param(p, arg, &target.type_args)? {
                 ptb::Param::Pure(bytes) => ptb::pure_input(&bytes),
-                ptb::Param::Object { id, mutable } => object_input(&self.get_object(g, &id).await?, mutable)?,
+                ptb::Param::Object { id, mutable } => {
+                    let o = self.get_object(g, &id).await?;
+                    check_owner(&o, sender, fork)?;
+                    object_input(&o, mutable)?
+                }
                 ptb::Param::Receiving { id } => {
                     let o = self.get_object(g, &id).await?;
                     json!({ "kind": "RECEIVING", "objectId": o["objectId"], "version": o["version"], "digest": o["digest"] })
@@ -402,7 +422,7 @@ impl SuiAdapter {
 
     /// The inputs and commands of a raw PTB (`send --data`). Object inputs given
     /// by ID alone get their version and digest, or initial shared version, from the fork.
-    async fn raw_ptb(&self, g: &Grpc<'_>, data: &str) -> Result<(Vec<Value>, Vec<Value>)> {
+    async fn raw_ptb(&self, g: &Grpc<'_>, fork: &str, sender: &str, data: &str) -> Result<(Vec<Value>, Vec<Value>)> {
         let usage = || Error::new(ErrorCode::Usage, "--data must be a programmable transaction as protobuf JSON: {\"inputs\": [...], \"commands\": [...]}");
         let ptb: Value = serde_json::from_str(data).map_err(|_| usage())?;
         let (Some(inputs), Some(commands)) = (ptb["inputs"].as_array(), ptb["commands"].as_array()) else { return Err(usage()) };
@@ -410,7 +430,11 @@ impl SuiAdapter {
         for i in inputs {
             let kind = i["kind"].as_str().unwrap_or("");
             let resolved_input = match (kind, i["objectId"].as_str(), i.get("version")) {
-                ("IMMUTABLE_OR_OWNED" | "SHARED", Some(id), None) => object_input(&self.get_object(g, &parse_address(id)?).await?, i["mutable"].as_bool().unwrap_or(true))?,
+                ("IMMUTABLE_OR_OWNED" | "SHARED", Some(id), _) => {
+                    let o = self.get_object(g, &parse_address(id)?).await?;
+                    check_owner(&o, sender, fork)?;
+                    if i.get("version").is_some() { i.clone() } else { object_input(&o, i["mutable"].as_bool().unwrap_or(true))? }
+                }
                 ("RECEIVING", Some(id), None) => {
                     let o = self.get_object(g, &parse_address(id)?).await?;
                     json!({ "kind": "RECEIVING", "objectId": o["objectId"], "version": o["version"], "digest": o["digest"] })
@@ -739,11 +763,11 @@ impl Adapter for SuiAdapter {
         let (inputs, commands, to) = match &req.data {
             Some(_) if !req.args.is_empty() => return Err(Error::new(ErrorCode::Usage, "pass a Move function with its arguments, or --data alone").next(move_form)),
             Some(data) => {
-                let (i, c) = self.raw_ptb(&g, data).await?;
+                let (i, c) = self.raw_ptb(&g, name, &sender, data).await?;
                 (i, c, "ptb".to_string())
             }
             None => {
-                let (i, c) = self.move_call(&g, &req.to, &req.args).await?;
+                let (i, c) = self.move_call(&g, name, &sender, &req.to, &req.args).await?;
                 (i, c, req.to.trim().to_string())
             }
         };
@@ -965,6 +989,18 @@ mod tests {
         assert!(!valid_snapshot_id("../x"));
         assert!(revert_script("s1", "s2").starts_with("D=/data; [ -d $D/snap/s1 ] || exit 4;"));
         assert!(snapshot_script("s1").contains("trap 'rm -f $D/hold' EXIT"));
+    }
+
+    #[test]
+    fn owned_inputs_must_belong_to_the_sender() {
+        let cap = json!({ "objectId": "0xef", "owner": { "kind": "ADDRESS", "address": "0xcf" } });
+        assert!(check_owner(&cap, "0xcf", "f").is_ok());
+        let e = check_owner(&cap, "0x5e", "f").unwrap_err();
+        assert_eq!(e.code, ErrorCode::Usage);
+        assert_eq!(e.next.as_deref(), Some("rerun with --as 0xcf, or chainsim set f owner 0xef 0x5e first"));
+        assert!(check_owner(&json!({ "objectId": "0x6", "owner": { "kind": "SHARED", "version": "1" } }), "0x5e", "f").is_ok());
+        assert!(check_owner(&json!({ "objectId": "0x2", "owner": { "kind": "IMMUTABLE" } }), "0x5e", "f").is_ok());
+        assert_eq!(check_owner(&json!({ "objectId": "0xc", "owner": { "kind": "OBJECT", "address": "0xp" } }), "0x5e", "f").unwrap_err().code, ErrorCode::Usage);
     }
 
     #[test]
