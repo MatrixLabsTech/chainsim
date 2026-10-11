@@ -21,7 +21,7 @@ on every supported chain.
 - `snapshot` and `revert` reset a fork between scenarios.
 - `selftest` proves a fork is fit before a test spends anything on it.
 - Arc runs on Circle's own engine, so native USDC behaves as on Arc.
-- JSON output, fixed exit codes and `error.next` let an agent act on every result.
+- JSON output, fixed exit codes and `error.next`, so an agent can branch on every result.
 - A Claude Code and Codex plugin teaches agents the setup and the workflow.
 - Forks publish no host ports by default, and provider keys never appear in output.
 
@@ -126,7 +126,7 @@ codex plugin add chainsim@chainsim
 Offline, `chainsim install` adds the copy of the plugin built into the binary to each CLI found
 on `PATH`, and prints a suggested Claude Code permission rule.
 
-## Built for DeepQA
+## DeepQA
 
 <a href="https://deepqa.app">
   <picture>
@@ -140,7 +140,7 @@ workflow for dApps, and MatrixLabs maintains it. DeepQA is moving its on-chain t
 chainsim forks. On Arc, the native USDC that chainsim's engine runs lets DeepQA's runner drop
 the testing-only USDC stand-in and balance-sync process it uses today.
 
-## More
+## Documentation
 
 - [docs/architecture.md](docs/architecture.md): engines, the control sidecar, networks,
   `--publish`, the engine lock, upstreams and profiles.
