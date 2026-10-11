@@ -36,8 +36,14 @@ pub trait Adapter: Send + Sync {
     /// Consume snapshot `id` and return a fresh snapshot of the restored state.
     async fn revert(&self, name: &str, id: &str) -> Result<Reverted>;
 
+    /// Override state on the fork and return the read-back value.
     async fn set(&self, _name: &str, _req: &SetRequest) -> Result<Value> {
-        Err(Error::unsupported("set", "chainsim call <name> <method> <params-json>"))
+        Err(Error::unsupported("set", "chainsim fund <name> <address> --native <amount> sets a native balance on this chain"))
+    }
+
+    /// Send a transaction as any address without its key, and return the receipt.
+    async fn send(&self, _name: &str, _req: &SendRequest) -> Result<Value> {
+        Err(Error::unsupported("send", "chainsim fund <name> <address> --native <amount> gives a fresh address a balance on this chain"))
     }
 
     async fn time(&self, _name: &str, _req: &TimeRequest) -> Result<Value> {

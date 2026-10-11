@@ -106,7 +106,12 @@ impl<'a> Control<'a> {
         })?;
         if let Some(err) = v.get("error") {
             let message = self.scrub(err.get("message").and_then(Value::as_str).unwrap_or("error"));
-            return Err(classify_rpc_error(method, &message, err.get("code").and_then(Value::as_i64), self.env.as_deref()));
+            let e = classify_rpc_error(method, &message, err.get("code").and_then(Value::as_i64), self.env.as_deref());
+            // Revert data, for a caller that decodes the reason.
+            return Err(match err.get("data").filter(|d| !d.is_null()) {
+                Some(data) if e.code == ErrorCode::RpcError => e.data(json!({ "rpcData": data })),
+                _ => e,
+            });
         }
         Ok(v.get("result").cloned().unwrap_or(Value::Null))
     }

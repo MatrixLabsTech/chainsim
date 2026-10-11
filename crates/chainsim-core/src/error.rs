@@ -18,6 +18,8 @@ pub enum ErrorCode {
     ReadbackMismatch,
     /// Exit 1: anything else.
     Internal,
+    /// Exit 1: a `send` reverted; the message carries the decoded reason.
+    TxReverted,
     /// Exit 2: bad arguments.
     Usage,
     /// Exit 3: this engine lacks the operation; `next` names the substitute.
@@ -43,12 +45,13 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    pub const ALL: [ErrorCode; 16] = [
+    pub const ALL: [ErrorCode; 17] = [
         Self::DockerUnavailable,
         Self::EngineFailed,
         Self::RpcError,
         Self::ReadbackMismatch,
         Self::Internal,
+        Self::TxReverted,
         Self::Usage,
         Self::Unsupported,
         Self::ForkNotFound,
@@ -64,7 +67,7 @@ impl ErrorCode {
 
     pub fn exit_code(self) -> i32 {
         match self {
-            Self::DockerUnavailable | Self::EngineFailed | Self::RpcError | Self::ReadbackMismatch | Self::Internal => 1,
+            Self::DockerUnavailable | Self::EngineFailed | Self::RpcError | Self::ReadbackMismatch | Self::Internal | Self::TxReverted => 1,
             Self::Usage => 2,
             Self::Unsupported => 3,
             Self::ForkNotFound | Self::UnknownChain | Self::UnknownToken | Self::SnapshotNotFound => 4,
@@ -82,6 +85,7 @@ impl ErrorCode {
             Self::RpcError => "rpc_error",
             Self::ReadbackMismatch => "readback_mismatch",
             Self::Internal => "internal",
+            Self::TxReverted => "tx_reverted",
             Self::Usage => "usage",
             Self::Unsupported => "unsupported",
             Self::ForkNotFound => "fork_not_found",

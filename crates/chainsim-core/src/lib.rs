@@ -10,6 +10,7 @@ pub mod envelope;
 pub mod error;
 pub mod fork;
 pub mod lock;
+pub mod mods;
 pub mod profile;
 
 mod embedded {

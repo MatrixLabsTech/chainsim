@@ -2,7 +2,6 @@
 //! (design section 5).
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::profile::Maturity;
 
@@ -125,18 +124,37 @@ pub struct Reverted {
     pub snapshot: String,
 }
 
-#[derive(Debug, Clone)]
+/// What `set` overrides on a fork.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetKind {
+    /// One storage slot: `slot` and a 32-byte `value`.
+    Storage { slot: String },
+    /// The contract code: `value` is hex.
     Code,
-    Storage,
-    Account,
+    /// The native balance: `value` is an amount in the native symbol's units.
+    Balance,
 }
 
 #[derive(Debug, Clone)]
 pub struct SetRequest {
     pub kind: SetKind,
-    pub target: String,
-    pub value: Value,
+    pub address: String,
+    pub value: String,
+}
+
+/// A transaction sent as `from` without its key (impersonation).
+#[derive(Debug, Clone, Default)]
+pub struct SendRequest {
+    pub from: String,
+    pub to: String,
+    /// A function signature such as `pause()` or `transfer(address,uint256)`.
+    pub sig: Option<String>,
+    /// The arguments for `sig`.
+    pub args: Vec<String>,
+    /// Raw calldata in hex, instead of `sig`.
+    pub data: Option<String>,
+    /// Native value in whole units of the native symbol.
+    pub value: Option<String>,
 }
 
 #[derive(Debug, Clone)]
