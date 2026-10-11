@@ -131,7 +131,7 @@ mod tests {
     fn the_embedded_plugin_is_one_skill_named_chainsim() {
         let skill = FILES.iter().find(|(p, _)| p.ends_with("SKILL.md")).unwrap().1;
         assert!(skill.starts_with("---\nname: chainsim\ndescription: Local mainnet forks of Ethereum, Arc, Robinhood Chain, Solana and Sui."));
-        for word in ["chainsim describe", "chainsim up", "chainsim selftest", "chainsim fund", "chainsim snapshot", "chainsim revert", "chainsim down", "error.next", "`fork`"] {
+        for word in ["chainsim describe", "chainsim up", "chainsim selftest", "chainsim fund", "chainsim snapshot", "chainsim revert", "chainsim down", "chainsim send", "--as", "chainsim set", "modifications", "error.next", "`fork`"] {
             assert!(skill.contains(word), "{word}");
         }
         let market: Value = serde_json::from_str(FILES[0].1).unwrap();

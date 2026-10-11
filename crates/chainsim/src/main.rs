@@ -9,7 +9,7 @@ use std::path::PathBuf;
 mod install;
 
 use chainsim_core::docker::Docker;
-use chainsim_core::fork::{FundRequest, TokenAmount, UpRequest};
+use chainsim_core::fork::{FundRequest, SendRequest, SetKind, SetRequest, TokenAmount, UpRequest};
 use chainsim_core::lock::EngineLock;
 use chainsim_core::profile::{self, Profile};
 use chainsim_core::{envelope, Adapter, Error, ErrorCode, Result};
@@ -87,6 +87,32 @@ enum Command {
         #[arg(long)]
         from: Option<String>,
     },
+    /// Send a transaction as any address, without its key, on the fork only.
+    Send {
+        name: String,
+        /// The sender to act as (impersonated; a mainnet-active address works).
+        #[arg(long = "as", value_name = "ADDRESS")]
+        from: String,
+        #[arg(long)]
+        to: String,
+        /// The function, such as "pause()" or "transfer(address,uint256)", followed by its arguments.
+        #[arg(long, conflicts_with = "data")]
+        sig: Option<String>,
+        /// Raw calldata in hex, instead of --sig.
+        #[arg(long)]
+        data: Option<String>,
+        /// Native value to send, in whole units of the native symbol.
+        #[arg(long)]
+        value: Option<String>,
+        /// The arguments for --sig. Put a negative number after `--`.
+        args: Vec<String>,
+    },
+    /// Override state on the fork and read it back.
+    Set {
+        name: String,
+        #[command(subcommand)]
+        what: SetWhat,
+    },
     /// Chain-level checks; exit 6 when any fails, with every check in data.
     Selftest { name: String },
     /// Pull or build engines from the lock ahead of time (default: every engine).
@@ -101,6 +127,22 @@ enum Command {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum SetWhat {
+    /// One storage slot to a 32-byte value (decimal or 0x hex).
+    Storage { address: String, slot: String, value: String },
+    /// A contract's code, from hex or a file holding hex.
+    Code {
+        address: String,
+        #[arg(required_unless_present = "file", conflicts_with = "file")]
+        hex: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// The native balance, in whole units of the native symbol.
+    Balance { address: String, amount: String },
 }
 
 /// The adapter for a profile family.
@@ -159,6 +201,8 @@ fn describe(chain: Option<&str>) -> Result<Value> {
             "snapshot <name>",
             "revert <name> <id>",
             "call <name> <method> [<params-json>] [--from <address>]",
+            "send <name> --as <address> --to <address> (--sig \"<fn(types)>\" [<arg>...] | --data <hex>) [--value <amount>]",
+            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount>",
             "selftest <name>",
             "pull [<engine>]",
             "engines",
@@ -278,7 +322,31 @@ async fn run(command: Command) -> Result<Value> {
             to_value(adapter(&profile.family).await?.up(&profile, &req).await)
         }
         Command::Ls => ls().await,
-        Command::Status { name } => to_value(adapter_of(&name).await?.status(&name).await),
+        Command::Status { name } => {
+            let mut status = to_value(adapter_of(&name).await?.status(&name).await)?;
+            // Every send --as and set since up, so a report can name what depends on them.
+            status["modifications"] = json!(chainsim_core::mods::list(&Docker::connect().await?, &name).await?);
+            Ok(status)
+        }
+        Command::Send { name, from, to, sig, data, value, args } => {
+            let req = SendRequest { from, to, sig, args, data, value };
+            adapter_of(&name).await?.send(&name, &req).await
+        }
+        Command::Set { name, what } => {
+            let req = match what {
+                SetWhat::Storage { address, slot, value } => SetRequest { kind: SetKind::Storage { slot }, address, value },
+                SetWhat::Code { address, hex, file } => {
+                    let value = match (hex, file) {
+                        (Some(h), _) => h,
+                        (None, Some(f)) => std::fs::read_to_string(&f).map_err(|e| Error::new(ErrorCode::Usage, format!("read {}: {e}", f.display())))?,
+                        (None, None) => unreachable!("clap requires one"),
+                    };
+                    SetRequest { kind: SetKind::Code, address, value }
+                }
+                SetWhat::Balance { address, amount } => SetRequest { kind: SetKind::Balance, address, value: amount },
+            };
+            adapter_of(&name).await?.set(&name, &req).await
+        }
         Command::Down { all: true, .. } => down_all().await,
         Command::Down { name, .. } => {
             let name = name.unwrap_or_default();

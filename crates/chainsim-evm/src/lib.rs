@@ -2,6 +2,7 @@
 //! driven from outside through Docker and the engine's JSON-RPC (design
 //! sections 3 and 5). Every engine call goes through the fork's control path.
 
+pub mod abi;
 pub mod units;
 
 use std::collections::HashMap;
@@ -41,7 +42,7 @@ const ARB_GAS_INFO: &str = "0x000000000000000000000000000000000000006C";
 /// (profiles/assets/src/ArbGasInfoMock.sol).
 const MOCK_L1_BASE_FEE: u64 = 255074;
 
-pub const OPERATIONS: &[&str] = &["describe", "up", "down", "ls", "status", "fund", "snapshot", "revert", "call", "selftest"];
+pub const OPERATIONS: &[&str] = &["describe", "up", "down", "ls", "status", "fund", "snapshot", "revert", "call", "send", "set", "selftest"];
 
 pub struct EvmAdapter {
     docker: Docker,
@@ -153,6 +154,59 @@ struct FundToken {
     address: String,
     decimals: u8,
     native_view: bool,
+}
+
+/// The native amount to add before `send --as`, when `balance` cannot pay
+/// `value` plus gas. The top-up leaves twice the gas cost, for a fee that
+/// moves between the estimate and the send. None when the balance suffices.
+pub fn top_up(balance: U256, value: U256, gas: U256, gas_price: U256) -> Option<U256> {
+    let fee = gas.saturating_mul(gas_price);
+    let need = fee.saturating_add(value);
+    (balance < need).then(|| fee.saturating_mul(U256::from(2u8)).saturating_add(value) - balance)
+}
+
+/// A 32-byte word from a decimal or 0x-hex number, as 0x plus 64 hex digits.
+pub fn word_hex(s: &str) -> Result<String> {
+    let v: U256 = s.trim().parse().map_err(|_| Error::new(ErrorCode::Usage, format!("{s:?} is not a decimal or 0x-hex number of at most 32 bytes")))?;
+    Ok(format!("0x{v:064x}"))
+}
+
+/// Hex bytes, checked and lowercased, with the 0x prefix.
+pub fn hex_bytes(s: &str, what: &str) -> Result<String> {
+    let t = s.trim();
+    let body = t.strip_prefix("0x").unwrap_or(t);
+    if body.len() % 2 != 0 || !body.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::new(ErrorCode::Usage, format!("{what} is not hex bytes")));
+    }
+    Ok(format!("0x{}", body.to_ascii_lowercase()))
+}
+
+/// A send that would revert: the decoded reason when the engine returned
+/// revert data, else the engine's message.
+fn reverted(e: Error) -> Error {
+    if e.code != ErrorCode::RpcError {
+        return e;
+    }
+    let data = e.data.as_ref().and_then(|d| d["rpcData"].as_str()).map(str::to_string);
+    let from_message = || {
+        let text = e.message.split_once("execution reverted").map_or(e.message.as_str(), |(_, r)| r);
+        // The engine's JSON-RPC code rides at the end as " (3)".
+        let text = match text.trim_end().rsplit_once(" (") {
+            Some((head, code)) if code.trim_end_matches(')').parse::<i64>().is_ok() => head,
+            _ if text.trim().strip_prefix('(').and_then(|c| c.strip_suffix(')')).is_some_and(|c| c.parse::<i64>().is_ok()) => "",
+            _ => text,
+        };
+        text.trim_start_matches([':', ' ']).trim().to_string()
+    };
+    let reason = data.as_deref().and_then(abi::revert_reason).unwrap_or_else(from_message);
+    let reason = if reason.is_empty() { "no reason given".to_string() } else { reason };
+    Error::new(ErrorCode::TxReverted, format!("the transaction reverts on the fork: {reason}"))
+        .next("check that --as holds the role the function needs, for example by reading the contract's role getter with chainsim call")
+        .data(json!({ "reason": reason, "revertData": data }))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 /// An `up --block` failure that reads like missing history: the upstream is
@@ -591,6 +645,112 @@ impl Adapter for EvmAdapter {
         Ok(Status { fork: handle.fork(&profile, dev), head, uptime_secs: handle.uptime_secs })
     }
 
+    async fn send(&self, name: &str, req: &SendRequest) -> Result<Value> {
+        let (handle, profile) = self.open(name).await?;
+        let eng = self.engine(&handle, &profile);
+        let from = parse_address(&req.from)?.to_string();
+        let to = parse_address(&req.to)?.to_string();
+        let data = match (&req.sig, &req.data) {
+            (Some(sig), None) => abi::encode_call(sig, &req.args)?,
+            (None, Some(d)) if req.args.is_empty() => hex_bytes(d, "--data")?,
+            (None, None) if req.args.is_empty() => "0x".to_string(),
+            _ => return Err(Error::new(ErrorCode::Usage, "pass --sig with its arguments, or --data alone").next("chainsim send <name> --as <address> --to <address> --sig \"pause()\"")),
+        };
+        let decimals = profile.native.as_ref().map_or(18, |n| n.decimals);
+        let symbol = profile.native.as_ref().map_or("native".to_string(), |n| n.symbol.clone());
+        let value = match &req.value {
+            Some(v) => parse_amount(v, decimals)?,
+            None => U256::ZERO,
+        };
+        let tx = json!({ "from": from, "to": to, "data": data, "value": qty(value) });
+
+        // A dry run first: a revert comes back with its reason and sends nothing.
+        eng.rpc("eth_call", json!([tx, "latest"])).await.map_err(reverted)?;
+        let gas = parse_qty(&eng.rpc("eth_estimateGas", json!([tx])).await.map_err(reverted)?)?;
+        let price = parse_qty(&eng.rpc("eth_gasPrice", json!([])).await?)?;
+        let balance = eng.balance(&from).await?;
+        let added = top_up(balance, value, gas, price);
+        if let Some(add) = added {
+            eng.set_balance(&from, balance + add).await?;
+        }
+        let receipt = eng.send_as(&from, tx).await?;
+        let ok = receipt["status"] == json!("0x1");
+        let hash = receipt["transactionHash"].clone();
+        let top = added.map(|a| json!({ "amount": format_amount(a, decimals), "symbol": symbol }));
+        let selector = data.get(..10).unwrap_or(&data).to_string();
+        let entry = json!({
+            "kind": "send-as", "from": from, "to": to, "sig": req.sig, "selector": selector,
+            "value": format_amount(value, decimals), "txHash": hash, "status": if ok { 1 } else { 0 }, "topUp": top, "at": now_secs(),
+        });
+        chainsim_core::mods::record(&self.docker, name, &entry).await?;
+        let gas_used = parse_qty(&receipt["gasUsed"]).map(|g| g.to_string()).unwrap_or_default();
+        let block = parse_qty(&receipt["blockNumber"]).map(|b| b.to::<u64>()).unwrap_or(0);
+        let out = json!({
+            "txHash": hash, "status": if ok { 1 } else { 0 }, "gasUsed": gas_used, "blockNumber": block,
+            "from": from, "to": to, "topUp": top, "note": chainsim_core::mods::NOTE,
+        });
+        if !ok {
+            return Err(Error::new(ErrorCode::TxReverted, "the transaction was mined with status 0").next("chainsim call <name> eth_call '[{...}, \"latest\"]' shows the reason before sending").data(out));
+        }
+        Ok(out)
+    }
+
+    async fn set(&self, name: &str, req: &SetRequest) -> Result<Value> {
+        let (handle, profile) = self.open(name).await?;
+        let eng = self.engine(&handle, &profile);
+        let address = parse_address(&req.address)?.to_string();
+        let (mut out, entry) = match &req.kind {
+            SetKind::Storage { slot } => {
+                let (slot, value) = (word_hex(slot)?, word_hex(&req.value)?);
+                eng.rpc("anvil_setStorageAt", json!([address, slot, value])).await?;
+                let read = parse_qty(&eng.rpc("eth_getStorageAt", json!([address, slot, "latest"])).await?)?;
+                let read = format!("0x{read:064x}");
+                if read != value {
+                    return Err(Error::new(ErrorCode::ReadbackMismatch, format!("slot {slot} reads {read} after setting {value}")));
+                }
+                (json!({ "kind": "storage", "address": address, "slot": slot, "value": read }), json!({ "kind": "set-storage", "address": address, "slot": slot, "value": read }))
+            }
+            SetKind::Code => {
+                let code = hex_bytes(&req.value, "the code")?;
+                eng.rpc("anvil_setCode", json!([address, code])).await?;
+                let read = eng.rpc("eth_getCode", json!([address, "latest"])).await?.as_str().unwrap_or_default().to_ascii_lowercase();
+                if read != code {
+                    return Err(Error::new(ErrorCode::ReadbackMismatch, format!("the code at {address} reads {} bytes after setting {}", read.len().saturating_sub(2) / 2, code.len().saturating_sub(2) / 2)));
+                }
+                let bytes = alloy_primitives::hex::decode(&code).unwrap_or_default();
+                let hash = format!("{}", alloy_primitives::keccak256(&bytes));
+                (json!({ "kind": "code", "address": address, "bytes": bytes.len(), "codeHash": hash }), json!({ "kind": "set-code", "address": address, "bytes": bytes.len(), "codeHash": hash }))
+            }
+            SetKind::Balance => {
+                let decimals = profile.native.as_ref().map_or(18, |n| n.decimals);
+                let symbol = profile.native.as_ref().map_or("native".to_string(), |n| n.symbol.clone());
+                let amount = parse_amount(&req.value, decimals)?;
+                eng.set_balance(&address, amount).await?;
+                let read = eng.balance(&address).await?;
+                if read != amount {
+                    return Err(Error::new(ErrorCode::ReadbackMismatch, format!("{address} reads {} {symbol} after setting {}", format_amount(read, decimals), format_amount(amount, decimals))));
+                }
+                // Chains whose native balance is also an ERC-20 (Arc USDC) show both views.
+                let who = parse_address(&address)?;
+                let mut views = Vec::new();
+                for t in profile.tokens.iter().filter(|t| t.native_view) {
+                    let v = eng.token_balance(&t.address, who).await?;
+                    views.push(json!({ "symbol": t.symbol, "address": t.address, "amount": format_amount(v, t.decimals), "raw": v.to_string() }));
+                }
+                let amount_s = format_amount(read, decimals);
+                (
+                    json!({ "kind": "balance", "address": address, "symbol": symbol, "amount": amount_s, "raw": read.to_string(), "views": views }),
+                    json!({ "kind": "set-balance", "address": address, "symbol": symbol, "amount": amount_s }),
+                )
+            }
+        };
+        let mut entry = entry;
+        entry["at"] = json!(now_secs());
+        chainsim_core::mods::record(&self.docker, name, &entry).await?;
+        out["note"] = json!(chainsim_core::mods::NOTE);
+        Ok(out)
+    }
+
     async fn fund(&self, name: &str, req: &FundRequest) -> Result<Funded> {
         let (handle, profile) = self.open(name).await?;
         let eng = self.engine(&handle, &profile);
@@ -710,6 +870,42 @@ impl Adapter for EvmAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tops_up_only_when_gas_cannot_be_paid() {
+        let (gas, price) = (U256::from(50_000u64), U256::from(10u64));
+        // Exactly enough: no top-up.
+        assert_eq!(top_up(U256::from(500_000u64), U256::ZERO, gas, price), None);
+        // Empty account: twice the fee.
+        assert_eq!(top_up(U256::ZERO, U256::ZERO, gas, price), Some(U256::from(1_000_000u64)));
+        // Value counts, and the top-up is the difference.
+        assert_eq!(top_up(U256::from(100u64), U256::from(7u64), gas, price), Some(U256::from(1_000_007u64 - 100)));
+    }
+
+    #[test]
+    fn words_and_hex() {
+        assert_eq!(word_hex("1").unwrap(), format!("0x{:064x}", 1));
+        assert_eq!(word_hex("0xff").unwrap(), format!("0x{:064x}", 255));
+        assert!(word_hex("nope").is_err());
+        assert_eq!(hex_bytes("0xAbCd", "x").unwrap(), "0xabcd");
+        assert!(hex_bytes("0xabc", "x").is_err());
+    }
+
+    #[test]
+    fn reverts_carry_the_decoded_reason() {
+        let data = abi::encode_call("Error(string)", &["Pausable: caller is not the pauser".to_string()]).unwrap();
+        let e = reverted(Error::new(ErrorCode::RpcError, "eth_call: execution reverted (3)").data(json!({ "rpcData": data })));
+        assert_eq!((e.code, e.code.exit_code()), (ErrorCode::TxReverted, 1));
+        assert_eq!(e.message, "the transaction reverts on the fork: Pausable: caller is not the pauser");
+        let e = reverted(Error::new(ErrorCode::RpcError, "eth_call: execution reverted: Ownable: caller is not the owner"));
+        assert_eq!(e.data.unwrap()["reason"], "Ownable: caller is not the owner");
+        assert_eq!(reverted(Error::new(ErrorCode::RateLimited, "slow")).code, ErrorCode::RateLimited);
+        // An empty revert, as anvil reports it: no reason, and not the RPC code.
+        let e = reverted(Error::new(ErrorCode::RpcError, "eth_call: execution reverted (3)").data(json!({ "rpcData": "0x" })));
+        assert_eq!(e.data.unwrap()["reason"], "no reason given");
+        let e = reverted(Error::new(ErrorCode::RpcError, "eth_call: execution reverted: Ownable: caller is not the owner (3)"));
+        assert_eq!(e.data.unwrap()["reason"], "Ownable: caller is not the owner");
+    }
 
     #[test]
     fn old_block_failures_point_at_an_archive_upstream() {
