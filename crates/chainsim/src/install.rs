@@ -51,7 +51,7 @@ pub fn permissions() -> Value {
             "file": "~/.claude/settings.json",
             "permissions": { "allow": ["Bash(chainsim *)"], "ask": ["Bash(chainsim down --all)", "Bash(chainsim down --all *)", "Bash(chainsim prune)", "Bash(chainsim prune *)"] },
         },
-        "codex": "no per-command rule: Codex asks according to its approval policy",
+        "codex": "no per-command rule: Codex asks according to its approval policy. Codex's default sandbox blocks the Docker socket, so chainsim commands must run outside it: approve the escalation when Codex asks, or use a sandbox setting that allows the Docker socket.",
         "note": "Add the claude rule to your settings to run chainsim without a prompt each time; `chainsim down --all` and `chainsim prune` still ask.",
     })
 }
@@ -139,6 +139,13 @@ mod tests {
         assert_eq!(market["plugins"][0]["source"], "./plugins/chainsim");
         assert_eq!((market["name"].as_str(), plugin["name"].as_str()), (Some(NAME), Some(NAME)));
         assert_eq!(plugin["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn codex_permissions_say_chainsim_runs_outside_the_sandbox() {
+        let codex = permissions()["codex"].as_str().unwrap().to_string();
+        assert!(codex.contains("Codex's default sandbox blocks the Docker socket"), "{codex}");
+        assert!(codex.contains("approve the escalation"), "{codex}");
     }
 
     #[test]

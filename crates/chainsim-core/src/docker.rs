@@ -148,7 +148,32 @@ pub struct Docker {
 }
 
 fn docker_err(e: bollard::errors::Error) -> Error {
-    Error::new(ErrorCode::DockerUnavailable, format!("docker: {e}")).next("start Docker, then retry")
+    // bollard's text stops at "client error (Connect)": the cause, such as
+    // "Permission denied (os error 13)", is further down the source chain.
+    let mut message = format!("docker: {e}");
+    let mut source = std::error::Error::source(&e);
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !message.contains(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        source = cause.source();
+    }
+    let next = docker_next(&message);
+    Error::new(ErrorCode::DockerUnavailable, message).next(next)
+}
+
+/// `error.next` for docker_unavailable. A refused socket usually means a
+/// sandbox, such as Codex's default one, sits between chainsim and Docker; a
+/// missing daemon needs Docker started.
+pub fn docker_next(message: &str) -> &'static str {
+    let lower = message.to_lowercase();
+    if ["permission denied", "operation not permitted", "os error 13", "os error 1)"].iter().any(|w| lower.contains(w)) {
+        "if this runs inside a sandbox such as Codex's, rerun the command outside the sandbox (approve the escalation); otherwise start Docker and give your user access to its socket, then retry"
+    } else {
+        "start Docker, then retry"
+    }
 }
 
 fn is_not_found(e: &bollard::errors::Error) -> bool {
@@ -703,6 +728,15 @@ fn parse_rfc3339_secs(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_socket_points_out_of_the_sandbox() {
+        let sandbox = docker_next("docker: Error in the hyper legacy client: client error (Connect): Permission denied (os error 13)");
+        assert!(sandbox.starts_with("if this runs inside a sandbox such as Codex's, rerun the command outside the sandbox"), "{sandbox}");
+        assert!(docker_next("docker: Operation not permitted (os error 1)").contains("sandbox"));
+        assert_eq!(docker_next("docker: Socket not found: /var/run/docker.sock"), "start Docker, then retry");
+        assert_eq!(docker_next("docker: Connection refused (os error 111)"), "start Docker, then retry");
+    }
 
     #[test]
     fn names() {
