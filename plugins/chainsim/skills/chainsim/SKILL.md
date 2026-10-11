@@ -24,9 +24,11 @@ Work through these steps in order. Each ends on a check you can make.
    read-back balances.
 5. **Act as any account, or change contract state, when the task needs it.** To call a function
    only an admin, owner or other role holder may call, run `chainsim send <name> --as <address>
-   --to <contract> --sig "<fn(types)>" [<arg>...]` with the role holder's address: no key is
-   needed. To change state directly, run `chainsim set <name> storage|code|balance ...`. Done
-   when the receipt `status` is 1 or the read-back matches what you set.
+   --to <target> [<arg>...]` with the role holder's address: no key is needed. The target is a
+   contract with `--sig "<fn(types)>"` on EVM, or `package::module::function<T...>` on Sui. To
+   change state directly, run `chainsim set <name> balance|token|owner|storage|code ...`;
+   `chainsim describe <chain>` lists what each chain supports. Done when the receipt `status` is
+   1 or the read-back matches what you set.
 6. **Do the work.** Before each scenario run `chainsim snapshot <name>`, and after it
    `chainsim revert <name> <id>`. Done when every scenario has a pass or fail and each `revert`
    exited 0.
