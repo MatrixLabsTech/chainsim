@@ -370,7 +370,7 @@ impl EvmAdapter {
                 }
             }
         }
-        eprintln!("chainsim: {name} warmed up in {} ms", warm.elapsed().as_millis());
+        chainsim_core::log(format_args!("{name} warmed up in {} ms", warm.elapsed().as_millis()));
 
         let dev = self.dev_accounts(&eng).await;
         Ok(handle.fork(profile, dev))

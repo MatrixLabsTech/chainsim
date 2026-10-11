@@ -18,4 +18,11 @@ mod embedded {
 }
 
 pub use adapter::Adapter;
+
+/// One progress line on stderr. A closed stderr, such as `chainsim up 2>&1 | head`,
+/// is ignored rather than a panic.
+pub fn log(msg: std::fmt::Arguments) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "chainsim: {msg}");
+}
 pub use error::{Error, ErrorCode, Result};

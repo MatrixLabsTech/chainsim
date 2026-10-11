@@ -239,7 +239,7 @@ impl Docker {
     async fn fetch_engine(&self, id: &str, engine: &Engine, reference: &str) -> Result<()> {
         let reference = reference.to_string();
         if engine.pull.is_some() {
-            eprintln!("chainsim: pulling {id} {}", engine.version);
+            crate::log(format_args!("pulling {id} {}", engine.version));
             let opts = CreateImageOptionsBuilder::default().from_image(&reference).build();
             let mut stream = self.inner.create_image(Some(opts), None, None);
             while let Some(item) = stream.next().await {
@@ -253,7 +253,7 @@ impl Docker {
                 .find(|(ctx, _)| *ctx == build.context)
                 .map(|(_, body)| *body)
                 .ok_or_else(|| Error::new(ErrorCode::Internal, format!("engines/{}/Dockerfile is not embedded", build.context)))?;
-            eprintln!("chainsim: building {id} {} for {arch}", engine.version);
+            crate::log(format_args!("building {id} {} for {arch}", engine.version));
             let mut tar = tar::Builder::new(Vec::new());
             let mut header = tar::Header::new_gnu();
             header.set_size(dockerfile.len() as u64);

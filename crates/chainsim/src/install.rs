@@ -3,6 +3,7 @@
 //! It is the offline path: the binary carries the plugin, so no network is
 //! needed. Online, both CLIs also add the marketplace from GitHub.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -64,7 +65,7 @@ fn on_path(cli: &str) -> bool {
 /// Runs one CLI step. Its output goes to stderr; a failure returns its last line.
 fn run(cli: &str, args: &[&str]) -> std::result::Result<(), String> {
     let out = Command::new(cli).args(args).stdin(Stdio::null()).output().map_err(|e| format!("{cli}: {e}"))?;
-    eprint!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let _ = write!(std::io::stderr(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     if out.status.success() {
         return Ok(());
     }
