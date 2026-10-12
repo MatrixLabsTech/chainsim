@@ -45,6 +45,18 @@
           "amd64": "mysten/sui-tools:mainnet-v1.81.1@sha256:5336a71e37812bd6609a73a07bb99c267b3861c7670b7c49e20a6c9e5d5f1de6",
           "arm64": "mysten/sui-tools:mainnet-v1.81.1-arm64@sha256:75cffe13c485980874bf24874b9d892fa718b13748b690d0b0ba84b5872b2836"
         },
+        "tarballs": {
+          "amd64": {
+            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/sui-fork-chainsim-mainnet-v1.81.1-485d5ec0a773/sui-fork-mainnet-v1.81.1-485d5ec0a773-linux-amd64.tar.gz",
+            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/sui-fork-chainsim-mainnet-v1.81.1-485d5ec0a773/sui-fork-mainnet-v1.81.1-485d5ec0a773-linux-amd64.tar.gz.sha256",
+            "sha256": "10873a04f7b52acbe71bc7d9d3152d4a7771e30b3f3b963d6388a7d3809ce3a5"
+          },
+          "arm64": {
+            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/sui-fork-chainsim-mainnet-v1.81.1-485d5ec0a773/sui-fork-mainnet-v1.81.1-485d5ec0a773-linux-arm64.tar.gz",
+            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/sui-fork-chainsim-mainnet-v1.81.1-485d5ec0a773/sui-fork-mainnet-v1.81.1-485d5ec0a773-linux-arm64.tar.gz.sha256",
+            "sha256": "6f85fc9ac09c8e640a74d8f4c29cfffb3c291437ec18e8d5f1995c0947601803"
+          }
+        },
         "source": {
           "repo": "https://github.com/MatrixLabsTech/sui",
           "branch": "chainsim/mainnet-v1.81.1",

@@ -1,27 +1,24 @@
-# chainsim's patched sui-fork (design section 3): Mysten's sui-fork built from
-# chainsim's branch of github.com/MatrixLabsTech/sui at a pinned commit, which adds
-# ForkingService/SetObject, then copied onto the pinned sui-tools image of the
-# same release. chainsim passes every argument from engines.lock.json. The
-# source and cargo cache are removed in the step that builds, so the build
-# stage keeps only the toolchain layer.
-ARG TOOLCHAIN
+# chainsim's patched sui-fork from its release asset (design section 3): the
+# binary the engine workflow compiled from the pinned commit with
+# build.Dockerfile, checked against the lock's sha256 and copied onto the pinned
+# sui-tools image for the host. sui-tools has no curl, so a pinned curl stage
+# downloads it. chainsim passes every argument from engines.lock.json.
 ARG BASE
-FROM ${TOOLCHAIN} AS build
-ARG REPO
-ARG COMMIT
+ARG FETCH=curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6
+FROM ${FETCH} AS fetch
+ARG TARBALL_URL
+ARG TARBALL_SHA256_URL
+ARG TARBALL_SHA256
+# The curl image runs as curl_user, which cannot write to a WORKDIR Docker creates.
+USER root
+WORKDIR /tmp/fetch
 RUN set -eu; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends cmake clang libpq-dev; \
-    git init -q /src; \
-    cd /src; \
-    git fetch -q --depth 1 "$REPO" "$COMMIT"; \
-    git checkout -q FETCH_HEAD; \
-    head="$(git rev-parse HEAD)"; \
-    [ "$head" = "$COMMIT" ] || { echo "fetched $head, not $COMMIT"; exit 1; }; \
-    CARGO_PROFILE_RELEASE_DEBUG=0 cargo build --locked --release -j 8 --bin sui-fork; \
-    install -m 0755 target/release/sui-fork /sui-fork; \
-    cd /; \
-    rm -rf /src /usr/local/cargo/registry /usr/local/cargo/git /var/lib/apt/lists/*
+    curl -fsSL -o sui-fork.tar.gz "$TARBALL_URL"; \
+    published="$(curl -fsSL "$TARBALL_SHA256_URL" | cut -d' ' -f1)"; \
+    [ "$published" = "$TARBALL_SHA256" ] || { echo "published sha256 $published differs from the lock $TARBALL_SHA256"; exit 1; }; \
+    echo "$TARBALL_SHA256  sui-fork.tar.gz" | sha256sum -c -; \
+    tar -xzf sui-fork.tar.gz sui-fork; \
+    rm sui-fork.tar.gz
 FROM ${BASE}
-COPY --from=build /sui-fork /usr/local/bin/sui-fork
+COPY --from=fetch /tmp/fetch/sui-fork /usr/local/bin/sui-fork
 RUN ["sui-fork", "--version"]

@@ -1,5 +1,6 @@
 //! The engine lock (design section 7): each engine is a pinned pull, or a
-//! local build from a checksummed tarball or from source at a pinned commit.
+//! local build from a checksummed tarball. A build may also record the source
+//! commit its tarballs were compiled from.
 
 use std::collections::BTreeMap;
 
@@ -59,7 +60,7 @@ pub struct Build {
     /// Per architecture (`amd64`, `arm64`): the tarball and its checksum.
     #[serde(default)]
     pub tarballs: BTreeMap<String, Tarball>,
-    /// A build from source at a pinned commit, instead of a tarball.
+    /// Where the tarballs were compiled from, for provenance.
     pub source: Option<Source>,
 }
 
@@ -70,15 +71,15 @@ impl Build {
     }
 }
 
-/// A source build: the repo and commit to compile, and the toolchain image.
+/// The source of a build's tarballs: the repo and commit compiled, and the toolchain image.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Source {
     /// The git repository, fetched over https.
     pub repo: String,
-    /// The branch that holds `commit`, for people; the build fetches `commit` only.
+    /// The branch that holds `commit`.
     pub branch: String,
-    /// The full commit sha the build checks out and verifies.
+    /// The full commit sha the tarballs were compiled from.
     pub commit: String,
     /// The upstream release the branch is based on, and its commit.
     pub upstream: String,
@@ -160,10 +161,8 @@ mod tests {
                 }
             }
             if let Some(b) = &e.build {
-                assert!(b.tarballs.is_empty() != b.source.is_none(), "{id}: exactly one of tarballs or source");
-                let archs: Vec<&String> = if b.source.is_some() { b.bases.keys().collect() } else { b.tarballs.keys().collect() };
-                assert!(!archs.is_empty(), "{id}: no architecture");
-                for arch in archs {
+                assert!(!b.tarballs.is_empty(), "{id}: a build needs tarballs");
+                for arch in b.tarballs.keys() {
                     assert!(arch == "amd64" || arch == "arm64", "{id}: arch {arch}");
                     assert!(b.base_for(arch).is_some_and(|base| base.contains("@sha256:")), "{id}/{arch}: base must be pinned by digest");
                 }

@@ -248,26 +248,19 @@ impl Docker {
         } else if let Some(build) = &engine.build {
             let arch = host_arch();
             let base = build.base_for(arch).ok_or_else(|| Error::new(ErrorCode::Unsupported, format!("{id} has no base image for {arch}")).next("use another chain"))?;
-            let mut args = HashMap::from([("BASE".to_string(), base.to_string())]);
-            if let Some(source) = &build.source {
-                args.insert("TOOLCHAIN".into(), source.toolchain.clone());
-                args.insert("REPO".into(), source.repo.clone());
-                args.insert("COMMIT".into(), source.commit.clone());
-            } else {
-                let tarball = build.tarballs.get(arch).ok_or_else(|| Error::new(ErrorCode::Unsupported, format!("{id} has no tarball for {arch}")).next("use another chain"))?;
-                args.insert("TARBALL_URL".into(), tarball.url.clone());
-                args.insert("TARBALL_SHA256_URL".into(), tarball.sha256_url.clone());
-                args.insert("TARBALL_SHA256".into(), tarball.sha256.clone());
-            }
+            let tarball = build.tarballs.get(arch).ok_or_else(|| Error::new(ErrorCode::Unsupported, format!("{id} has no tarball for {arch}")).next("use another chain"))?;
+            let args = HashMap::from([
+                ("BASE".to_string(), base.to_string()),
+                ("TARBALL_URL".to_string(), tarball.url.clone()),
+                ("TARBALL_SHA256_URL".to_string(), tarball.sha256_url.clone()),
+                ("TARBALL_SHA256".to_string(), tarball.sha256.clone()),
+            ]);
             let dockerfile = crate::embedded::DOCKERFILES
                 .iter()
                 .find(|(ctx, _)| *ctx == build.context)
                 .map(|(_, body)| *body)
                 .ok_or_else(|| Error::new(ErrorCode::Internal, format!("engines/{}/Dockerfile is not embedded", build.context)))?;
-            match &build.source {
-                Some(source) => crate::log(format_args!("building {id} {} for {arch} from {} at {}; compiling from source takes several minutes", engine.version, source.repo, &source.commit[..12])),
-                None => crate::log(format_args!("building {id} {} for {arch}", engine.version)),
-            }
+            crate::log(format_args!("building {id} {} for {arch}", engine.version));
             let mut tar = tar::Builder::new(Vec::new());
             let mut header = tar::Header::new_gnu();
             header.set_size(dockerfile.len() as u64);
@@ -279,14 +272,19 @@ impl Docker {
             let opts = BuildImageOptionsBuilder::default().dockerfile("Dockerfile").t(&build.image).rm(true).buildargs(&args).labels(&labels).build();
             let mut stream = self.inner.build_image(opts, None, Some(bollard::body_full(context.into())));
             let mut log = String::new();
+            // The last line a failing step printed says why, such as a sha256 mismatch; Docker's
+            // own error repeats the whole command, so it is used only when the step printed nothing.
+            let failed = |log: &str, docker: String| {
+                let said = log.lines().map(str::trim).rfind(|l| !l.is_empty() && !l.starts_with("--->") && !l.starts_with("Step ")).map(str::to_string);
+                Error::new(ErrorCode::EngineFailed, format!("build {id}: {}", said.unwrap_or(docker))).next(build_next(id))
+            };
             while let Some(item) = stream.next().await {
-                let info = item.map_err(|e| Error::new(ErrorCode::EngineFailed, format!("build {id}: {e}")))?;
+                let info = item.map_err(|e| failed(&log, e.to_string()))?;
                 if let Some(s) = info.stream {
                     log.push_str(&s);
                 }
                 if let Some(detail) = info.error_detail {
-                    let tail: String = log.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-                    return Err(Error::new(ErrorCode::EngineFailed, format!("build {id}: {} {tail}", detail.message.unwrap_or_default())));
+                    return Err(failed(&log, detail.message.unwrap_or_default()));
                 }
             }
         }
@@ -731,6 +729,11 @@ fn parse_rfc3339_secs(s: &str) -> Option<u64> {
     let days = era * 146097 + doe - 719468;
     let secs = days * 86400 + hh * 3600 + mm * 60 + ss;
     (secs > 0).then_some(secs as u64)
+}
+
+/// What to do after an engine build fails.
+fn build_next(id: &str) -> String {
+    format!("chainsim pull {id} retries the build. A sha256 that differs from the lock means the download is not the engine engines.lock.json pins, so do not edit the lock to match it")
 }
 
 #[cfg(test)]
