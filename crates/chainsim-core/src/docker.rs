@@ -247,13 +247,27 @@ impl Docker {
             }
         } else if let Some(build) = &engine.build {
             let arch = host_arch();
-            let tarball = build.tarballs.get(arch).ok_or_else(|| Error::new(ErrorCode::Unsupported, format!("{id} has no tarball for {arch}")).next("use another chain"))?;
+            let base = build.base_for(arch).ok_or_else(|| Error::new(ErrorCode::Unsupported, format!("{id} has no base image for {arch}")).next("use another chain"))?;
+            let mut args = HashMap::from([("BASE".to_string(), base.to_string())]);
+            if let Some(source) = &build.source {
+                args.insert("TOOLCHAIN".into(), source.toolchain.clone());
+                args.insert("REPO".into(), source.repo.clone());
+                args.insert("COMMIT".into(), source.commit.clone());
+            } else {
+                let tarball = build.tarballs.get(arch).ok_or_else(|| Error::new(ErrorCode::Unsupported, format!("{id} has no tarball for {arch}")).next("use another chain"))?;
+                args.insert("TARBALL_URL".into(), tarball.url.clone());
+                args.insert("TARBALL_SHA256_URL".into(), tarball.sha256_url.clone());
+                args.insert("TARBALL_SHA256".into(), tarball.sha256.clone());
+            }
             let dockerfile = crate::embedded::DOCKERFILES
                 .iter()
                 .find(|(ctx, _)| *ctx == build.context)
                 .map(|(_, body)| *body)
                 .ok_or_else(|| Error::new(ErrorCode::Internal, format!("engines/{}/Dockerfile is not embedded", build.context)))?;
-            crate::log(format_args!("building {id} {} for {arch}", engine.version));
+            match &build.source {
+                Some(source) => crate::log(format_args!("building {id} {} for {arch} from {} at {}; compiling from source takes several minutes", engine.version, source.repo, &source.commit[..12])),
+                None => crate::log(format_args!("building {id} {} for {arch}", engine.version)),
+            }
             let mut tar = tar::Builder::new(Vec::new());
             let mut header = tar::Header::new_gnu();
             header.set_size(dockerfile.len() as u64);
@@ -261,12 +275,6 @@ impl Docker {
             header.set_cksum();
             tar.append_data(&mut header, "Dockerfile", dockerfile.as_bytes()).map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
             let context = tar.into_inner().map_err(|e| Error::new(ErrorCode::Internal, e.to_string()))?;
-            let args = HashMap::from([
-                ("BASE".to_string(), build.base.clone()),
-                ("TARBALL_URL".to_string(), tarball.url.clone()),
-                ("TARBALL_SHA256_URL".to_string(), tarball.sha256_url.clone()),
-                ("TARBALL_SHA256".to_string(), tarball.sha256.clone()),
-            ]);
             let labels = HashMap::from([(LABEL_ENGINE.to_string(), format!("{id}@{}", engine.version))]);
             let opts = BuildImageOptionsBuilder::default().dockerfile("Dockerfile").t(&build.image).rm(true).buildargs(&args).labels(&labels).build();
             let mut stream = self.inner.build_image(opts, None, Some(bollard::body_full(context.into())));

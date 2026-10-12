@@ -1,5 +1,5 @@
 //! The engine lock (design section 7): each engine is a pinned pull, or a
-//! local build from a checksummed tarball.
+//! local build from a checksummed tarball or from source at a pinned commit.
 
 use std::collections::BTreeMap;
 
@@ -49,10 +49,42 @@ pub struct Build {
     pub image: String,
     /// The folder under `engines/` holding the Dockerfile.
     pub context: String,
-    /// The base image, pinned by digest.
-    pub base: String,
+    /// The base image, pinned by digest, when it is the same on every architecture.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Per architecture (`amd64`, `arm64`): the base image pinned by digest,
+    /// for bases published as single-arch tags (mysten/sui-tools).
+    #[serde(default)]
+    pub bases: BTreeMap<String, String>,
     /// Per architecture (`amd64`, `arm64`): the tarball and its checksum.
+    #[serde(default)]
     pub tarballs: BTreeMap<String, Tarball>,
+    /// A build from source at a pinned commit, instead of a tarball.
+    pub source: Option<Source>,
+}
+
+impl Build {
+    /// The base image for an architecture, or None when the lock has none for it.
+    pub fn base_for(&self, arch: &str) -> Option<&str> {
+        self.bases.get(arch).or(self.base.as_ref()).map(String::as_str)
+    }
+}
+
+/// A source build: the repo and commit to compile, and the toolchain image.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Source {
+    /// The git repository, fetched over https.
+    pub repo: String,
+    /// The branch that holds `commit`, for people; the build fetches `commit` only.
+    pub branch: String,
+    /// The full commit sha the build checks out and verifies.
+    pub commit: String,
+    /// The upstream release the branch is based on, and its commit.
+    pub upstream: String,
+    pub upstream_commit: String,
+    /// The toolchain image, pinned by digest.
+    pub toolchain: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,12 +160,26 @@ mod tests {
                 }
             }
             if let Some(b) = &e.build {
-                assert!(b.base.contains("@sha256:"), "{id}: base must be pinned by digest");
-                for (arch, t) in &b.tarballs {
+                assert!(b.tarballs.is_empty() != b.source.is_none(), "{id}: exactly one of tarballs or source");
+                let archs: Vec<&String> = if b.source.is_some() { b.bases.keys().collect() } else { b.tarballs.keys().collect() };
+                assert!(!archs.is_empty(), "{id}: no architecture");
+                for arch in archs {
                     assert!(arch == "amd64" || arch == "arm64", "{id}: arch {arch}");
+                    assert!(b.base_for(arch).is_some_and(|base| base.contains("@sha256:")), "{id}/{arch}: base must be pinned by digest");
+                }
+                for (arch, t) in &b.tarballs {
                     assert_eq!(t.sha256.len(), 64, "{id}/{arch}: sha256");
                     assert!(t.url.starts_with("https://") && t.sha256_url.starts_with("https://"));
                 }
+                if let Some(s) = &b.source {
+                    assert!(s.repo.starts_with("https://"), "{id}: repo over https");
+                    for sha in [&s.commit, &s.upstream_commit] {
+                        assert!(sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()), "{id}: full commit sha, not a branch name");
+                    }
+                    assert!(s.toolchain.contains("@sha256:"), "{id}: toolchain must be pinned by digest");
+                    assert!(e.version.ends_with(&s.commit[..12]), "{id}: version names the commit, so a new commit builds a new image");
+                }
+                assert!(b.image.ends_with(&format!(":{}", e.version)), "{id}: image tag is the version");
             }
         }
     }
