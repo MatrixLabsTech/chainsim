@@ -34,7 +34,7 @@ Work through these steps in order. Each ends on a check you can make.
    only an admin, owner or other role holder may call, run `chainsim send <name> --as <address>
    --to <target> [<arg>...]` with the role holder's address: no key is needed. The target is a
    contract with `--sig "<fn(types)>"` on EVM, or `package::module::function<T...>` on Sui. To
-   change state directly, run `chainsim set <name> balance|token|owner|storage|code ...`;
+   change state directly, run `chainsim set <name> balance|token|owner|object|storage|code ...`;
    `chainsim describe <chain>` lists what each chain supports. Done when the receipt `status` is
    1 or the read-back matches what you set.
 7. **Do the work.** Before each scenario run `chainsim snapshot <name>`, and after it
