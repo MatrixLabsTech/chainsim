@@ -1,15 +1,17 @@
 name: engine
 
-# Builds chainsim's sui-fork engine (engines/sui-fork-chainsim) from the commit
-# engines.lock.json pins, natively per architecture, and pushes it to GHCR as
-# ghcr.io/matrixlabstech/sui-fork-chainsim:<lock version>-<arch>, plus a
-# multi-arch <lock version> tag. chainsim pulls it instead of compiling Sui on
-# first use. An existing version is skipped unless the run is forced.
+# Compiles chainsim's sui-fork (engines/sui-fork-chainsim/build.Dockerfile) from
+# the commit engines.lock.json pins, natively per architecture, and publishes
+# sui-fork-<lock version>-linux-<arch>.tar.gz with a .sha256 for each as the
+# prerelease sui-fork-chainsim-<lock version>. chainsim downloads the binary
+# instead of compiling Sui on first use. The release is never marked latest, so
+# releases/latest stays the chainsim CLI. A version whose release already has
+# every asset is skipped unless the run is forced.
 on:
   workflow_dispatch:
     inputs:
       force:
-        description: Rebuild and push even when the version is already on GHCR
+        description: Rebuild and upload even when the release already has every asset
         type: boolean
         default: false
   push:
@@ -24,10 +26,39 @@ permissions:
 
 env:
   ENGINE: sui-fork-chainsim
-  IMAGE: ghcr.io/matrixlabstech/sui-fork-chainsim
 
 jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.lock.outputs.version }}
+      skip: ${{ steps.assets.outputs.skip }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read the lock
+        id: lock
+        run: echo "version=$(jq -r ".engines[\"$ENGINE\"].version" engines.lock.json)" >> "$GITHUB_OUTPUT"
+      - name: Skip a release that has every asset
+        id: assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.lock.outputs.version }}
+        run: |
+          have=$(gh release view "$ENGINE-$VERSION" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null || true)
+          missing=0
+          for arch in amd64 arm64; do
+            for f in "sui-fork-$VERSION-linux-$arch.tar.gz" "sui-fork-$VERSION-linux-$arch.tar.gz.sha256"; do
+              grep -qx "$f" <<< "$have" || missing=1
+            done
+          done
+          if [ "$missing" = 0 ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "release $ENGINE-$VERSION has every asset, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: check
+    if: needs.check.outputs.skip != 'true'
     strategy:
       matrix:
         include:
@@ -36,69 +67,73 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Read the lock
         id: lock
         run: |
-          entry=".engines[\"$ENGINE\"]"
+          entry=".engines[\"$ENGINE\"].build"
           {
-            echo "version=$(jq -r "$entry.version" engines.lock.json)"
-            echo "toolchain=$(jq -r "$entry.build.source.toolchain" engines.lock.json)"
-            echo "repo=$(jq -r "$entry.build.source.repo" engines.lock.json)"
-            echo "commit=$(jq -r "$entry.build.source.commit" engines.lock.json)"
-            echo "base=$(jq -r "$entry.build.bases[\"${{ matrix.arch }}\"]" engines.lock.json)"
+            echo "toolchain=$(jq -r "$entry.source.toolchain" engines.lock.json)"
+            echo "repo=$(jq -r "$entry.source.repo" engines.lock.json)"
+            echo "commit=$(jq -r "$entry.source.commit" engines.lock.json)"
+            echo "base=$(jq -r "$entry.bases[\"${{ matrix.arch }}\"]" engines.lock.json)"
           } >> "$GITHUB_OUTPUT"
           cat "$GITHUB_OUTPUT"
-      - name: Log in to GHCR
-        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: Skip a version already on GHCR
-        id: exists
-        run: |
-          tag="$IMAGE:${{ steps.lock.outputs.version }}-${{ matrix.arch }}"
-          if [ "${{ inputs.force }}" != "true" ] && docker manifest inspect "$tag" > /dev/null 2>&1; then
-            echo "$tag exists, skipping"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          fi
       # The Sui build needs more disk than the runner leaves free.
       - name: Free disk
-        if: steps.exists.outputs.skip != 'true'
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
           docker system prune -af
           df -h /
       - name: Build
-        if: steps.exists.outputs.skip != 'true'
         run: |
           docker build engines/sui-fork-chainsim \
+            --file engines/sui-fork-chainsim/build.Dockerfile \
+            --target build \
             --build-arg TOOLCHAIN="${{ steps.lock.outputs.toolchain }}" \
             --build-arg BASE="${{ steps.lock.outputs.base }}" \
             --build-arg REPO="${{ steps.lock.outputs.repo }}" \
             --build-arg COMMIT="${{ steps.lock.outputs.commit }}" \
-            --label org.opencontainers.image.source="https://github.com/${{ github.repository }}" \
-            --label org.opencontainers.image.revision="${{ steps.lock.outputs.commit }}" \
-            --tag "$IMAGE:${{ steps.lock.outputs.version }}-${{ matrix.arch }}"
-      - name: Push
-        if: steps.exists.outputs.skip != 'true'
+            --tag sui-fork-build
+      - name: Package
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
         run: |
-          tag="$IMAGE:${{ steps.lock.outputs.version }}-${{ matrix.arch }}"
-          docker push "$tag"
-          echo "pushed $(docker inspect --format '{{index .RepoDigests 0}}' "$tag")"
+          mkdir -p dist out
+          id=$(docker create sui-fork-build)
+          docker cp "$id:/sui-fork" out/sui-fork
+          docker rm "$id"
+          file="sui-fork-$VERSION-linux-${{ matrix.arch }}.tar.gz"
+          tar -czf "dist/$file" -C out sui-fork
+          (cd dist && sha256sum "$file" > "$file.sha256" && cat "$file.sha256")
+          ls -l dist
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sui-fork-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
 
-  manifest:
-    needs: build
+  publish:
+    needs: [check, build]
     runs-on: ubuntu-24.04
     permissions:
-      contents: read
-      packages: write
+      contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Push the multi-arch tag
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
         run: |
-          version=$(jq -r ".engines[\"$ENGINE\"].version" engines.lock.json)
-          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker buildx imagetools create --tag "$IMAGE:$version" "$IMAGE:$version-amd64" "$IMAGE:$version-arm64"
-          docker buildx imagetools inspect "$IMAGE:$version"
+          tag="$ENGINE-$VERSION"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "$ENGINE $VERSION" --prerelease --latest=false \
+              --notes "chainsim's sui-fork engine binary, compiled from the commit engines.lock.json pins for $ENGINE $VERSION."
+          fi
+          gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | "\(.name) \(.size)"'
