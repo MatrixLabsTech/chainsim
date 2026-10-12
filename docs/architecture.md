@@ -41,8 +41,10 @@ chainsim down eth-host
 
 `engines.lock.json` pins every engine image by tag and digest per architecture. For an engine
 chainsim builds, it pins the source instead, such as arc-foundry's release tarball and its
-checksum, or the git commit, toolchain image and base images of chainsim's `sui-fork` build. `up` pulls or builds an engine on first use and tags it
-`chainsim/<engine>:<version>`. `chainsim pull`, `chainsim engines` and `chainsim prune` manage
+checksum. chainsim's own `sui-fork` follows the same pattern: our `engine` workflow compiles it from
+the pinned commit and publishes the binary as a release asset, and the lock pins each tarball's
+sha256 next to the commit, toolchain and base images it came from. `up` pulls or builds an
+engine on first use and tags it `chainsim/<engine>:<version>`. `chainsim pull`, `chainsim engines` and `chainsim prune` manage
 engines ahead of time:
 
 ```sh

@@ -51,15 +51,22 @@ under `engine` and its repo and commit under `engineSource`.
   [MatrixLabsTech/sui](https://github.com/MatrixLabsTech/sui), a fork of MystenLabs/sui. The branch
   holds Mysten's tag commit `e04cf9aa` and one commit on top. `engines.lock.json` pins that commit
   by its full sha, so a build never follows the branch.
-- The first `up` builds the image `chainsim/sui-fork-chainsim:<version>` from
-  `engines/sui-fork-chainsim/Dockerfile`, and `chainsim pull sui-fork-chainsim` builds it ahead of
-  time. A build stage on the pinned `rust:1.96.1-bookworm` toolchain fetches the commit, checks
-  its sha and compiles `sui-fork`. chainsim then copies the binary onto Mysten's `sui-tools` image
-  for the host architecture, pinned by digest: `mainnet-v1.81.1` for amd64 and
-  `mainnet-v1.81.1-arm64` for arm64.
-- A cold `up` that built the image took 6.4 minutes on arm64, with 18 CPUs and 8 GB for Docker
-  (measured on 2026-10-11). We have not timed amd64. Later forks reuse the image, and
-  `chainsim engines` shows whether it is built.
+- Our `engine` GitHub Actions workflow compiles `sui-fork` from that commit on native amd64 and
+  arm64 runners, with `engines/sui-fork-chainsim/build.Dockerfile` on the pinned
+  `rust:1.96.1-bookworm` toolchain. It publishes each binary as a tarball with its sha256 in the
+  prerelease `sui-fork-chainsim-<version>` of the chainsim repo.
+- The first `up` builds a thin image from `engines/sui-fork-chainsim/Dockerfile`, and
+  `chainsim pull sui-fork-chainsim` builds it ahead of time. The build downloads the tarball for
+  the host, checks it against the sha256 in `engines.lock.json`, and copies the binary onto
+  Mysten's `sui-tools` image for that architecture, pinned by digest: `mainnet-v1.81.1` for amd64
+  and `mainnet-v1.81.1-arm64` for arm64. A sha256 that differs from the lock stops the build.
+  The tarball is about 28 MB. A cold `up` that built the image this way became ready in 22 s on
+  arm64, with the `sui-tools` base already on the host (measured on 2026-10-12). Later forks reuse
+  the image, and `chainsim engines` shows whether it is built.
+- To compile the engine yourself instead, build the full `build.Dockerfile` with the lock's
+  `TOOLCHAIN`, `REPO`, `COMMIT` and `BASE` and tag the image
+  `chainsim/sui-fork-chainsim:<version>`. chainsim then uses that image as it is. The compile took
+  6.4 minutes on arm64 with 18 CPUs and 8 GB for Docker (measured on 2026-10-11).
 - The engine runs as uid 65534 (nobody), not root. `up` creates the fork volume owned by that
   user, mounts it at `/data`, and runs a small supervisor loop around `sui-fork` so that snapshot
   and revert can stop and restart it.
@@ -86,12 +93,15 @@ new release is one cherry-pick.
 4. In `engines.lock.json`, update the `sui-fork-chainsim` entry: `version` and the `image` tag
    (`mainnet-v<new>-` plus the first 12 digits of the commit), the `source` branch, commit,
    upstream tag and upstream commit, the `toolchain` (the Rust version in the tag's
-   `rust-toolchain.toml`, pinned by digest), and both `bases` (the new `sui-tools` tags, pinned by
-   digest).
+   `rust-toolchain.toml`, pinned by digest), both `bases` (the new `sui-tools` tags, pinned by
+   digest), and the `tarballs` URLs for the new version.
 5. Copy the new `forking_service.proto` into `crates/chainsim-sui/proto/` and update the first
    limit in `profiles/sui-mainnet.json`. `cargo test --workspace` fails until both name the
    lock's commit.
-6. Rebuild with `chainsim pull sui-fork-chainsim`, then run the Sui acceptance suite:
+6. Push these changes to main. The `engine` workflow compiles the new version on both
+   architectures and publishes its release. Then copy each tarball's sha256 from the release into
+   the lock.
+7. Rebuild with `chainsim pull sui-fork-chainsim`, then run the Sui acceptance suite:
    `cargo test -p chainsim-sui --test acceptance -- --ignored --test-threads=1`.
 
 ## Upstream
