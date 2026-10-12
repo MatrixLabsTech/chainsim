@@ -1,0 +1,104 @@
+name: engine
+
+# Builds chainsim's sui-fork engine (engines/sui-fork-chainsim) from the commit
+# engines.lock.json pins, natively per architecture, and pushes it to GHCR as
+# ghcr.io/matrixlabstech/sui-fork-chainsim:<lock version>-<arch>, plus a
+# multi-arch <lock version> tag. chainsim pulls it instead of compiling Sui on
+# first use. An existing version is skipped unless the run is forced.
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and push even when the version is already on GHCR
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - engines/sui-fork-chainsim/**
+      - engines.lock.json
+      - .github/workflows/engine.yml
+
+permissions:
+  contents: read
+
+env:
+  ENGINE: sui-fork-chainsim
+  IMAGE: ghcr.io/matrixlabstech/sui-fork-chainsim
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Read the lock
+        id: lock
+        run: |
+          entry=".engines[\"$ENGINE\"]"
+          {
+            echo "version=$(jq -r "$entry.version" engines.lock.json)"
+            echo "toolchain=$(jq -r "$entry.build.source.toolchain" engines.lock.json)"
+            echo "repo=$(jq -r "$entry.build.source.repo" engines.lock.json)"
+            echo "commit=$(jq -r "$entry.build.source.commit" engines.lock.json)"
+            echo "base=$(jq -r "$entry.build.bases[\"${{ matrix.arch }}\"]" engines.lock.json)"
+          } >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+      - name: Log in to GHCR
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Skip a version already on GHCR
+        id: exists
+        run: |
+          tag="$IMAGE:${{ steps.lock.outputs.version }}-${{ matrix.arch }}"
+          if [ "${{ inputs.force }}" != "true" ] && docker manifest inspect "$tag" > /dev/null 2>&1; then
+            echo "$tag exists, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      # The Sui build needs more disk than the runner leaves free.
+      - name: Free disk
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache /usr/local/share/boost
+          docker system prune -af
+          df -h /
+      - name: Build
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          docker build engines/sui-fork-chainsim \
+            --build-arg TOOLCHAIN="${{ steps.lock.outputs.toolchain }}" \
+            --build-arg BASE="${{ steps.lock.outputs.base }}" \
+            --build-arg REPO="${{ steps.lock.outputs.repo }}" \
+            --build-arg COMMIT="${{ steps.lock.outputs.commit }}" \
+            --label org.opencontainers.image.source="https://github.com/${{ github.repository }}" \
+            --label org.opencontainers.image.revision="${{ steps.lock.outputs.commit }}" \
+            --tag "$IMAGE:${{ steps.lock.outputs.version }}-${{ matrix.arch }}"
+      - name: Push
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          tag="$IMAGE:${{ steps.lock.outputs.version }}-${{ matrix.arch }}"
+          docker push "$tag"
+          echo "pushed $(docker inspect --format '{{index .RepoDigests 0}}' "$tag")"
+
+  manifest:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Push the multi-arch tag
+        run: |
+          version=$(jq -r ".engines[\"$ENGINE\"].version" engines.lock.json)
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker buildx imagetools create --tag "$IMAGE:$version" "$IMAGE:$version-amd64" "$IMAGE:$version-arm64"
+          docker buildx imagetools inspect "$IMAGE:$version"
