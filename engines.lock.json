@@ -35,15 +35,23 @@
         }
       }
     },
-    "sui-tools": {
-      "version": "mainnet-v1.81.1",
+    "sui-fork-chainsim": {
+      "version": "mainnet-v1.81.1-485d5ec0a773",
       "user": "65534:65534",
-      "pull": {
-        "image": "mysten/sui-tools:mainnet-v1.81.1",
-        "digest": "sha256:5336a71e37812bd6609a73a07bb99c267b3861c7670b7c49e20a6c9e5d5f1de6",
-        "platforms": {
+      "build": {
+        "image": "chainsim/sui-fork-chainsim:mainnet-v1.81.1-485d5ec0a773",
+        "context": "sui-fork-chainsim",
+        "bases": {
           "amd64": "mysten/sui-tools:mainnet-v1.81.1@sha256:5336a71e37812bd6609a73a07bb99c267b3861c7670b7c49e20a6c9e5d5f1de6",
           "arm64": "mysten/sui-tools:mainnet-v1.81.1-arm64@sha256:75cffe13c485980874bf24874b9d892fa718b13748b690d0b0ba84b5872b2836"
+        },
+        "source": {
+          "repo": "https://github.com/MatrixLabsTech/sui",
+          "branch": "chainsim/mainnet-v1.81.1",
+          "commit": "485d5ec0a7731a9b92491a0b5450cb92163f5c48",
+          "upstream": "mainnet-v1.81.1",
+          "upstream_commit": "e04cf9aa915cb6c069092733bebc3648755998e2",
+          "toolchain": "rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663"
         }
       }
     },

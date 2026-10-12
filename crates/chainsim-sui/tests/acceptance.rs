@@ -219,3 +219,94 @@ async fn sui_send_and_set() {
     assert!(a.down(name).await.unwrap().removed);
     assert_gone(name);
 }
+
+/// The u64 at `offset` in base64 BCS bytes.
+fn u64_at(b64: &str, offset: usize) -> u64 {
+    let bytes = chainsim_sui::units::unbase64(b64).unwrap();
+    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+/// set object on the patched engine: a field override that execution sees,
+/// the refusals, and the modification log.
+#[tokio::test]
+#[ignore]
+async fn sui_set_object() {
+    use mainnet_objects::*;
+    let a = SuiAdapter::connect().await.unwrap();
+    let p = profile::get("sui-mainnet").unwrap();
+    let name = "acc-sui-object";
+    a.down(name).await.unwrap();
+    a.up(&p, &UpRequest { name: name.into(), ..Default::default() }).await.unwrap();
+    let object = |id: &str, fields: &[&str], bcs: Option<String>| SetRequest {
+        kind: SetKind::Object { fields: fields.iter().map(|s| s.to_string()).collect(), bcs },
+        address: id.into(),
+        value: String::new(),
+    };
+
+    // The fee reads back from the fork after the set.
+    let out = a.set(name, &object(CETUS_CONFIG, &["protocol_fee_rate=1234"], None)).await.unwrap();
+    assert_eq!(out["fields"]["protocol_fee_rate"], "1234", "{out}");
+    assert_eq!(out["changed"], json!(["protocol_fee_rate"]));
+    assert_eq!(out["fields"]["id"], CETUS_CONFIG);
+
+    // A role-gated call sees it: update_protocol_fee_rate emits the old rate.
+    let member = fresh_address();
+    let roles = u128::MAX.to_string();
+    let grant = SendRequest { from: CETUS_ADMIN.into(), to: format!("{CETUS}::config::set_roles"), args: vec![CETUS_ADMIN_CAP.into(), CETUS_CONFIG.into(), member.clone(), roles], ..Default::default() };
+    assert_eq!(a.send(name, &grant).await.unwrap()["status"], 1);
+    let funder = p.funder.clone().unwrap();
+    let coins = a.call(name, "StateService/ListOwnedObjects", json!({ "owner": funder, "objectType": "0x2::coin::Coin<0x2::sui::SUI>", "pageSize": 1, "readMask": { "paths": ["object_id", "version", "digest"] } }), None).await.unwrap();
+    let coin = &coins["objects"][0];
+    let shared = a.call(name, "LedgerService/GetObject", json!({ "objectId": CETUS_CONFIG, "readMask": { "paths": ["owner"] } }), None).await.unwrap();
+    let tx = json!({
+        "transaction": {
+            "version": 1, "sender": member,
+            "kind": { "kind": "PROGRAMMABLE_TRANSACTION", "programmableTransaction": {
+                "inputs": [
+                    { "kind": "SHARED", "objectId": CETUS_CONFIG, "version": shared["object"]["owner"]["version"], "mutable": true },
+                    { "kind": "PURE", "pure": chainsim_sui::units::base64(&1500u64.to_le_bytes()) },
+                ],
+                "commands": [{ "moveCall": { "package": CETUS, "module": "config", "function": "update_protocol_fee_rate", "arguments": [{ "kind": "INPUT", "input": 0 }, { "kind": "INPUT", "input": 1 }] } }],
+            } },
+            "gasPayment": { "objects": [{ "objectId": coin["objectId"], "version": coin["version"], "digest": coin["digest"] }], "owner": funder, "price": "1000", "budget": "500000000" },
+            "expiration": { "kind": "NONE" },
+        },
+        "signatures": [],
+        "readMask": { "paths": ["effects.status", "events"] },
+    });
+    let done = a.call(name, "TransactionExecutionService/ExecuteTransaction", tx, None).await.unwrap();
+    assert_eq!(done["transaction"]["effects"]["status"]["success"], true, "{done}");
+    let event = &done["transaction"]["events"]["events"][0];
+    assert!(event["eventType"].as_str().unwrap().ends_with("::config::UpdateFeeRateEvent"), "{event}");
+    let bytes = event["contents"]["value"].as_str().unwrap();
+    assert_eq!((u64_at(bytes, 0), u64_at(bytes, 8)), (1234, 1500), "old and new fee rate");
+
+    // Nested fields by dotted path, and the package version gate sees an override.
+    let out = a.set(name, &object(CETUS_CONFIG, &["fee_tiers.contents.0.value.fee_rate=111", "package_version=999"], None)).await.unwrap();
+    assert_eq!(out["fields"]["fee_tiers"]["contents"][0]["value"]["fee_rate"], "111", "{out}");
+    let e = a.send(name, &grant).await.unwrap_err();
+    assert_eq!(e.data.as_ref().unwrap()["error"]["abort"]["function"], "checked_package_version");
+
+    // --bcs takes the whole contents: the current bytes go back unchanged.
+    let current = a.call(name, "LedgerService/GetObject", json!({ "objectId": CETUS_CONFIG, "readMask": { "paths": ["contents"] } }), None).await.unwrap();
+    let hex: String = chainsim_sui::units::unbase64(current["object"]["contents"]["value"].as_str().unwrap()).unwrap().iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(a.set(name, &object(CETUS_CONFIG, &[], Some(format!("0x{hex}")))).await.unwrap()["changed"], "bcs");
+
+    // Refusals: a coin and a package exit 3, another object's id and a bad path exit 2.
+    let coin_id = coin["objectId"].as_str().unwrap();
+    let e = a.set(name, &object(coin_id, &["balance.value=1"], None)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Unsupported);
+    assert!(e.next.as_deref().unwrap().contains(" token "), "{:?}", e.next);
+    assert_eq!(a.set(name, &object("0x2", &["x=1"], None)).await.unwrap_err().code, ErrorCode::Unsupported);
+    let other_id = format!("0x{hex}").replacen(&CETUS_CONFIG[2..], &"11".repeat(32), 1);
+    assert_eq!(a.set(name, &object(CETUS_CONFIG, &[], Some(other_id))).await.unwrap_err().code, ErrorCode::Usage);
+    assert_eq!(a.set(name, &object(CETUS_CONFIG, &["nope=1"], None)).await.unwrap_err().code, ErrorCode::Usage);
+
+    // Three sets and two sends (one aborted) are in the modification log.
+    let mods = chainsim_core::mods::list(a.docker(), name).await.unwrap();
+    assert_eq!(mods.iter().filter(|m| m["kind"] == "set-object").count(), 3, "{mods:?}");
+    assert_eq!(mods.len(), 5, "{mods:?}");
+
+    assert!(a.down(name).await.unwrap().removed);
+    assert_gone(name);
+}

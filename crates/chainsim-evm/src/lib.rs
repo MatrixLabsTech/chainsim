@@ -703,6 +703,9 @@ impl Adapter for EvmAdapter {
             SetKind::Token { .. } => {
                 return Err(Error::unsupported("set token on EVM", "chainsim fund <name> <address> --token <symbol|address>:<amount> sets a token balance"));
             }
+            SetKind::Object { .. } => {
+                return Err(Error::unsupported("set object on EVM", "EVM has no objects: chainsim set <name> storage <contract> <slot> <value> changes a contract's state"));
+            }
             SetKind::Owner => {
                 return Err(Error::unsupported("set owner on EVM", "EVM has no object owners: chainsim set <name> storage <contract> <slot> <value> changes the slot that records an owner"));
             }

@@ -3,6 +3,7 @@
 //! call runs as grpcurl in the fork's control sidecar.
 
 pub mod grpc;
+pub mod object;
 pub mod ptb;
 pub mod units;
 
@@ -572,6 +573,85 @@ impl SuiAdapter {
         Ok(())
     }
 
+    /// An object with its BCS contents, for set object.
+    async fn object_contents(&self, g: &Grpc<'_>, id: &str) -> Result<Value> {
+        let body = json!({ "objectId": id, "readMask": { "paths": ["object_id", "version", "digest", "owner", "object_type", "contents"] } });
+        Ok(g.call("sui.rpc.v2.LedgerService/GetObject", &body, CALL_TIMEOUT).await?["object"].clone())
+    }
+
+    /// Fetches the layout of every datatype `ty` reaches.
+    async fn layouts(&self, g: &Grpc<'_>, ty: &object::Ty) -> Result<object::Layouts> {
+        let mut layouts = object::Layouts::new();
+        loop {
+            let missing = object::missing(ty, &layouts)?;
+            if missing.is_empty() {
+                return Ok(layouts);
+            }
+            for name in missing {
+                let parts: Vec<&str> = name.split("::").collect();
+                let d = g.call("sui.rpc.v2.MovePackageService/GetDatatype", &json!({ "packageId": parts[0], "moduleName": parts[1], "name": parts[2] }), CALL_TIMEOUT).await?;
+                layouts.insert(name, object::layout_of(&d["datatype"]));
+            }
+        }
+    }
+
+    /// set object: replaces an object's contents through ForkingService/SetObject,
+    /// from `--field` changes to its decoded fields or from `--bcs`, and reads them back.
+    async fn set_object(&self, g: &Grpc<'_>, fork: &str, id: &str, fields: &[String], bcs: Option<&str>) -> Result<(Value, Value)> {
+        let id = parse_address(id)?;
+        let current = self.object_contents(g, &id).await?;
+        let ty_text = current["objectType"].as_str().unwrap_or("").to_string();
+        let refuse = |why: String, next: String| Err(Error::new(ErrorCode::Unsupported, format!("object {id} cannot be set: {why}")).next(next));
+        let Some(contents) = current["contents"]["value"].as_str().filter(|_| ty_text != "package") else {
+            return refuse("it is a package, and a package's code cannot change".into(), format!("not supported: call its functions with chainsim send {fork} --as <address> --to '<package>::<module>::<function>'"));
+        };
+        let ty = object::parse_type(&ty_text)?;
+        if let object::Ty::Datatype { name, args } = &ty {
+            if *name == format!("0x{:0>64}::coin::Coin", "2") {
+                let coin_type = args.first().map(object::Ty::to_string).unwrap_or_default();
+                let owner = current["owner"]["address"].as_str().unwrap_or("<owner>");
+                return refuse("it is a coin, and the fork's balance index changes only through transactions".into(), format!("chainsim set {fork} token {owner} {coin_type} <amount>"));
+            }
+        }
+        let layouts = self.layouts(g, &ty).await?;
+        let mut node = object::decode(&ty, &units::unbase64(contents)?, &layouts)?;
+        let (new_bytes, changed) = match bcs {
+            Some(hex) => {
+                let bytes = ptb::hex(hex.trim_start_matches("0x")).ok_or_else(|| Error::new(ErrorCode::Usage, "--bcs must be hex bytes, such as 0x0a1b..."))?;
+                if bytes.get(..32) != Some(&address_bytes(&id)[..]) {
+                    return Err(Error::new(ErrorCode::Usage, format!("--bcs must start with the object's own id {id}")).next(format!("chainsim call {fork} LedgerService/GetObject '{{\"objectId\": \"{id}\", \"readMask\": {{\"paths\": [\"contents\"]}}}}' shows the current contents, which start with it")));
+                }
+                // Refuse bytes that do not decode as the object's type before the engine takes them.
+                object::decode(&ty, &bytes, &layouts).map_err(|e| Error::new(ErrorCode::Usage, format!("--bcs does not decode as {ty}: {}", e.message)))?;
+                (bytes, json!("bcs"))
+            }
+            None => {
+                let mut paths = Vec::new();
+                for f in fields {
+                    let (path, value) = object::split_field(f)?;
+                    object::set_path(&mut node, path, value, &layouts)?;
+                    paths.push(json!(path));
+                }
+                (object::encode(&node), Value::Array(paths))
+            }
+        };
+        let set = g
+            .call("sui.forking.v1alpha.ForkingService/SetObject", &json!({ "objectId": id, "contents": base64(&new_bytes) }), CALL_TIMEOUT)
+            .await
+            .map_err(|e| if e.message.contains("SetObject") && e.message.to_lowercase().contains("not") { Error::new(ErrorCode::Unsupported, format!("this fork's engine has no ForkingService/SetObject: {}", e.message)).next(format!("chainsim down {fork}, then chainsim up sui-mainnet, which runs chainsim's patched engine")) } else { e })?;
+        let read = self.object_contents(g, &id).await?;
+        let read_bytes = units::unbase64(read["contents"]["value"].as_str().unwrap_or(""))?;
+        if read_bytes != new_bytes {
+            return Err(Error::new(ErrorCode::ReadbackMismatch, format!("object {id} reads back other contents than were set")));
+        }
+        let fields_json = object::to_json(&object::decode(&ty, &read_bytes, &layouts)?);
+        let view = json!({
+            "kind": "object", "object": id, "type": ty_text, "owner": read["owner"], "changed": changed,
+            "version": read["version"], "digest": read["digest"], "checkpoint": set["checkpointSequenceNumber"], "fields": fields_json,
+        });
+        Ok((view, json!({ "kind": "set-object", "object": id, "type": ty_text, "changed": changed })))
+    }
+
     /// The selftest checks. Never returns early: every part reports.
     async fn checks(&self, handle: &ForkHandle, profile: &Profile, g: &Grpc<'_>) -> Vec<Check> {
         let mut parts = Vec::new();
@@ -883,10 +963,11 @@ impl Adapter for SuiAdapter {
                     json!({ "kind": "set-owner", "object": id, "type": ty, "previousOwner": from, "owner": owner }),
                 )
             }
+            SetKind::Object { fields, bcs } => self.set_object(&g, name, &req.address, fields, bcs.as_deref()).await?,
             SetKind::Storage { .. } | SetKind::Code => {
                 return Err(Error::unsupported(
                     "set storage and set code on Sui",
-                    "Sui has no storage slots or contract code: change an object through its own module as its owner or admin with chainsim send --as; arbitrary object contents need a patched engine that chainsim does not ship",
+                    "Sui has no storage slots or contract code: chainsim set <name> object <id> --field <name>=<value> changes an object's fields, and chainsim send --as calls its module as its owner or admin",
                 ));
             }
         };
@@ -967,9 +1048,20 @@ mod tests {
     }
 
     #[test]
-    fn vendored_proto_lists_three_rpcs() {
-        assert_eq!(grpc::rpc_names(FORKING_PROTO), vec!["AdvanceCheckpoint", "AdvanceClock", "GetStatus"]);
+    fn vendored_proto_lists_four_rpcs() {
+        assert_eq!(grpc::rpc_names(FORKING_PROTO), vec!["AdvanceCheckpoint", "AdvanceClock", "GetStatus", "SetObject"]);
         assert!(FORKING_PROTO.contains("SPDX-License-Identifier: Apache-2.0") && FORKING_PROTO.contains("tag mainnet-v1.81.1"));
+    }
+
+    #[test]
+    fn profile_names_the_engine_source_from_the_lock() {
+        let p = profile::get("sui-mainnet").unwrap();
+        let source = EngineLock::embedded().unwrap().engine(&p.engine).unwrap().build.as_ref().unwrap().source.clone().unwrap();
+        assert!(FORKING_PROTO.contains(&source.commit[..12]) && FORKING_PROTO.contains(&source.branch));
+        let first = &p.limits[0];
+        for part in [&source.repo, &source.branch, &source.commit, &source.upstream] {
+            assert!(first.contains(part.as_str()), "the first limit does not name {part}");
+        }
     }
 
     #[test]

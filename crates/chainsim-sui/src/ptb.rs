@@ -40,7 +40,7 @@ pub fn parse_target(s: &str) -> Result<Target> {
 }
 
 /// Splits `a, b<c, d>, e` at the commas outside angle brackets.
-fn split_top_level(s: &str) -> Vec<&str> {
+pub(crate) fn split_top_level(s: &str) -> Vec<&str> {
     let (mut depth, mut start, mut out) = (0i32, 0, Vec::new());
     for (i, c) in s.char_indices() {
         match c {
@@ -244,7 +244,7 @@ pub fn uleb128(mut n: usize) -> Vec<u8> {
     }
 }
 
-fn hex(h: &str) -> Option<Vec<u8>> {
+pub(crate) fn hex(h: &str) -> Option<Vec<u8>> {
     if h.len() % 2 != 0 {
         return None;
     }

@@ -138,6 +138,10 @@ pub enum SetKind {
     Token { coin_type: String, from: Option<String> },
     /// The owner of an object: `address` is the object, `value` the new owner.
     Owner,
+    /// The contents of an object: `address` is the object. `fields` holds
+    /// `name=value` pairs, nested fields by dotted path; `bcs` is the whole
+    /// new contents as hex instead.
+    Object { fields: Vec<String>, bcs: Option<String> },
 }
 
 #[derive(Debug, Clone)]

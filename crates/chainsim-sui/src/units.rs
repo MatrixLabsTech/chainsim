@@ -56,6 +56,31 @@ pub fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// Standard base64, as protobuf-JSON encodes `bytes`; padding is optional.
+pub fn unbase64(s: &str) -> Result<Vec<u8>> {
+    let bad = || Error::new(ErrorCode::RpcError, "the engine returned bytes that are not base64");
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in s.trim_end_matches('=').bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return Err(bad()),
+        };
+        acc = acc << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,6 +105,10 @@ mod tests {
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(&1_000_000_000u64.to_le_bytes()), "AMqaOwAAAAA=");
+        for bytes in [&b""[..], b"f", b"fo", b"foo", b"foob", &[0xff, 0xfe, 0x00, 0x7f]] {
+            assert_eq!(unbase64(&base64(bytes)).unwrap(), bytes);
+        }
+        assert!(unbase64("a*b").is_err());
         let a = address_bytes(&format!("0x{}c5", "0".repeat(62)));
         assert_eq!(a[31], 0xc5);
         assert!(a[..31].iter().all(|b| *b == 0));

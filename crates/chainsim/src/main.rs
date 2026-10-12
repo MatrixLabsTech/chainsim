@@ -158,6 +158,16 @@ enum SetWhat {
     },
     /// The owner of an object, moved as its current owner.
     Owner { object: String, owner: String },
+    /// The contents of an object: one or more fields, or the whole object as BCS.
+    Object {
+        object: String,
+        /// A field to change, as name=value; a nested field by dotted path, such as a.b=1. Repeat for more.
+        #[arg(long = "field", value_name = "NAME=VALUE", required_unless_present = "bcs", conflicts_with = "bcs")]
+        fields: Vec<String>,
+        /// The whole new contents as BCS hex, starting with the object's own id.
+        #[arg(long)]
+        bcs: Option<String>,
+    },
 }
 
 /// The adapter for a profile family.
@@ -185,6 +195,8 @@ fn describe_profile(p: &Profile, lock: &EngineLock) -> Value {
         "name": p.name,
         "family": p.family,
         "engine": format!("{}@{}", p.engine, engine.map_or("?", |e| e.version.as_str())),
+        // A source-built engine: the repo, branch and commit it compiles.
+        "engineSource": engine.and_then(|e| e.build.as_ref()).and_then(|b| b.source.as_ref()),
         "maturity": p.maturity,
         "operations": match p.family.as_str() { "evm" => chainsim_evm::OPERATIONS, "sui" => chainsim_sui::OPERATIONS, _ => &[] },
         "upstream": p.upstream_info(),
@@ -385,6 +397,7 @@ async fn run(command: Command) -> Result<Value> {
                 SetWhat::Balance { address, amount } => SetRequest { kind: SetKind::Balance, address, value: amount },
                 SetWhat::Token { address, coin_type, amount, from } => SetRequest { kind: SetKind::Token { coin_type, from }, address, value: amount },
                 SetWhat::Owner { object, owner } => SetRequest { kind: SetKind::Owner, address: object, value: owner },
+                SetWhat::Object { object, fields, bcs } => SetRequest { kind: SetKind::Object { fields, bcs }, address: object, value: String::new() },
             };
             adapter_of(&name).await?.set(&name, &req).await
         }
