@@ -67,6 +67,25 @@
         }
       }
     },
+    "aptos-cli": {
+      "version": "9.6.0",
+      "user": "10001:10001",
+      "build": {
+        "image": "chainsim/aptos-cli:9.6.0",
+        "context": "aptos-cli",
+        "base": "debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3",
+        "tarballs": {
+          "amd64": {
+            "url": "https://github.com/aptos-labs/aptos-core/releases/download/aptos-cli-v9.6.0/aptos-cli-9.6.0-Linux-x86_64.zip",
+            "sha256": "4e28e71659a53e8eacff29d127685f2f282a8c008ff6e51047daedc72576bb8d"
+          },
+          "arm64": {
+            "url": "https://github.com/aptos-labs/aptos-core/releases/download/aptos-cli-v9.6.0/aptos-cli-9.6.0-Linux-aarch64.zip",
+            "sha256": "8e26f9ec373247c469c87c5e0003158eea58c68bf94ff03b74d78870cdfa1cbe"
+          }
+        }
+      }
+    },
     "control-grpcurl": {
       "version": "1.9.3",
       "user": "grpcurl",

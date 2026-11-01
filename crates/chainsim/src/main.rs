@@ -9,7 +9,8 @@ use std::path::PathBuf;
 mod install;
 
 use chainsim_core::docker::Docker;
-use chainsim_core::fork::{FundRequest, SendRequest, SetKind, SetRequest, TokenAmount, UpRequest};
+use chainsim_aptos::AptosAdapter;
+use chainsim_core::fork::{FundRequest, SendRequest, SetKind, SetRequest, TimeRequest, TokenAmount, UpRequest};
 use chainsim_core::lock::EngineLock;
 use chainsim_core::profile::{self, Profile};
 use chainsim_core::{envelope, Adapter, Error, ErrorCode, Result};
@@ -93,7 +94,7 @@ enum Command {
         /// The sender to act as (impersonated; a mainnet-active address works).
         #[arg(long = "as", value_name = "ADDRESS")]
         from: String,
-        /// The contract address (EVM), or the Move function package::module::function<T...> (Sui).
+        /// The contract address (EVM), or the Move function package::module::function<T...> (Sui, Aptos).
         #[arg(long)]
         to: String,
         /// The function, such as "pause()" or "transfer(address,uint256)", followed by its arguments.
@@ -105,7 +106,7 @@ enum Command {
         /// Native value to send, in whole units of the native symbol.
         #[arg(long)]
         value: Option<String>,
-        /// The arguments for --sig. Put a negative number after `--`.
+        /// The arguments for --sig (EVM), or for the Move function (Sui; Aptos as <type>:<value>, such as u64:100). Put a negative number after `--`.
         args: Vec<String>,
     },
     /// Override state on the fork and read it back.
@@ -113,6 +114,22 @@ enum Command {
         name: String,
         #[command(subcommand)]
         what: SetWhat,
+    },
+    /// Move the fork's clock forward by seconds, or to a Unix time.
+    Time {
+        name: String,
+        /// Seconds to move forward.
+        #[arg(long, required_unless_present = "to", conflicts_with = "to")]
+        advance: Option<u64>,
+        /// The Unix time in seconds to move to.
+        #[arg(long)]
+        to: Option<u64>,
+    },
+    /// Produce blocks on the fork (default: 1).
+    Mine {
+        name: String,
+        #[arg(long)]
+        blocks: Option<u64>,
     },
     /// Chain-level checks; exit 6 when any fails, with every check in data.
     Selftest { name: String },
@@ -168,6 +185,15 @@ enum SetWhat {
         #[arg(long)]
         bcs: Option<String>,
     },
+    /// A Move resource under an account (Aptos), replaced by its BCS bytes.
+    Resource {
+        address: String,
+        /// The resource type, such as 0x1::account::Account.
+        struct_tag: String,
+        /// The whole new value as BCS hex.
+        #[arg(long)]
+        bcs: String,
+    },
 }
 
 /// The adapter for a profile family.
@@ -175,6 +201,7 @@ async fn adapter(family: &str) -> Result<Box<dyn Adapter>> {
     match family {
         "evm" => Ok(Box::new(EvmAdapter::connect().await?)),
         "sui" => Ok(Box::new(SuiAdapter::connect().await?)),
+        "aptos" => Ok(Box::new(AptosAdapter::connect().await?)),
         other => Err(Error::unsupported(&format!("the {other} family"), "chainsim describe")),
     }
 }
@@ -198,7 +225,7 @@ fn describe_profile(p: &Profile, lock: &EngineLock) -> Value {
         // A source-built engine: the repo, branch and commit it compiles.
         "engineSource": engine.and_then(|e| e.build.as_ref()).and_then(|b| b.source.as_ref()),
         "maturity": p.maturity,
-        "operations": match p.family.as_str() { "evm" => chainsim_evm::OPERATIONS, "sui" => chainsim_sui::OPERATIONS, _ => &[] },
+        "operations": match p.family.as_str() { "evm" => chainsim_evm::OPERATIONS, "sui" => chainsim_sui::OPERATIONS, "aptos" => chainsim_aptos::OPERATIONS, _ => &[] },
         "upstream": p.upstream_info(),
         "native": p.native,
         "tokens": p.tokens,
@@ -229,7 +256,9 @@ fn describe(chain: Option<&str>) -> Result<Value> {
             "revert <name> <id>",
             "call <name> <method> [<params-json>] [--from <address>]",
             "send <name> --as <address> --to <address> (--sig \"<fn(types)>\" [<arg>...] | --data <hex>) [--value <amount>]",
-            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type> <amount> [--from <holder>] | owner <object> <new owner>",
+            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex>",
+            "time <name> (--advance <seconds> | --to <unix seconds>)",
+            "mine <name> [--blocks <n>]",
             "selftest <name>",
             "pull [<engine>]",
             "engines",
@@ -398,6 +427,7 @@ async fn run(command: Command) -> Result<Value> {
                 SetWhat::Token { address, coin_type, amount, from } => SetRequest { kind: SetKind::Token { coin_type, from }, address, value: amount },
                 SetWhat::Owner { object, owner } => SetRequest { kind: SetKind::Owner, address: object, value: owner },
                 SetWhat::Object { object, fields, bcs } => SetRequest { kind: SetKind::Object { fields, bcs }, address: object, value: String::new() },
+                SetWhat::Resource { address, struct_tag, bcs } => SetRequest { kind: SetKind::Resource { struct_tag, bcs }, address, value: String::new() },
             };
             adapter_of(&name).await?.set(&name, &req).await
         }
@@ -421,6 +451,15 @@ async fn run(command: Command) -> Result<Value> {
             };
             adapter_of(&name).await?.call(&name, &method, params, from.as_deref()).await
         }
+        Command::Time { name, advance, to } => {
+            let req = match (advance, to) {
+                (Some(secs), None) => TimeRequest::Advance(secs),
+                (None, Some(t)) => TimeRequest::To(t),
+                _ => unreachable!("clap requires exactly one"),
+            };
+            adapter_of(&name).await?.time(&name, &req).await
+        }
+        Command::Mine { name, blocks } => adapter_of(&name).await?.mine(&name, blocks).await,
         Command::Selftest { name } => to_value(adapter_of(&name).await?.selftest(&name).await),
         Command::Pull { engine } => pull(engine.as_deref()).await,
         Command::Engines => engines().await,

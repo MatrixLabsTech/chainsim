@@ -1,0 +1,39 @@
+{
+  "key": "aptos-mainnet",
+  "id": "aptos:1",
+  "name": "Aptos Mainnet",
+  "family": "aptos",
+  "engine": "aptos-cli",
+  "upstream": { "default": "https://api.mainnet.aptoslabs.com/v1", "env": "CHAINSIM_APTOS_MAINNET_REST" },
+  "ports": { "rpc": null, "ws": null },
+  "maturity": "experimental",
+  "fork": { "default": "latest", "flags": [] },
+  "native": { "symbol": "APT", "decimals": 8 },
+  "overrides": [],
+  "tokens": [
+    { "symbol": "USDC", "address": "0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b", "decimals": 6 }
+  ],
+  "warmup": [],
+  "selftest": { "token": "USDC", "extras": [] },
+  "funder": "0xbe13ea18241ed83ada91e8f5ca37b5507b397cb66ae1e52151cf32a96547600b",
+  "limits": [
+    "Experimental: the engine is the Aptos CLI 9.6.0 transaction simulation session (aptos move sim), which Aptos marks as beta and subject to change. chainsim builds its image from the official release zip of aptos-cli-v9.6.0 at https://github.com/aptos-labs/aptos-core/releases and checks it against the sha256 in engines.lock.json.",
+    "This is a private copy of Aptos Mainnet: transactions run on the copy only and never appear on Aptos Mainnet or its explorers.",
+    "The copy serves no REST API, so SDKs, wallets and browser dApps cannot connect to it. The fork object's rpcUrl is null, and agents read and change the copy through chainsim call, send, fund and set.",
+    "Every transaction and read runs one at a time through the Aptos CLI, which loads and rewrites the session files on each call, so runs are slow and cannot run in parallel.",
+    "send --as replaces the authentication key in the sender's Account resource on the copy with the fork's control key, and creates an Account resource for an address that has none. On the copy, the account's own key no longer signs for it.",
+    "Aptos signatures bind chain id 1, so a transaction signed for the copy is also valid on Aptos Mainnet for that key and sequence number. Use test keys that hold no mainnet assets.",
+    "The copy reads Aptos Mainnet from the Aptos Labs REST API https://api.mainnet.aptoslabs.com/v1 by default. CHAINSIM_APTOS_MAINNET_REST replaces it with a provider REST URL, and CHAINSIM_APTOS_API_KEY passes an API key to the CLI. Requests without a key face lower rate limits, so heavier runs should set one.",
+    "The public fullnode keeps about the last 150 million versions (versions from 7710585045 on 2026-11-01), so an older --block needs an archive upstream.",
+    "State the copy has not touched is read from the upstream on first access, so the first read of each resource is slower.",
+    "The Aptos CLI keeps the upstream URL and API key in the session's config.json on the fork volume. chainsim never prints them, and down removes the volume.",
+    "aptos-core and the Aptos CLI are under the Innovation-Enabling Source Code License (https://github.com/aptos-labs/aptos-core/blob/aptos-cli-v9.6.0/LICENSE). chainsim redistributes nothing of the CLI, since each host downloads the official release. Whether a use is allowed under that license is for the user to check.",
+    "fund --native raises an APT balance with the CLI's direct store write. fund --token raises a USDC balance with a transfer on the copy from 0xbe13ea18241ed83ada91e8f5ca37b5507b397cb66ae1e52151cf32a96547600b, the largest primary USDC store in the Aptos indexer on 2026-11-01 (152.1 million USDC), sent by impersonation. Nothing is sent on Aptos Mainnet.",
+    "On Aptos, fund, set balance and set token only raise a balance: an address that already holds more than the amount asked is refused.",
+    "send --as tops the sender up with 1 APT on the copy for gas when it holds less than 0.1 APT.",
+    "set resource replaces a resource that is stored on its own. Members of a resource group, such as object and fungible store resources, are stored in their group and are refused.",
+    "Each selftest run moves 0.1 APT from the fork's control key to the fixed throwaway receiver 0x000000000000000000000000000000000000000000000000000000000000c5e2, and 1 USDC from the holder to the control key, on the copy, and leaves both transfers in place.",
+    "time and mine run block metadata transactions through the CLI. Time only moves forward, and mine runs at most 100 blocks per call.",
+    "call reads the copy with three methods: view runs a Move view function, resource reads a resource under an account, and ledger returns the chain id, fork version, block height and timestamp. There is no raw REST or JSON-RPC."
+  ]
+}

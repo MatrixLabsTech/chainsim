@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/chainsim", "crates/chainsim-core", "crates/chainsim-evm", "crates/chainsim-sui"]
+members = ["crates/chainsim", "crates/chainsim-aptos", "crates/chainsim-core", "crates/chainsim-evm", "crates/chainsim-sui"]
 
 [workspace.package]
 version = "0.1.3"
@@ -17,9 +17,11 @@ clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha3 = "0.10"
 tar = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+chainsim-aptos = { path = "crates/chainsim-aptos" }
 chainsim-core = { path = "crates/chainsim-core" }
 chainsim-evm = { path = "crates/chainsim-evm" }
 chainsim-sui = { path = "crates/chainsim-sui" }
