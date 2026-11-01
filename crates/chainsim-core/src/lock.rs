@@ -92,8 +92,10 @@ pub struct Source {
 #[serde(deny_unknown_fields)]
 pub struct Tarball {
     pub url: String,
-    /// The published `.sha256` URL, checked against `sha256` at build time.
-    pub sha256_url: String,
+    /// The published `.sha256` URL, checked against `sha256` at build time,
+    /// when the release publishes one (the Aptos CLI release does not).
+    #[serde(default)]
+    pub sha256_url: Option<String>,
     pub sha256: String,
 }
 
@@ -168,7 +170,7 @@ mod tests {
                 }
                 for (arch, t) in &b.tarballs {
                     assert_eq!(t.sha256.len(), 64, "{id}/{arch}: sha256");
-                    assert!(t.url.starts_with("https://") && t.sha256_url.starts_with("https://"));
+                    assert!(t.url.starts_with("https://") && t.sha256_url.as_deref().is_none_or(|u| u.starts_with("https://")));
                 }
                 if let Some(s) = &b.source {
                     assert!(s.repo.starts_with("https://"), "{id}: repo over https");

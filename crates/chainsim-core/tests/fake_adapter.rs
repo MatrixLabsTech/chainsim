@@ -44,7 +44,7 @@ impl Adapter for Fake {
             fork_point: ForkPoint { kind: "block".into(), number: req.block.unwrap_or(100) },
             network: format!("chainsim-{}", req.name),
             alias: req.name.clone(),
-            rpc_url: format!("http://{}:{}", req.name, profile.ports.rpc),
+            rpc_url: Some(format!("http://{}:{}", req.name, profile.rpc_port())),
             ws_url: None,
             host_rpc_url: None,
             dev_accounts: None,

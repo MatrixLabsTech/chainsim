@@ -324,7 +324,7 @@ impl EvmAdapter {
             aliases: vec![alias.clone()],
             tmpfs,
             memory: docker::ENGINE_MEMORY,
-            publish: req.publish.then_some(profile.ports.rpc),
+            publish: req.publish.then_some(profile.rpc_port()),
             mounts: vec![],
         };
         self.docker.run(&spec).await?;
@@ -574,7 +574,7 @@ impl EvmAdapter {
 pub fn anvil_command(profile: &Profile, block: u64) -> String {
     let mut script = vec![
         "exec anvil --host 0.0.0.0".to_string(),
-        format!("--port {}", profile.ports.rpc),
+        format!("--port {}", profile.rpc_port()),
         format!("--fork-url \"${UPSTREAM_ENV}\""),
         format!("--fork-block-number {block}"),
     ];
@@ -705,6 +705,9 @@ impl Adapter for EvmAdapter {
             }
             SetKind::Object { .. } => {
                 return Err(Error::unsupported("set object on EVM", "EVM has no objects: chainsim set <name> storage <contract> <slot> <value> changes a contract's state"));
+            }
+            SetKind::Resource { .. } => {
+                return Err(Error::unsupported("set resource on EVM", "EVM has no Move resources: chainsim set <name> storage <contract> <slot> <value> changes a contract's state"));
             }
             SetKind::Owner => {
                 return Err(Error::unsupported("set owner on EVM", "EVM has no object owners: chainsim set <name> storage <contract> <slot> <value> changes the slot that records an owner"));

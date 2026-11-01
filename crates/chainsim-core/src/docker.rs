@@ -86,7 +86,7 @@ pub struct ForkHandle {
 impl ForkHandle {
     /// The in-network RPC URL of the engine.
     pub fn rpc_url(&self, profile: &Profile) -> String {
-        format!("http://{}:{}", self.alias, profile.ports.rpc)
+        format!("http://{}:{}", self.alias, profile.rpc_port())
     }
 
     /// The fork object, rebuilt from the labels and the profile.
@@ -99,7 +99,7 @@ impl ForkHandle {
             fork_point: self.fork_point.clone(),
             network: self.network.clone(),
             alias: self.alias.clone(),
-            rpc_url: self.rpc_url(profile),
+            rpc_url: profile.ports.rpc.map(|_| self.rpc_url(profile)),
             ws_url: profile.ports.ws.map(|p| format!("ws://{}:{p}", self.alias)),
             host_rpc_url: self.host_port.map(|p| format!("http://127.0.0.1:{p}")),
             dev_accounts,
@@ -252,7 +252,7 @@ impl Docker {
             let args = HashMap::from([
                 ("BASE".to_string(), base.to_string()),
                 ("TARBALL_URL".to_string(), tarball.url.clone()),
-                ("TARBALL_SHA256_URL".to_string(), tarball.sha256_url.clone()),
+                ("TARBALL_SHA256_URL".to_string(), tarball.sha256_url.clone().unwrap_or_default()),
                 ("TARBALL_SHA256".to_string(), tarball.sha256.clone()),
             ]);
             let dockerfile = crate::embedded::DOCKERFILES

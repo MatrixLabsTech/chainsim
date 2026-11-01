@@ -196,7 +196,7 @@ impl SuiAdapter {
     /// The control path of a fork.
     pub fn grpc<'a>(&'a self, handle: &ForkHandle, profile: &Profile) -> Grpc<'a> {
         let secret = profile.upstream_is_secret().then(|| profile.upstream_url());
-        Grpc { docker: &self.docker, container: handle.control_container.clone(), target: format!("{}:{}", handle.alias, profile.ports.rpc), secret, upstream_env: profile.upstream.env.clone() }
+        Grpc { docker: &self.docker, container: handle.control_container.clone(), target: format!("{}:{}", handle.alias, profile.rpc_port()), secret, upstream_env: profile.upstream.env.clone() }
     }
 
     async fn open(&self, name: &str) -> Result<(ForkHandle, Profile)> {
@@ -264,7 +264,7 @@ impl SuiAdapter {
 
         // The control sidecar: grpcurl (the profile's control engine), with the upstream URL in its environment only.
         self.docker.run_control(&self.lock, profile.control_engine(), name, &network, &upstream).await?;
-        let probe = Grpc { docker: &self.docker, container: docker::control_container(name), target: format!("{alias}:{}", profile.ports.rpc), secret: secret.then(|| upstream.clone()), upstream_env: profile.upstream.env.clone() };
+        let probe = Grpc { docker: &self.docker, container: docker::control_container(name), target: format!("{alias}:{}", profile.rpc_port()), secret: secret.then(|| upstream.clone()), upstream_env: profile.upstream.env.clone() };
 
         // The fork point: the asked checkpoint, or the upstream head now, so
         // the label records the exact checkpoint sui-fork starts from.
@@ -304,14 +304,14 @@ impl SuiAdapter {
                 image,
                 user: engine.user.clone(),
                 entrypoint: Some(vec!["/bin/sh".into(), "-c".into()]),
-                cmd: vec![engine_script(checkpoint, funder.as_deref(), profile.ports.rpc)],
+                cmd: vec![engine_script(checkpoint, funder.as_deref(), profile.rpc_port())],
                 env,
                 labels,
                 network: network.clone(),
                 aliases: vec![alias.clone()],
                 tmpfs: vec![("/tmp".into(), "rw,nosuid,size=64m".into())],
                 memory: docker::ENGINE_MEMORY,
-                publish: req.publish.then_some(profile.ports.rpc),
+                publish: req.publish.then_some(profile.rpc_port()),
                 // The data directory and snapshots outlive a sui-fork restart; down removes the volume.
                 mounts: vec![(data_volume(name), DATA.into())],
                 ..Default::default()
@@ -964,6 +964,9 @@ impl Adapter for SuiAdapter {
                 )
             }
             SetKind::Object { fields, bcs } => self.set_object(&g, name, &req.address, fields, bcs.as_deref()).await?,
+            SetKind::Resource { .. } => {
+                return Err(Error::unsupported("set resource on Sui", "Sui keeps state in objects, not account resources: chainsim set <name> object <id> --field <name>=<value> changes an object's fields"));
+            }
             SetKind::Storage { .. } | SetKind::Code => {
                 return Err(Error::unsupported(
                     "set storage and set code on Sui",

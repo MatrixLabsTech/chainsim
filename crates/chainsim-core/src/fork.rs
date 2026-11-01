@@ -39,7 +39,8 @@ pub struct Fork {
     /// The host name of the engine on that network.
     pub alias: String,
     /// In-network URL: reachable from containers on `network`, not from the host.
-    pub rpc_url: String,
+    /// Null for a family whose engine serves no RPC (Aptos).
+    pub rpc_url: Option<String>,
     pub ws_url: Option<String>,
     /// Set only with `--publish`: a `127.0.0.1` URL for tools on the host.
     pub host_rpc_url: Option<String>,
@@ -142,6 +143,9 @@ pub enum SetKind {
     /// `name=value` pairs, nested fields by dotted path; `bcs` is the whole
     /// new contents as hex instead.
     Object { fields: Vec<String>, bcs: Option<String> },
+    /// A Move resource under an account (Aptos): `address` is the account,
+    /// `struct_tag` the resource type, and `bcs` its whole new value as hex.
+    Resource { struct_tag: String, bcs: String },
 }
 
 #[derive(Debug, Clone)]

@@ -26,7 +26,8 @@ pub struct Upstream {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ports {
-    pub rpc: u16,
+    /// The engine's RPC port; null when the engine serves no RPC (Aptos).
+    pub rpc: Option<u16>,
     pub ws: Option<u16>,
 }
 
@@ -113,7 +114,8 @@ pub struct Profile {
     #[serde(default)]
     pub warmup: Vec<Warmup>,
     pub selftest: SelftestSettings,
-    /// Sui only: the seeded address that impersonation draws from.
+    /// Sui: the seeded address that impersonation draws from. Aptos: the
+    /// token holder that `fund --token` transfers from by impersonation.
     pub funder: Option<String>,
     /// The control sidecar's engine ID in the lock (default `control-curl`),
     /// for a family whose engine needs another client, such as grpcurl.
@@ -136,6 +138,12 @@ impl Profile {
     /// The upstream as `describe` and the fork object show it.
     pub fn upstream_info(&self) -> crate::fork::UpstreamInfo {
         crate::fork::UpstreamInfo { default: self.upstream.default.clone(), env: self.upstream.env.clone(), set: self.upstream_is_secret() }
+    }
+
+    /// The engine's RPC port, for families whose engine serves one. A profile
+    /// test checks that every EVM and Sui profile names it.
+    pub fn rpc_port(&self) -> u16 {
+        self.ports.rpc.unwrap_or_default()
     }
 
     pub fn control_engine(&self) -> &str {
@@ -191,6 +199,7 @@ mod tests {
             assert!(!p.limits.is_empty(), "{} has no limits", p.key);
             assert!(!p.upstream.env.is_empty());
             assert!(lock.engines.contains_key(p.control_engine()), "{} names control engine {} not in the lock", p.key, p.control_engine());
+            assert_eq!(p.ports.rpc.is_some(), p.family != "aptos", "{}: an RPC port exactly when the engine serves RPC", p.key);
             for o in &p.overrides {
                 asset(&o.file).unwrap();
             }
