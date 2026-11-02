@@ -268,6 +268,12 @@ enum HyperCoreWhat {
         #[arg(allow_hyphen_values = true)]
         rate: String,
     },
+    /// Whether an address's EVM transactions go into big blocks (30M gas) or small ones (3M).
+    BigBlocks {
+        user: String,
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
 }
 
 /// `set hypercore`: a change to the copy's local HyperCore state.
@@ -286,6 +292,7 @@ async fn set_hypercore(name: &str, what: HyperCoreWhat) -> Result<Value> {
         HyperCoreWhat::Book { coin, live: _ } => CoreOp::Book { coin },
         HyperCoreWhat::Mirror { user } => CoreOp::Mirror { user },
         HyperCoreWhat::Funding { perp, rate } => CoreOp::Funding { perp, rate },
+        HyperCoreWhat::BigBlocks { user, state } => CoreOp::BigBlocks { user, on: state == "on" },
     };
     EvmAdapter::connect().await?.hypercore(name, op).await
 }
@@ -327,6 +334,7 @@ fn describe_profile(p: &Profile, lock: &EngineLock) -> Value {
         "hypercore": p.hypercore.as_ref().map(|h| json!({
             "perps": h.perps, "tokens": h.tokens, "spots": h.spots,
             "set": chainsim_evm::HYPERCORE_SETS, "call": chainsim_evm::HYPERCORE_CALLS, "time": chainsim_evm::HYPERCORE_TIME,
+            "info": chainsim_evm::HYPERCORE_INFO, "rpc": chainsim_evm::HYPERCORE_RPC,
         })),
         "limits": p.limits,
     })
@@ -355,7 +363,7 @@ fn describe(chain: Option<&str>) -> Result<Value> {
             "revert <name> <id>",
             "call <name> <method> [<params-json>] [--from <address>]  (HyperEVM: call <name> corewriter_actions [{\"fromBlock\": <n>}])",
             "send <name> --as <address> --to <address> (--sig \"<fn(types)>\" [<arg>...] | --data <hex>) [--value <amount>]",
-            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex> | precompile <address> <calldata hex> (--result <hex> | --live) | hypercore (price <perp> <px> | spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>] | position <user> <perp> <szi> <entryNtl> [--leverage <n>] [--isolated-raw-usd <n>] [--isolated] | book <coin> --live | mirror <user> | funding <perp> <rate>)",
+            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex> | precompile <address> <calldata hex> (--result <hex> | --live) | hypercore (price <perp> <px> | spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>] | position <user> <perp> <szi> <entryNtl> [--leverage <n>] [--isolated-raw-usd <n>] [--isolated] | book <coin> --live | mirror <user> | funding <perp> <rate> | big-blocks <user> on|off)",
             "time <name> (--advance <seconds> | --to <unix seconds> | --replay <perp> --from <time> --to <time>)",
             "mine <name> [--blocks <n>]",
             "selftest <name>",
