@@ -504,8 +504,8 @@ fn hyperevm_local_hypercore() {
     let fork = ok(&["up", "hyperevm-mainnet", "--name", name]);
     println!("up: {:.1} s", t.elapsed().as_secs_f64());
     let core = &fork["hypercore"]["core"];
-    // metaAndAssetCtxs, spotMeta, and an l2Book and a fundingHistory per seeded perp.
-    assert_eq!(core["infoCalls"], 10, "{core}");
+    // metaAndAssetCtxs, spotMeta, allBorrowLendReserveStates, and an l2Book and a fundingHistory per seeded perp.
+    assert_eq!(core["infoCalls"], 11, "{core}");
     let btc = core["books"].as_array().unwrap().iter().find(|b| b["coin"] == "BTC").cloned().unwrap();
     let (best_bid, best_ask) = (fixed(btc["bestBid"].as_str().unwrap(), 8), fixed(btc["bestAsk"].as_str().unwrap(), 8));
     assert!(best_bid > 0 && best_ask > best_bid, "{btc}");
@@ -808,6 +808,166 @@ fn hyperevm_proxy() {
     }
     assert_eq!(back, held);
 
+    ok(&["down", name]);
+    assert_gone(name);
+    println!("whole run: {:.1} s", started.elapsed().as_secs_f64());
+}
+
+/// One 32-byte word of a precompile answer read through the proxy with cast.
+fn precompile_word(network: &str, rpc: &str, address: &str, calldata: &str, word: usize) -> u128 {
+    let out = cast(network, &format!("cast rpc --rpc-url {rpc} eth_call '{{\"to\":\"{address}\",\"data\":\"{calldata}\"}}' latest"));
+    let hex = out.trim_matches('"').trim_start_matches("0x").to_string();
+    u128::from_str_radix(&hex[word * 64 + 32..word * 64 + 64], 16).unwrap()
+}
+
+fn user_word(user: &str, n: u64) -> String {
+    format!("0x{:0>64}{:064x}", user.trim_start_matches("0x").to_lowercase(), n)
+}
+
+/// A mainnet account with borrow and lend state (portfolio margin, USDT0 borrowed), measured 2026-11-02.
+const LEND_USERS: &[&str] = &["0x2e4634304d58856d003545badbfef5ec1a442c1d", "0x286d8863806d77b1ca5ae5e8c6f080bcc637a9ab"];
+
+#[test]
+#[ignore]
+fn hyperevm_hip3_and_borrow_lend() {
+    use chainsim_evm::hypercore::{encode_action, limit_order, word_addr, word_u};
+    let name = "acc-phase3";
+    chainsim(&["down", name]);
+    let started = Instant::now();
+    let t = Instant::now();
+    let fork = ok(&["up", "hyperevm-mainnet", "--name", name]);
+    println!("up: {:.1} s, {} info calls, {} reserves", t.elapsed().as_secs_f64(), fork["hypercore"]["core"]["infoCalls"], fork["hypercore"]["core"]["reserves"]);
+    let (network, rpc) = (fork["network"].as_str().unwrap().to_string(), fork["rpcUrl"].as_str().unwrap().to_string());
+
+    // HIP-3: 1000 USD on perp, 600 of it sent to the xyz dex (1) with sendAsset.
+    ok(&["set", name, "balance", ADDR_A, "10"]);
+    ok(&["set", name, "hypercore", "spot-balance", ADDR_A, "0", "200000000000"]);
+    cast_action(&network, &rpc, KEY_A, &encode_action(7, &[word_u(1_000_000_000), word_u(1)].concat()));
+    cast_action(&network, &rpc, KEY_A, &encode_action(13, &[word_addr(ADDR_A.parse().unwrap()), word_addr(Default::default()), word_u(0), word_u(1), word_u(0), word_u(60_000_000_000)].concat()));
+    let t = Instant::now();
+    let xyz = ok(&["set", name, "hypercore", "book", "xyz:XYZ100", "--live"]);
+    let hood = ok(&["set", name, "hypercore", "book", "xyz:HOOD", "--live"]);
+    println!("HIP-3 books: {:.1} s, {} and {}", t.elapsed().as_secs_f64(), xyz["book"], hood["book"]);
+    assert_eq!((xyz["book"]["perp"].clone(), hood["book"]["perp"].clone()), (json!(10_000), json!(10_004)));
+    // A cross IOC on xyz:XYZ100 (asset 110000) fills against its mainnet book.
+    let ask = fixed(xyz["book"]["bestAsk"].as_str().unwrap(), 8);
+    let a = cast_action(&network, &rpc, KEY_A, &limit_order(110_000, true, (ask * 101 / 100) as u64, 1_000_000, false, 3, 0));
+    let actions = ok(&["call", name, "corewriter_actions"]);
+    let filled = actions.as_array().unwrap().iter().find(|x| x["txHash"] == a["transactionHash"]).cloned().unwrap();
+    assert!(filled["result"].as_str().unwrap().starts_with(&format!("filled 0.01 at {}", xyz["book"]["bestAsk"].as_str().unwrap())), "{filled}");
+    // 0x800 (uint16 perp 10000) and 0x813 read it: szi 100 at szDecimals 4.
+    assert_eq!(precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000800", &user_word(ADDR_A, 10_000), 0), 100);
+    assert_eq!(precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000813", &user_word(ADDR_A, 10_000), 0), 100);
+    let ch = info(&network, &rpc, json!({ "type": "clearinghouseState", "user": ADDR_A, "dex": "xyz" }));
+    assert_eq!(ch["assetPositions"][0]["position"]["coin"], "xyz:XYZ100", "{ch}");
+    assert_eq!(info(&network, &rpc, json!({ "type": "meta", "dex": "xyz" }))["universe"][4]["name"], "xyz:HOOD");
+    // An isolated xyz:HOOD long at 5x, and a cross BTC long on the main dex.
+    let hood_ask = fixed(hood["book"]["bestAsk"].as_str().unwrap(), 8);
+    let hood_d = info(&network, &rpc, json!({ "type": "meta", "dex": "xyz" }))["universe"][4]["szDecimals"].as_u64().unwrap() as u32;
+    // About 1000 USD of HOOD, in whole szDecimals steps.
+    let step = 10u128.pow(8 - hood_d);
+    let hood_sz = (10_000_000_000_000_000_000u128 / hood_ask as u128 / step * step) as u64;
+    cast_action(&network, &rpc, KEY_A, &limit_order(110_004, true, (hood_ask * 101 / 100) as u64, hood_sz, false, 3, 0));
+    let btc_ask = fixed(fork["hypercore"]["core"]["books"][0]["bestAsk"].as_str().unwrap(), 8);
+    cast_action(&network, &rpc, KEY_A, &limit_order(0, true, (btc_ask * 101 / 100) as u64, 100_000, false, 3, 0));
+    let state = ok(&["call", name, "hypercore_state", ADDR_A]);
+    let hood_pos = state["dexes"]["xyz"]["assetPositions"].as_array().unwrap().iter().find(|p| p["position"]["coin"] == "xyz:HOOD").cloned().unwrap();
+    assert_eq!(hood_pos["position"]["leverage"]["type"], "isolated", "{hood_pos}");
+    // HOOD down 30%: the isolated position is liquidated, XYZ100 (cross on xyz) and BTC (main dex) survive.
+    let raw = |px: i128, d: u32| px / 10i128.pow(2 + d);
+    let t = Instant::now();
+    let moved = ok(&["set", name, "hypercore", "price", "10004", &raw(hood_ask * 70 / 100, hood_d).to_string()]);
+    println!("HOOD price drop: {:.1} s, liquidated {}", t.elapsed().as_secs_f64(), moved["liquidated"]);
+    assert_eq!(moved["liquidated"].as_array().unwrap().len(), 1);
+    assert_eq!(precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000800", &user_word(ADDR_A, 10_004), 0), 0);
+    assert_eq!(precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000800", &user_word(ADDR_A, 10_000), 0), 100);
+    assert_eq!(precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000800", &user_word(ADDR_A, 0), 0), 100);
+    let line = history(name, ADDR_A).into_iter().find(|h| h.starts_with("liquidated: isolated xyz:HOOD")).expect("an isolated liquidation line");
+    println!("HOOD: {line}");
+
+    // Borrow and lend: B supplies 10 HYPE, switches to portfolio margin, and a
+    // 100 USDC spot send with no USDC borrows it.
+    ok(&["set", name, "balance", ADDR_B, "10"]);
+    ok(&["set", name, "hypercore", "spot-balance", ADDR_B, "150", "1000000000"]);
+    cast_action(&network, &rpc, KEY_B, &encode_action(15, &[word_u(0), word_u(150), word_u(0)].concat()));
+    cast_action(&network, &rpc, KEY_B, &encode_action(16, &[word_addr(ADDR_B.parse().unwrap()), word_u(3)].concat()));
+    let reserve_before = precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000812", &format!("0x{:064x}", 0), 7);
+    cast_action(&network, &rpc, KEY_B, &encode_action(6, &[word_addr(ADDR_A.parse().unwrap()), word_u(0), word_u(10_000_000_000)].concat()));
+    let supplied = precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000811", &user_word(ADDR_B, 150), 3);
+    let borrowed = precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000811", &user_word(ADDR_B, 0), 1);
+    assert_eq!((supplied, borrowed), (1_000_000_000, 10_000_000_000));
+    assert_eq!(precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000812", &format!("0x{:064x}", 0), 7), reserve_before + 10_000_000_000);
+    let bl = info(&network, &rpc, json!({ "type": "borrowLendUserState", "user": ADDR_B }));
+    assert_eq!(bl["health"], "healthy", "{bl}");
+    // Two hours later the borrow has grown by the hourly rate.
+    ok(&["time", name, "--advance", "7200"]);
+    let later = precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000811", &user_word(ADDR_B, 0), 1);
+    println!("USDC borrow: {borrowed} wei, two hours later {later} wei");
+    assert!(later > borrowed, "interest accrued");
+
+    // Mirror a mainnet account with borrow and lend state.
+    let t = Instant::now();
+    let mut mirrored = None;
+    for user in LEND_USERS {
+        let m = ok(&["set", name, "hypercore", "mirror", user]);
+        if m["borrowLend"].as_u64().unwrap_or(0) > 0 {
+            mirrored = Some((user.to_string(), m));
+            break;
+        }
+    }
+    let (user, m) = mirrored.expect("a mainnet account with borrow and lend state");
+    println!("mirror {user}: {:.1} s, {} borrow and lend tokens, abstraction {}, {} info calls", t.elapsed().as_secs_f64(), m["borrowLend"], m["abstraction"], m["infoCalls"]);
+    let state = ok(&["call", name, "hypercore_state", &user]);
+    let tokens = state["borrowLendUserState"]["tokenToState"].as_array().unwrap().clone();
+    let (token, entry) = (tokens[0][0].as_u64().unwrap(), tokens[0][1].clone());
+    let supply = fixed(entry["supply"]["value"].as_str().unwrap(), 8);
+    if supply > 0 {
+        assert!(precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000811", &user_word(&user, token), 3) > 0);
+    }
+    assert_eq!(info(&network, &rpc, json!({ "type": "borrowLendUserState", "user": user }))["tokenToState"].as_array().unwrap().len(), tokens.len());
+
+    ok(&["down", name]);
+    assert_gone(name);
+    println!("whole run: {:.1} s", started.elapsed().as_secs_f64());
+}
+
+#[test]
+#[ignore]
+fn hyperevm_testnet() {
+    use chainsim_evm::hypercore::limit_order;
+    let name = "acc-testnet";
+    chainsim(&["down", name]);
+    let started = Instant::now();
+    let t = Instant::now();
+    let fork = ok(&["up", "hyperevm-testnet", "--name", name]);
+    println!("up: {:.1} s, {} info calls", t.elapsed().as_secs_f64(), fork["hypercore"]["core"]["infoCalls"]);
+    assert_eq!(fork["chainId"], "eip155:998");
+    let coins: Vec<_> = fork["hypercore"]["perps"].as_array().unwrap().iter().map(|p| p["coin"].as_str().unwrap().to_string()).collect();
+    assert_eq!(coins, ["BTC", "ETH", "SOL", "HYPE"]);
+    let t = Instant::now();
+    check_selftest(name, &["chain-id", "hypercore", "corewriter"]);
+    println!("selftest: {:.1} s", t.elapsed().as_secs_f64());
+    let wallet = fresh_address(41);
+    let funded = ok(&["fund", name, &wallet, "--native", "5", "--token", "PURR:100"]);
+    let amounts: Vec<_> = funded["balances"].as_array().unwrap().iter().map(|b| b["amount"].as_str().unwrap().to_string()).collect();
+    assert_eq!(amounts, ["5", "100"]);
+    // A CoreWriter IOC on BTC (perp 3 on testnet) fills against the testnet book.
+    let (network, rpc) = (fork["network"].as_str().unwrap().to_string(), fork["rpcUrl"].as_str().unwrap().to_string());
+    ok(&["set", name, "balance", ADDR_A, "10"]);
+    ok(&["set", name, "hypercore", "spot-balance", ADDR_A, "0", "100000000000"]);
+    cast_action(&network, &rpc, KEY_A, &chainsim_evm::hypercore::encode_action(7, &[chainsim_evm::hypercore::word_u(500_000_000), chainsim_evm::hypercore::word_u(1)].concat()));
+    let btc = fork["hypercore"]["core"]["books"].as_array().unwrap().iter().find(|b| b["coin"] == "BTC").cloned().unwrap();
+    let ask = fixed(btc["bestAsk"].as_str().unwrap(), 8);
+    let a = cast_action(&network, &rpc, KEY_A, &limit_order(3, true, (ask * 105 / 100) as u64, 1_000, false, 3, 0));
+    let actions = ok(&["call", name, "corewriter_actions"]);
+    let order = actions.as_array().unwrap().iter().find(|x| x["txHash"] == a["transactionHash"]).cloned().unwrap();
+    println!("testnet IOC: {}", order["result"]);
+    assert!(order["result"].as_str().unwrap().starts_with("filled 0.00001 at "), "{order}");
+    // HYPE bridges in as token 1105 on testnet.
+    let sent = ok(&["send", name, "--as", ADDR_A, "--to", "0x2222222222222222222222222222222222222222", "--value", "1"]);
+    assert_eq!(sent["status"], 1);
+    let state = ok(&["call", name, "hypercore_state", ADDR_A]);
+    assert!(state["spotClearinghouseState"]["balances"].as_array().unwrap().iter().any(|b| b["token"] == 1105 && b["total"] == "1.0"), "{state}");
     ok(&["down", name]);
     assert_gone(name);
     println!("whole run: {:.1} s", started.elapsed().as_secs_f64());
