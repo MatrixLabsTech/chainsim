@@ -6,7 +6,8 @@ chainsim runs a private copy of HyperEVM Mainnet, the EVM side of Hyperliquid, i
 chain `hyperevm-mainnet`. The commands and their JSON output are the same as on every chain, and
 the [README](../../README.md) covers the shared workflow. This page covers what is specific to
 HyperEVM. Every output below comes from a live run against HyperEVM Mainnet, on 2026-11-01 for
-the precompile answers and on 2026-11-02 for the local HyperCore and market scripting.
+the precompile answers and on 2026-11-02 for the local HyperCore, market scripting and the
+proxy.
 
 ## What chainsim gives on HyperEVM
 
@@ -26,6 +27,12 @@ the precompile answers and on 2026-11-02 for the local HyperCore and market scri
   crosses and liquidates accounts below maintenance margin, `time --replay` plays a past stretch
   of mainnet candles as the price path, funding accrues every hour of the fork's clock, and every
   fill pays maker or taker fees.
+- An RPC proxy in front of the fork, so any client, such as forge, cast, a frontend or an SDK,
+  gets HyperCore applied on every block with no chainsim command in between.
+- Small and big blocks as on mainnet, per sender, with `eth_usingBigBlocks` and
+  `eth_bigBlockGasPrice`.
+- The Hyperliquid info API for the copy at `/info`, so a frontend built on the Hyperliquid SDK can
+  point at it.
 - Every action a contract sends through CoreWriter, decoded with what it did by `call
   corewriter_actions`.
 - `fund` for HYPE and five ERC-20 tokens, and `send --as` for any account.
@@ -39,9 +46,13 @@ the precompile answers and on 2026-11-02 for the local HyperCore and market scri
 - The engine is Foundry anvil v1.8.5, the same image as Ethereum mainnet, run with chain id 999,
   the Cancun hardfork and a 30,000,000 gas limit, so large deployments fit.
 - The fork has no dev accounts. `fund` gives a test wallet its balances.
-- Each fork is an engine container and a control sidecar on the fork's network. Both run as
-  non-root users with a read-only root filesystem, every Linux capability dropped and
-  `no-new-privileges`, and publish no port unless `up --publish` asks for one.
+- Each fork is an engine container, a control sidecar and chainsim's HyperEVM proxy on the
+  fork's network. The proxy takes the fork's alias and port, and anvil sits behind it at
+  `<alias>-engine`. All three run as non-root users with a read-only root filesystem, every
+  Linux capability dropped and `no-new-privileges`, and publish no port unless `up --publish`
+  asks for one, which publishes the proxy's.
+- The proxy is a small Rust binary chainsim builds in its release workflow and pins in its engine
+  lock by version and sha256, like the other engines. `up` downloads it once and checks it.
 
 ## Upstream
 
@@ -84,7 +95,7 @@ fork object, with its `limits` and `devAccounts` left out here:
   "network": "chainsim-hyperevm-mainnet",
   "alias": "hyperevm-mainnet",
   "rpcUrl": "http://hyperevm-mainnet:8545",
-  "wsUrl": "ws://hyperevm-mainnet:8545",
+  "wsUrl": "ws://hyperevm-mainnet-engine:8545",
   "hostRpcUrl": null,
   "upstream": { "default": "https://rpc.hyperliquid.xyz/evm", "env": "CHAINSIM_HYPEREVM_MAINNET_RPC", "set": false },
   "hypercore": {
@@ -240,8 +251,8 @@ Every `set precompile` and `set hypercore` is listed under `status` modification
 ## Local HyperCore
 
 chainsim keeps HyperCore state for the copy: spot balances, perp positions with cross margin, and
-open orders, per account. It applies each CoreWriter action and bridge transfer in block order
-when a chainsim command runs on the fork, and an action takes effect from the block after its
+open orders, per account. The proxy applies each CoreWriter action and bridge transfer in block
+order after every block, whoever sent it, and an action takes effect from the block after its
 own, as on mainnet.
 
 ### Mirror a mainnet account
@@ -468,6 +479,90 @@ chainsim time hyperevm-mainnet --replay BTC --from 2026-10-31 --to 2026-11-01
 The replay took one info API request. After it, `0x806` reads 776380, the last close in the
 precompile's units, and the bidder had paid 25 more hours of funding, 1.999287 USD in all.
 `snapshot` and `revert` restore prices, positions, margin and funding with the rest of the fork.
+
+## RPC proxy
+
+The fork's `rpcUrl` is chainsim's HyperEVM proxy. It forwards every JSON-RPC request to anvil,
+brings HyperCore up to date after each block, and answers what anvil cannot. The fork object
+from the 2026-11-02 run:
+
+```json
+{ "rpcUrl": "http://hyperevm-mainnet:8545", "wsUrl": "ws://hyperevm-mainnet-engine:8545", "hostRpcUrl": null }
+```
+
+`wsUrl` is anvil's own address, since the proxy serves HTTP. A transaction sent over a
+WebSocket reaches HyperCore at the next HTTP request or chainsim command.
+
+### Any client
+
+This run gave `0x7099…79C8` 1,000 USDC with `set hypercore spot-balance`, then used plain `cast`
+on the fork's network for a USD class transfer and an IOC buy of 0.001 BTC through CoreWriter:
+
+```sh
+cast send --rpc-url http://hyperevm-mainnet:8545 --private-key <test key> \
+  0x3333333333333333333333333333333333333333 "sendRawAction(bytes)" <IOC action>
+```
+
+With no chainsim command after it, the next `eth_call` to the position precompile reads the
+position, szi 100 (0.001 BTC in szDecimals 5):
+
+```json
+"0x0000000000000000000000000000000000000000000000000000000000000064000000000000000000000000000000000000000000000000000000000004a7b238…"
+```
+
+The proxy's overhead was about 0.1 to 0.2 ms per request in this run.
+
+### Block types
+
+HyperEVM has small blocks (about 1 s, 3,000,000 gas) and big blocks (about 1 min, 30,000,000
+gas), and a user opts into big blocks with the `evmUserModify` action. On the copy the proxy
+mines one block per transaction with the gas limit of its sender's block type, and
+`set hypercore big-blocks <user> on|off` stands in for that action:
+
+```sh
+chainsim set hyperevm-mainnet hypercore big-blocks 0x70997970C51812dc3A010C7d01b50e0d17dc79C8 on
+```
+
+```json
+{ "kind": "hypercore", "helper": "big-blocks", "user": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8", "usingBigBlocks": true, "blockGasLimit": 30000000 }
+```
+
+After it, `eth_usingBigBlocks` answers `true` for that address, its next transaction lands in a
+block with `gasLimit` `0x1c9c380` (30,000,000), and a small-block sender's lands in one with
+`0x2dc6c0` (3,000,000). A big block comes at least 60 s after the last big block.
+`eth_bigBlockGasPrice` answers `0x5f5e100`, as measured on mainnet. A transaction too large for
+its sender's block type is refused:
+
+```text
+error code -32000: exceeds block gas limit: the transaction asks 5000000 gas and a small block holds 3000000
+```
+
+### Info API
+
+`POST /info` on the proxy answers the Hyperliquid info API's request types `clearinghouseState`,
+`spotClearinghouseState`, `openOrders`, `userFills`, `meta`, `metaAndAssetCtxs`, `l2Book` and
+`allMids` from the copy, in the info API's own shapes, with CORS headers for a browser. After the
+IOC and a GTC bid at 70,000:
+
+```sh
+curl -X POST -H 'content-type: application/json' \
+  --data '{"type": "openOrders", "user": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"}' \
+  http://hyperevm-mainnet:8545/info
+```
+
+```json
+[{ "coin": "BTC", "side": "B", "limitPx": "70000.0", "sz": "0.001", "oid": 2, "timestamp": 1793606127000, "origSz": "0.001", "cloid": "0x0000000000000000000000000000004d" }]
+```
+
+`userFills` for the same user:
+
+```json
+[{ "coin": "BTC", "px": "78099.0", "sz": "0.001", "side": "B", "time": 1793606127000, "startPosition": "0.0", "dir": "Open Long", "closedPnl": "0.0", "hash": "0x0000…0001", "oid": 1, "crossed": true, "fee": "0.035144", "tid": 1, "feeToken": "USDC" }]
+```
+
+`clearinghouseState` matches `call hypercore_state`, whose output also carries the user's fills
+under `userFills`. `meta` and `metaAndAssetCtxs` cover the whole perp universe from the snapshot
+`up` took, with the copy's own mark, oracle, funding and mid for the perps it tracks.
 
 ## CoreWriter actions
 

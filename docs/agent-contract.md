@@ -59,11 +59,13 @@ error codes from the binary.
 - On HyperEVM, the `fork` object carries a `hypercore` field: the HyperCore answers `up` seeded
   and, under `core`, the order books it took. In `status` it adds `coreWriterActions`, the count
   of captured CoreWriter actions, and `coreState`. Other chains' fork objects have no such field.
-- HyperEVM applies CoreWriter actions and bridge transfers to the copy's HyperCore when a
-  chainsim command runs on the fork. A transaction sent straight to the RPC port by another tool
-  takes effect at the next chainsim command on that fork, so run one (`status` will do) before
-  reading Core state that such a transaction changed. `describe hyperevm-mainnet` lists in
-  `limits` what HyperCore does not model yet, such as fees, funding and liquidations.
+- On HyperEVM, `rpcUrl` and `hostRpcUrl` are chainsim's proxy, which applies CoreWriter actions
+  and bridge transfers after every block for any client, mines small and big blocks per sender
+  (`set hypercore big-blocks <user> on|off`, `eth_usingBigBlocks`, `eth_bigBlockGasPrice`) and
+  answers `POST /info` from the copy. `wsUrl` is anvil itself: a transaction sent over a
+  WebSocket reaches HyperCore at the next HTTP request or chainsim command. `describe
+  hyperevm-mainnet` lists the info request types and RPC methods the proxy serves, and in
+  `limits` what HyperCore does not model.
 - `latest_state_only` (exit 7) means `up --block` was refused because the default upstream
   answers state reads at its latest block only. `error.next` names the variable that takes an
   archive provider URL.

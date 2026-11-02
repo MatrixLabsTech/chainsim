@@ -205,8 +205,10 @@ the same JSON contract and exit codes as every other chain.
 - `call hypercore_state <user>` returns an account's Core state in the info API's own shapes,
   with its fills, funding and liquidations, and `call corewriter_actions` shows each action with
   what it did.
-- chainsim applies Core actions on each command, and `snapshot` and `revert` carry Core state
-  with the rest of the fork.
+- An RPC proxy in front of the fork applies HyperCore after every block for any client, such as
+  forge, cast or a frontend, mines small and big blocks per sender, and serves the Hyperliquid
+  info API for the copy at `/info`.
+- `snapshot` and `revert` carry Core state with the rest of the fork.
 
 ```sh
 chainsim up hyperevm-mainnet

@@ -46,7 +46,8 @@ Work through these steps in order. Each ends on a check you can make.
    Core state, and `call <name> corewriter_actions` lists the CoreWriter actions contracts sent,
    decoded, with what each did. `set <name> hypercore price` moves a perp (fills and liquidations
    follow), `set <name> hypercore funding` sets a funding rate, and `time <name> --replay <perp>
-   --from <date> --to <date>` replays mainnet candles. Core actions apply when a chainsim command runs on the fork.
+   --from <date> --to <date>` replays mainnet candles. Core actions apply after every block, whoever sends them, and the fork answers the Hyperliquid
+   info API at `<rpcUrl>/info`.
    `chainsim describe <chain>` lists what each chain supports. Done when the receipt `status` is
    1 (`success` on Aptos) or the read-back matches what you set.
 7. **Do the work.** Before each scenario run `chainsim snapshot <name>`, and after it
