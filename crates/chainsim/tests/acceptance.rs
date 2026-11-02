@@ -974,7 +974,7 @@ fn hyperevm_testnet() {
     // The PURR bridge both ways: 10 PURR sent to its system address (token 1)
     // credits Core spot, and a spot send of 4 back credits the ERC-20.
     let t = Instant::now();
-    ok(&["fund", name, ADDR_A, "--token", "PURR:100"]);
+    ok(&["set", name, "token", ADDR_A, "PURR", "100"]);
     let purr = "0xa9056c15938f9aff34cd497c722ce33db0c2fd57";
     let purr_of = |who: &str| -> u128 {
         let out = cast(&network, &format!("cast call --rpc-url {rpc} {purr} 'balanceOf(address)(uint256)' {who}"));
