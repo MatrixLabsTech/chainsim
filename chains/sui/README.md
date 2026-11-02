@@ -138,10 +138,11 @@ chainsim fund sui-mainnet 0xc0ffee --native 25
 ```
 
 On Sui, `fund --native` gives SUI by a transfer on the copy from the profile's funder,
-`0x935029ca5219502a47ac9b69f556ccf6e2198b5e7815cf50f68846f723739cbd`. It is labeled Binance 1 on
-CoinCarp's Sui rich list and held 27.59 million SUI in address-owned coins when we checked on
-2026-10-09. The transfer carries no signature: `sui-fork` executes a transaction with an empty
-signature list as its sender. Nothing is sent on Sui Mainnet.
+`0x80841329787fd577639add61cc955ace969af60fadfb05b8ff752c2de4a8aa65`. It is an unlabeled holder
+ranked seventh on CoinCarp's Sui rich list and held 787,301 SUI in one address-owned coin when we
+checked on 2026-11-01. `up` seeds the funder's objects into the copy, so the funder is an address
+that owns few objects: this one owned 178. The transfer carries no signature: `sui-fork` executes
+a transaction with an empty signature list as its sender. Nothing is sent on Sui Mainnet.
 
 - `fund` only raises a balance: an address that already holds more than the amount asked exits 3.
   `set balance` (below) can lower one.
