@@ -109,7 +109,7 @@ mod tests {
         assert_eq!(rows.len(), lock.engines.len());
         let foundry = rows.iter().find(|r| r.engine == "foundry").unwrap();
         assert!(foundry.present && foundry.source == "pull");
-        assert_eq!(foundry.used_by, ["ethereum-mainnet", "robinhood-mainnet"]);
+        assert_eq!(foundry.used_by, ["ethereum-mainnet", "hyperevm-mainnet", "robinhood-mainnet"]);
         let curl = rows.iter().find(|r| r.engine == "control-curl").unwrap();
         assert!(curl.used_by.contains(&"arc-mainnet".to_string()), "control sidecars count as users");
         assert_eq!(rows.iter().find(|r| r.engine == "arc-foundry").unwrap().source, "build");

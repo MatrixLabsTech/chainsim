@@ -194,6 +194,80 @@ enum SetWhat {
         #[arg(long)]
         bcs: String,
     },
+    /// The answer of a HyperCore read precompile (HyperEVM): given, or copied from the upstream.
+    Precompile {
+        /// The precompile, from 0x800 to 0x813.
+        address: String,
+        /// The query: the ABI-encoded arguments as hex, with no selector.
+        calldata: String,
+        /// The answer to store, as hex.
+        #[arg(long, required_unless_present = "live", conflicts_with = "live")]
+        result: Option<String>,
+        /// Copy the upstream's answer to this query.
+        #[arg(long)]
+        live: bool,
+    },
+    /// Common HyperCore answers (HyperEVM), encoded for you.
+    Hypercore {
+        #[command(subcommand)]
+        what: HyperCoreWhat,
+    },
+}
+
+#[derive(Subcommand)]
+enum HyperCoreWhat {
+    /// A perp's mark price (0x806) and oracle price (0x807), in the precompile's raw units.
+    Price { perp: u32, px: u64 },
+    /// A user's spot balance on HyperCore (0x801), in the token's raw units.
+    SpotBalance {
+        user: String,
+        token: u64,
+        total: u64,
+        #[arg(long, default_value_t = 0)]
+        hold: u64,
+        #[arg(long = "entry-ntl", default_value_t = 0)]
+        entry_ntl: u64,
+    },
+    /// A user's perp position (0x800): signed size and entry notional, in raw units.
+    Position {
+        user: String,
+        perp: u16,
+        #[arg(allow_hyphen_values = true)]
+        szi: i64,
+        entry_ntl: u64,
+        #[arg(long, default_value_t = 1)]
+        leverage: u32,
+        #[arg(long = "isolated-raw-usd", default_value_t = 0, allow_hyphen_values = true)]
+        isolated_raw_usd: i64,
+        #[arg(long)]
+        isolated: bool,
+    },
+}
+
+/// `set hypercore`: one `set precompile` per answer the helper encodes.
+async fn set_hypercore(name: &str, what: HyperCoreWhat) -> Result<Value> {
+    use chainsim_evm::hypercore;
+    use chainsim_evm::units::parse_address;
+    let (helper, entries) = match what {
+        HyperCoreWhat::Price { perp, px } => ("price", hypercore::price(perp, px)),
+        HyperCoreWhat::SpotBalance { user, token, total, hold, entry_ntl } => ("spot-balance", vec![hypercore::spot_balance(parse_address(&user)?, token, total, hold, entry_ntl)]),
+        HyperCoreWhat::Position { user, perp, szi, entry_ntl, leverage, isolated_raw_usd, isolated } => {
+            let p = hypercore::Position { szi, entry_ntl, isolated_raw_usd, leverage, is_isolated: isolated };
+            ("position", vec![hypercore::position(parse_address(&user)?, perp, p)])
+        }
+    };
+    let adapter = adapter_of(name).await?;
+    let mut sets = Vec::new();
+    for e in entries {
+        let hex = hypercore::to_hex;
+        let req = SetRequest { kind: SetKind::Precompile { calldata: hex(&e.calldata), result: Some(hex(&e.result)) }, address: hypercore::address(e.precompile), value: String::new() };
+        let mut out = adapter.set(name, &req).await?;
+        if let Some(o) = out.as_object_mut() {
+            o.remove("note");
+        }
+        sets.push(out);
+    }
+    Ok(json!({ "kind": "hypercore", "helper": helper, "sets": sets, "note": chainsim_core::mods::NOTE }))
 }
 
 /// The adapter for a profile family.
@@ -230,6 +304,7 @@ fn describe_profile(p: &Profile, lock: &EngineLock) -> Value {
         "native": p.native,
         "tokens": p.tokens,
         "overrides": p.overrides.iter().map(|o| json!({ "kind": o.kind, "target": o.target, "note": o.note })).collect::<Vec<_>>(),
+        "hypercore": p.hypercore,
         "limits": p.limits,
     })
 }
@@ -254,9 +329,9 @@ fn describe(chain: Option<&str>) -> Result<Value> {
             "fund <name> <address> [--native <amount>] [--token <symbol|address>:<amount>]...",
             "snapshot <name>",
             "revert <name> <id>",
-            "call <name> <method> [<params-json>] [--from <address>]",
+            "call <name> <method> [<params-json>] [--from <address>]  (HyperEVM: call <name> corewriter_actions [{\"fromBlock\": <n>}])",
             "send <name> --as <address> --to <address> (--sig \"<fn(types)>\" [<arg>...] | --data <hex>) [--value <amount>]",
-            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex>",
+            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex> | precompile <address> <calldata hex> (--result <hex> | --live) | hypercore (price <perp> <px> | spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>] | position <user> <perp> <szi> <entryNtl> [--leverage <n>] [--isolated-raw-usd <n>] [--isolated])",
             "time <name> (--advance <seconds> | --to <unix seconds>)",
             "mine <name> [--blocks <n>]",
             "selftest <name>",
@@ -428,6 +503,8 @@ async fn run(command: Command) -> Result<Value> {
                 SetWhat::Owner { object, owner } => SetRequest { kind: SetKind::Owner, address: object, value: owner },
                 SetWhat::Object { object, fields, bcs } => SetRequest { kind: SetKind::Object { fields, bcs }, address: object, value: String::new() },
                 SetWhat::Resource { address, struct_tag, bcs } => SetRequest { kind: SetKind::Resource { struct_tag, bcs }, address, value: String::new() },
+                SetWhat::Precompile { address, calldata, result, live: _ } => SetRequest { kind: SetKind::Precompile { calldata, result }, address, value: String::new() },
+                SetWhat::Hypercore { what } => return set_hypercore(&name, what).await,
             };
             adapter_of(&name).await?.set(&name, &req).await
         }

@@ -1,0 +1,37 @@
+{
+  "key": "hyperevm-mainnet",
+  "id": "eip155:999",
+  "name": "HyperEVM Mainnet",
+  "family": "evm",
+  "engine": "foundry",
+  "upstream": { "default": "https://rpc.hyperliquid.xyz/evm", "env": "CHAINSIM_HYPEREVM_MAINNET_RPC" },
+  "ports": { "rpc": 8545, "ws": 8545 },
+  "maturity": "experimental",
+  "fork": {
+    "default": "latest",
+    "flags": ["--chain-id", "999", "--hardfork", "cancun", "--gas-limit", "30000000", "--accounts", "0", "--retries", "20", "--fork-retry-backoff", "3000", "--compute-units-per-second", "1000"],
+    "latestStateOnly": true
+  },
+  "native": { "symbol": "HYPE", "decimals": 18 },
+  "tokens": [
+    { "symbol": "USDC", "address": "0xb88339CB7199b77E23DB6E890353E22632Ba630f", "decimals": 6 },
+    { "symbol": "USDT0", "address": "0xB8CE59FC3717ada4C02eaDF9682A9e934F625ebb", "decimals": 6 },
+    { "symbol": "WHYPE", "address": "0x5555555555555555555555555555555555555555", "decimals": 18 },
+    { "symbol": "UBTC", "address": "0x9FDBdA0A5e284c32744D2f17Ee5c74B284993463", "decimals": 8 },
+    { "symbol": "UETH", "address": "0xBe6727B535545C67d5cAa73dEa54865B92CF7907", "decimals": 18 }
+  ],
+  "warmup": [{ "action": "native-transfer" }],
+  "selftest": { "token": "USDC", "extras": ["chain-id", "hypercore", "corewriter"] },
+  "hypercore": { "perps": [0, 1, 5, 159], "tokens": [0, 150], "spots": [107] },
+  "limits": [
+    "This is a private copy of HyperEVM Mainnet: transactions confirm on the copy only and never appear on Hyperliquid or its explorers.",
+    "The copy keeps chain id 999, so a transaction signed for it is also valid on HyperEVM Mainnet. Use test keys that hold no mainnet assets.",
+    "The engine is Foundry anvil v1.8.5 with a 30,000,000 gas limit and one block type. There is no small and big block split, blocks are mined on demand, gas prices follow anvil's base fee, and the custom methods eth_bigBlockGasPrice, eth_usingBigBlocks and eth_getSystemTxsByBlockNumber are not served.",
+    "HyperCore answers come from a chainsim mock at the read precompiles 0x800 to 0x813. They are a snapshot taken from the upstream at up (the L1 block number, mark price, oracle price and asset info for the BTC, ETH, SOL and HYPE perps, token info for USDC and HYPE, spot info and spot price for HYPE/USDC) plus what set writes. Any other query reverts with a chainsim reason until chainsim set <name> precompile seeds it.",
+    "Actions sent through CoreWriter at 0x3333…3333, HYPE sent to 0x2222…2222 and tokens sent to the token system addresses are recorded on the copy but change nothing on HyperCore, so no order fills, no spot or perp balance moves and no HyperCore-to-HyperEVM transfer arrives.",
+    "The default public upstream answers every state read at its latest block, whatever block the read names. up --block with it exits 7, and set CHAINSIM_HYPEREVM_MAINNET_RPC to an archive provider URL to fork at an older block.",
+    "Accounts and storage the copy has not written are read from the upstream on first access, at the upstream's latest state, so a long session can read state newer than the fork block.",
+    "The default upstream allows 100 requests per minute per IP. Set CHAINSIM_HYPEREVM_MAINNET_RPC to a provider URL for heavier runs.",
+    "App indexers and explorers read the public chain, so they do not show what happens on the copy."
+  ]
+}

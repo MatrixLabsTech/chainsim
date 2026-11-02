@@ -3,6 +3,7 @@
 //! sections 3 and 5). Every engine call goes through the fork's control path.
 
 pub mod abi;
+pub mod hypercore;
 pub mod units;
 
 use std::collections::HashMap;
@@ -116,6 +117,36 @@ impl Engine<'_> {
         }
     }
 
+    /// Makes the HyperCore mock at `precompile` answer `calldata` with `result`.
+    async fn write_answer(&self, precompile: u16, calldata: &[u8], result: &[u8]) -> Result<()> {
+        let target = hypercore::address(precompile);
+        for (slot, value) in hypercore::storage_writes(calldata, result) {
+            self.rpc("anvil_setStorageAt", json!([target, slot, value])).await?;
+        }
+        Ok(())
+    }
+
+    /// One precompile call, on the fork or the upstream, as bytes.
+    async fn precompile_call(&self, upstream_block: Option<u64>, precompile: u16, calldata: &[u8]) -> Result<Vec<u8>> {
+        let call = json!({ "to": hypercore::address(precompile), "data": format!("0x{}", alloy_primitives::hex::encode(calldata)) });
+        let out = match upstream_block {
+            Some(b) => self.upstream("eth_call", json!([call, format!("0x{b:x}")])).await?,
+            None => self.rpc("eth_call", json!([call, "latest"])).await?,
+        };
+        let text = out.as_str().ok_or_else(|| Error::new(ErrorCode::RpcError, format!("eth_call returned {out}")))?;
+        alloy_primitives::hex::decode(text).map_err(|_| Error::new(ErrorCode::RpcError, format!("eth_call returned {text}")))
+    }
+
+    /// The RawAction logs CoreWriter emitted on the fork since `from`.
+    async fn raw_actions(&self, from: u64) -> Result<Vec<Value>> {
+        if from > self.head().await? {
+            return Ok(vec![]);
+        }
+        let filter = json!({ "address": hypercore::CORE_WRITER, "topics": [hypercore::RAW_ACTION_TOPIC], "fromBlock": format!("0x{from:x}"), "toBlock": "latest" });
+        let logs = self.rpc("eth_getLogs", json!([filter])).await?;
+        Ok(logs.as_array().cloned().unwrap_or_default())
+    }
+
     async fn decimals(&self, token: &str) -> Result<u8> {
         let out = self.rpc("eth_call", json!([{ "to": token, "data": DECIMALS }, "latest"])).await?;
         let d = parse_qty(&out)?;
@@ -207,6 +238,39 @@ fn reverted(e: Error) -> Error {
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// What `up` seeded on a HyperEVM fork, kept in the control sidecar's tmpfs
+/// beside the modification log, so it goes with the fork at `down`.
+const HYPERCORE_FILE: &str = "/tmp/chainsim-hypercore.json";
+
+async fn save_hypercore(docker: &Docker, fork: &str, summary: &Value) -> Result<()> {
+    let argv = ["sh", "-c", &format!("printf '%s' \"$1\" > {HYPERCORE_FILE}"), "sh", &summary.to_string()].map(String::from);
+    let out = docker.exec(&docker::control_container(fork), &argv).await?;
+    if out.exit_code != 0 {
+        return Err(Error::new(ErrorCode::Internal, format!("could not record the seeded HyperCore answers: {}", out.stderr.trim())));
+    }
+    Ok(())
+}
+
+async fn load_hypercore(docker: &Docker, fork: &str) -> Value {
+    let argv = ["sh", "-c", &format!("cat {HYPERCORE_FILE} 2>/dev/null || true")].map(String::from);
+    match docker.exec(&docker::control_container(fork), &argv).await {
+        Ok(out) => serde_json::from_str(&out.stdout).unwrap_or(Value::Null),
+        Err(_) => Value::Null,
+    }
+}
+
+/// `up --block` on an upstream that answers every state read at the latest
+/// block: refused, since the fork would pair an old header with current state.
+pub fn latest_state_refusal(profile: &Profile, block: Option<u64>) -> Option<Error> {
+    (block.is_some() && profile.fork.latest_state_only && !profile.upstream_is_secret()).then(|| {
+        Error::new(
+            ErrorCode::LatestStateOnly,
+            format!("--block is refused on {}: the default upstream answers state reads at the latest block whatever block they name, so an older fork point would pair an old header with current state", profile.key),
+        )
+        .next(format!("export {}=<archive provider URL> to fork at an older block, or drop --block to fork at the head", profile.upstream.env))
+    })
 }
 
 /// An `up --block` failure that reads like missing history: the upstream is
@@ -356,6 +420,15 @@ impl EvmAdapter {
             }
         }
 
+        let seeded = match &profile.hypercore {
+            Some(settings) => {
+                let summary = self.seed_hypercore(&eng, settings, block).await?;
+                save_hypercore(&self.docker, name, &summary).await?;
+                Some(summary)
+            }
+            None => None,
+        };
+
         // Warm-up: mine before handing the fork over. A cold fork's first
         // transaction took 63 s in UnitFlow round 6.
         let warm = Instant::now();
@@ -373,7 +446,73 @@ impl EvmAdapter {
         chainsim_core::log(format_args!("{name} warmed up in {} ms", warm.elapsed().as_millis()));
 
         let dev = self.dev_accounts(&eng).await;
-        Ok(handle.fork(profile, dev))
+        let mut fork = handle.fork(profile, dev);
+        fork.hypercore = seeded;
+        Ok(fork)
+    }
+
+    /// Sets the HyperCore mock at every read precompile, then seeds the
+    /// profile's queries with the upstream's answers at the fork block.
+    async fn seed_hypercore(&self, eng: &Engine<'_>, settings: &profile::HyperCoreSettings, block: u64) -> Result<Value> {
+        let code = hypercore::mock_code_hex();
+        for n in hypercore::FIRST_PRECOMPILE..=hypercore::LAST_PRECOMPILE {
+            eng.rpc("anvil_setCode", json!([hypercore::address(n), code])).await?;
+        }
+        let started = Instant::now();
+        let mut seeded = Vec::new();
+        for seed in hypercore::seeds(settings) {
+            let answer = eng.precompile_call(Some(block), seed.precompile, &seed.calldata).await?;
+            eng.write_answer(seed.precompile, &seed.calldata, &answer).await?;
+            seeded.push((seed, answer));
+        }
+        chainsim_core::log(format_args!("seeded {} HyperCore answers in {} ms", seeded.len(), started.elapsed().as_millis()));
+        Ok(hypercore::seeded_summary(&seeded))
+    }
+
+    /// The fork object, with what `up` seeded on a HyperEVM fork.
+    async fn fork_of(&self, handle: &ForkHandle, profile: &Profile, dev: Option<Vec<String>>) -> Fork {
+        let mut fork = handle.fork(profile, dev);
+        if profile.hypercore.is_some() {
+            fork.hypercore = Some(load_hypercore(&self.docker, &handle.name).await);
+        }
+        fork
+    }
+
+    /// `set precompile`: store an answer in the HyperCore mock, given or
+    /// copied from the upstream, and read it back through the precompile.
+    async fn set_precompile(&self, name: &str, handle: &ForkHandle, profile: &Profile, address: &str, calldata: &str, result: Option<&str>) -> Result<(Value, Value)> {
+        if profile.hypercore.is_none() {
+            return Err(Error::unsupported(
+                &format!("set precompile on {}", profile.key),
+                format!("only HyperEVM mocks precompiles: chainsim set {name} code <address> <hex> puts a contract at any address"),
+            ));
+        }
+        let n = hypercore::parse_precompile(address)?;
+        let calldata = alloy_primitives::hex::decode(hex_bytes(calldata, "the calldata")?).unwrap_or_default();
+        let eng = self.engine(handle, profile);
+        let (answer, source) = match result {
+            Some(r) => (alloy_primitives::hex::decode(hex_bytes(r, "--result")?).unwrap_or_default(), "given"),
+            None => {
+                let live = eng.precompile_call(Some(handle.fork_point.number), n, &calldata).await.map_err(|e| {
+                    if e.code == ErrorCode::RpcError {
+                        Error::new(ErrorCode::RpcError, format!("the upstream precompile refused the query: {}", e.message)).next("check that the calldata is the ABI encoding of the precompile's arguments, with no selector")
+                    } else {
+                        e
+                    }
+                })?;
+                (live, "live")
+            }
+        };
+        eng.write_answer(n, &calldata, &answer).await?;
+        let read = eng.precompile_call(None, n, &calldata).await?;
+        if read != answer {
+            return Err(Error::new(ErrorCode::ReadbackMismatch, format!("{} answers {} bytes after setting {}", hypercore::address(n), read.len(), answer.len())));
+        }
+        let (addr, cd, res) = (hypercore::address(n), format!("0x{}", alloy_primitives::hex::encode(&calldata)), format!("0x{}", alloy_primitives::hex::encode(&answer)));
+        Ok((
+            json!({ "kind": "precompile", "address": addr, "calldata": cd, "result": res, "source": source }),
+            json!({ "kind": "set-precompile", "address": addr, "calldata": cd, "result": res, "source": source }),
+        ))
     }
 
     async fn dev_accounts(&self, eng: &Engine<'_>) -> Option<Vec<String>> {
@@ -505,11 +644,67 @@ impl EvmAdapter {
             match extra.as_str() {
                 "dual-usdc-view" => parts.push(self.dual_usdc_view(eng, profile).await),
                 "arbgasinfo" => parts.push(self.arbgasinfo(eng).await),
+                "chain-id" => parts.push(self.chain_id(eng, profile).await),
+                "hypercore" => parts.push(self.hypercore_reads(eng, profile).await),
+                "corewriter" => parts.push(self.corewriter(eng).await),
                 // A typo in a profile must not pass as green.
                 _ => parts.push(Check { part: "extras", ok: false, reason: "the profile names a selftest extra the EVM adapter does not have", ms: 0 }),
             }
         }
         parts
+    }
+
+    /// eth_chainId equals the profile's chain id.
+    async fn chain_id(&self, eng: &Engine<'_>, profile: &Profile) -> Check {
+        let t = Instant::now();
+        let want = profile.id.rsplit(':').next().and_then(|n| n.parse::<u64>().ok());
+        let got = eng.rpc("eth_chainId", json!([])).await.ok().and_then(|v| parse_qty(&v).ok()).map(|v| v.to::<u64>());
+        let ok = want.is_some() && got == want;
+        Check { part: "chain-id", ok, reason: if ok { "eth_chainId returns the profile's chain id" } else { "eth_chainId does not return the profile's chain id" }, ms: ms(t) }
+    }
+
+    /// HyperEVM: the L1 block number precompile answers a uint64, and the
+    /// first seeded perp's oracle price decodes.
+    async fn hypercore_reads(&self, eng: &Engine<'_>, profile: &Profile) -> Check {
+        let t = Instant::now();
+        let perp = profile.hypercore.as_ref().and_then(|h| h.perps.first().copied());
+        let ok = async {
+            let l1 = hypercore::uint64(&eng.precompile_call(None, hypercore::L1_BLOCK_NUMBER, &[]).await?);
+            let px = match perp {
+                Some(p) => hypercore::uint64(&eng.precompile_call(None, hypercore::ORACLE_PX, &hypercore::word_u(p as u128)).await?),
+                None => None,
+            };
+            Ok::<bool, Error>(l1.is_some_and(|v| v > 0) && px.is_some_and(|v| v > 0))
+        }
+        .await
+        .unwrap_or(false);
+        Check {
+            part: "hypercore",
+            ok,
+            reason: if ok { "the L1 block number precompile at 0x809 and a seeded oracle price at 0x807 answer non-zero uint64 values" } else { "the HyperCore mock did not answer the L1 block number or a seeded oracle price" },
+            ms: ms(t),
+        }
+    }
+
+    /// HyperEVM: a limit order sent through CoreWriter emits RawAction, and it decodes.
+    async fn corewriter(&self, eng: &Engine<'_>) -> Check {
+        let t = Instant::now();
+        let ok = async {
+            let action = hypercore::limit_order(0, true, 1, 1, false, 2, 0);
+            let receipt = eng.send_as(ST_SENDER, json!({ "to": hypercore::CORE_WRITER, "data": hypercore::send_raw_action(&action) })).await?;
+            let logs = receipt["logs"].as_array().cloned().unwrap_or_default();
+            let decoded: Vec<Value> = logs.iter().filter(|l| l["topics"].get(0) == Some(&json!(hypercore::RAW_ACTION_TOPIC))).map(hypercore::decode_log).collect();
+            let sender = ST_SENDER.parse::<Address>().map(|a| a.to_string()).unwrap_or_default();
+            Ok::<bool, Error>(receipt["status"] == json!("0x1") && decoded.iter().any(|d| d["action"] == "limitOrder" && d["user"] == json!(sender)))
+        }
+        .await
+        .unwrap_or(false);
+        Check {
+            part: "corewriter",
+            ok,
+            reason: if ok { "a limit order sent through CoreWriter emitted RawAction and decoded" } else { "a CoreWriter sendRawAction did not emit a RawAction that decodes" },
+            ms: ms(t),
+        }
     }
 
     /// Arbitrum chains: the ArbGasInfo mock at 0x6C answers, and anvil's own
@@ -598,6 +793,9 @@ impl Adapter for EvmAdapter {
 
     async fn up(&self, profile: &Profile, req: &UpRequest) -> Result<Fork> {
         docker::check_name(&req.name)?;
+        if let Some(e) = latest_state_refusal(profile, req.block) {
+            return Err(e);
+        }
         if let Some(h) = self.docker.find(&req.name).await? {
             let taken = |why: String| {
                 Error::new(ErrorCode::NameConflict, format!("fork {} already runs {why}", req.name)).next(format!("chainsim down {} first, or pick another --name", req.name))
@@ -617,7 +815,7 @@ impl Adapter for EvmAdapter {
             if h.running && self.docker.is_running(&h.control_container).await {
                 let eng = self.engine(&h, profile);
                 let dev = self.dev_accounts(&eng).await;
-                return Ok(h.fork(profile, dev));
+                return Ok(self.fork_of(&h, profile, dev).await);
             }
             // A stopped fork of the same name and chain: start it fresh.
             self.docker.remove_fork(&req.name).await?;
@@ -642,7 +840,11 @@ impl Adapter for EvmAdapter {
         let eng = self.engine(&handle, &profile);
         let head = eng.head().await?;
         let dev = self.dev_accounts(&eng).await;
-        Ok(Status { fork: handle.fork(&profile, dev), head, uptime_secs: handle.uptime_secs })
+        let mut fork = self.fork_of(&handle, &profile, dev).await;
+        if let Some(h) = fork.hypercore.as_mut().filter(|h| h.is_object()) {
+            h["coreWriterActions"] = json!(eng.raw_actions(handle.fork_point.number + 1).await?.len());
+        }
+        Ok(Status { fork, head, uptime_secs: handle.uptime_secs })
     }
 
     async fn send(&self, name: &str, req: &SendRequest) -> Result<Value> {
@@ -698,8 +900,16 @@ impl Adapter for EvmAdapter {
     async fn set(&self, name: &str, req: &SetRequest) -> Result<Value> {
         let (handle, profile) = self.open(name).await?;
         let eng = self.engine(&handle, &profile);
+        if let SetKind::Precompile { calldata, result } = &req.kind {
+            let (mut out, mut entry) = self.set_precompile(name, &handle, &profile, &req.address, calldata, result.as_deref()).await?;
+            entry["at"] = json!(now_secs());
+            chainsim_core::mods::record(&self.docker, name, &entry).await?;
+            out["note"] = json!(chainsim_core::mods::NOTE);
+            return Ok(out);
+        }
         let address = parse_address(&req.address)?.to_string();
         let (mut out, entry) = match &req.kind {
+            SetKind::Precompile { .. } => unreachable!("handled above"),
             SetKind::Token { .. } => {
                 return Err(Error::unsupported("set token on EVM", "chainsim fund <name> <address> --token <symbol|address>:<amount> sets a token balance"));
             }
@@ -851,6 +1061,15 @@ impl Adapter for EvmAdapter {
         let eng = self.engine(&handle, &profile);
         if !params.is_array() {
             return Err(Error::new(ErrorCode::Usage, "params must be a JSON array, such as '[\"0x…\", \"latest\"]'"));
+        }
+        if method == "corewriter_actions" && profile.hypercore.is_some() {
+            let first = handle.fork_point.number + 1;
+            let from = match params.get(0) {
+                None => first,
+                Some(p) => p.get("fromBlock").and_then(Value::as_u64).filter(|_| p.is_object()).ok_or_else(|| Error::new(ErrorCode::Usage, "corewriter_actions takes [] or [{\"fromBlock\": <block number>}]"))?,
+            };
+            let logs = eng.raw_actions(from.max(first)).await?;
+            return Ok(json!(logs.iter().map(hypercore::decode_log).collect::<Vec<_>>()));
         }
         let result = match from {
             None => eng.rpc(method, params).await?,
