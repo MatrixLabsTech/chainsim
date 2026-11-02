@@ -688,6 +688,131 @@ fn hyperevm_market_scripting() {
     println!("whole run: {:.1} s", started.elapsed().as_secs_f64());
 }
 
+/// Foundry's image, as the lock pins it, for plain `cast` against the fork.
+const FOUNDRY: &str = "ghcr.io/foundry-rs/foundry:v1.8.5@sha256:32c8ea9ef052a440cb1620175987a3f49eff8b068a0c6a3d09ebf7f5f9a0e043";
+const CURL: &str = "curlimages/curl:8.10.1";
+/// Two of anvil's well-known test keys, never used for anything of value.
+const KEY_A: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+const ADDR_A: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+const KEY_B: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
+const ADDR_B: &str = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
+
+/// `cast` on the fork's network, with no chainsim command around it.
+fn cast(network: &str, cmd: &str) -> String {
+    let out = Command::new("docker").args(["run", "--rm", "--network", network, FOUNDRY, cmd]).output().expect("docker");
+    assert!(out.status.success(), "cast {cmd}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// `POST /info` on the proxy.
+fn info(network: &str, url: &str, body: Value) -> Value {
+    let out = Command::new("docker").args(["run", "--rm", "--network", network, CURL, "-sS", "-X", "POST", "-H", "content-type: application/json", "--data-raw", &body.to_string(), &format!("{url}/info")]).output().expect("docker");
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|_| panic!("/info {body}: {}", String::from_utf8_lossy(&out.stdout)))
+}
+
+fn cast_action(network: &str, rpc: &str, key: &str, payload: &[u8]) -> Value {
+    let hex = chainsim_evm::hypercore::to_hex(payload);
+    let out = cast(network, &format!("cast send --rpc-url {rpc} --private-key {key} 0x3333333333333333333333333333333333333333 'sendRawAction(bytes)' {hex} --json"));
+    let receipt: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(receipt["status"], "0x1", "{receipt}");
+    receipt
+}
+
+#[test]
+#[ignore]
+fn hyperevm_proxy() {
+    use chainsim_evm::hypercore::{encode_action, limit_order, word_u};
+    let name = "acc-proxy";
+    chainsim(&["down", name]);
+    let started = Instant::now();
+
+    let t = Instant::now();
+    let fork = ok(&["up", "hyperevm-mainnet", "--name", name]);
+    println!("up: {:.1} s", t.elapsed().as_secs_f64());
+    let (network, rpc) = (fork["network"].as_str().unwrap().to_string(), fork["rpcUrl"].as_str().unwrap().to_string());
+    assert_eq!(rpc, format!("http://{name}:8545"));
+    assert_eq!(fork["wsUrl"], format!("ws://{name}-engine:8545"));
+    let roles = docker(&["ps", "--filter", &format!("label=org.chainsim.fork={name}"), "--format", "{{.Label \"org.chainsim.role\"}}"]);
+    let mut roles: Vec<&str> = roles.lines().collect();
+    roles.sort();
+    assert_eq!(roles, ["control", "engine", "proxy"]);
+    assert_eq!(inspect(&format!("chainsim-{name}-proxy"), "{{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}}"), "true [ALL] [no-new-privileges]");
+    let btc = fork["hypercore"]["core"]["books"].as_array().unwrap().iter().find(|b| b["coin"] == "BTC").cloned().unwrap();
+    let best_ask = fixed(btc["bestAsk"].as_str().unwrap(), 8);
+
+    // Margin for A, then a CoreWriter IOC sent with plain cast: the next
+    // eth_call and /info see it, with no chainsim command after the send.
+    ok(&["set", name, "balance", ADDR_A, "10"]);
+    ok(&["set", name, "balance", ADDR_B, "10"]);
+    ok(&["set", name, "hypercore", "spot-balance", ADDR_A, "0", "100000000000"]);
+    cast_action(&network, &rpc, KEY_A, &encode_action(7, &[word_u(500_000_000), word_u(1)].concat()));
+    let t = Instant::now();
+    cast_action(&network, &rpc, KEY_A, &limit_order(0, true, (best_ask * 101 / 100) as u64, 100_000, false, 3, 0));
+    println!("cast send IOC: {:.1} s", t.elapsed().as_secs_f64());
+    let query = format!("0x{:0>64}{:064x}", ADDR_A.trim_start_matches("0x").to_lowercase(), 0);
+    let pos = cast(&network, &format!("cast rpc --rpc-url {rpc} eth_call '{{\"to\":\"0x0000000000000000000000000000000000000800\",\"data\":\"{query}\"}}' latest"));
+    let pos = pos.trim_matches('"').trim_start_matches("0x").to_string();
+    assert_eq!(u64::from_str_radix(&pos[48..64], 16).unwrap(), 100, "0x800 reads szi 100: {pos}");
+    let ch = info(&network, &rpc, json!({ "type": "clearinghouseState", "user": ADDR_A }));
+    assert_eq!(ch["assetPositions"][0]["position"]["szi"], "0.001", "{ch}");
+
+    // A resting order: /info openOrders and userFills match hypercore_state.
+    cast_action(&network, &rpc, KEY_A, &limit_order(0, true, 7_000_000_000_000, 100_000, false, 2, 77));
+    let state = ok(&["call", name, "hypercore_state", ADDR_A]);
+    let oo = info(&network, &rpc, json!({ "type": "openOrders", "user": ADDR_A }));
+    assert_eq!(oo.as_array().unwrap().len(), 1, "{oo}");
+    assert_eq!((oo[0]["oid"].clone(), oo[0]["limitPx"].clone(), oo[0]["sz"].clone()), (state["openOrders"][0]["oid"].clone(), state["openOrders"][0]["limitPx"].clone(), state["openOrders"][0]["sz"].clone()));
+    let fills = info(&network, &rpc, json!({ "type": "userFills", "user": ADDR_A }));
+    assert_eq!(fills, state["userFills"], "/info userFills and hypercore_state");
+    assert_eq!(fills[0]["side"], "B");
+    let book = info(&network, &rpc, json!({ "type": "l2Book", "coin": "BTC" }));
+    assert_eq!(book["levels"].as_array().unwrap().len(), 2);
+    assert!(info(&network, &rpc, json!({ "type": "allMids" }))["BTC"].is_string());
+    assert!(info(&network, &rpc, json!({ "type": "metaAndAssetCtxs" }))[0]["universe"].as_array().unwrap().len() > 100);
+
+    // Block types: A switched to big blocks lands in a 30M block, B stays in 3M ones.
+    assert_eq!(cast(&network, &format!("cast rpc --rpc-url {rpc} eth_bigBlockGasPrice")), "\"0x5f5e100\"");
+    ok(&["set", name, "hypercore", "big-blocks", ADDR_A, "on"]);
+    assert_eq!(cast(&network, &format!("cast rpc --rpc-url {rpc} eth_usingBigBlocks {ADDR_A}")), "true");
+    let gas_limit = |key: &str| -> u64 {
+        let r: Value = serde_json::from_str(&cast(&network, &format!("cast send --rpc-url {rpc} --private-key {key} {ADDR_B} --value 1 --json"))).unwrap();
+        let block: Value = serde_json::from_str(&cast(&network, &format!("cast rpc --rpc-url {rpc} eth_getBlockByNumber {} false", r["blockNumber"].as_str().unwrap()))).unwrap();
+        u64::from_str_radix(block["gasLimit"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
+    };
+    assert_eq!(gas_limit(KEY_A), 30_000_000);
+    assert_eq!(gas_limit(KEY_B), 3_000_000);
+    let refused = Command::new("docker").args(["run", "--rm", "--network", &network, FOUNDRY, &format!("cast send --rpc-url {rpc} --private-key {KEY_B} --gas-limit 5000000 {ADDR_A} --value 1")]).output().unwrap();
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("exceeds block gas limit"), "{}", String::from_utf8_lossy(&refused.stderr));
+
+    // Proxy overhead per request, against the engine directly.
+    let probe = |url: &str| -> f64 {
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": [] }).to_string();
+        let script = format!("t=0; i=0; while [ $i -lt 100 ]; do x=$(curl -s -o /dev/null -w '%{{time_total}}' -X POST -H 'content-type: application/json' --data-raw '{body}' {url}); t=$(awk -v a=$t -v b=$x 'BEGIN{{print a+b}}'); i=$((i+1)); done; echo $t");
+        let out = Command::new("docker").args(["run", "--rm", "--network", &network, "--entrypoint", "sh", CURL, "-c", &script]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().unwrap() * 10_000.0
+    };
+    let (via, direct) = (probe(&rpc), probe(&format!("http://{name}-engine:8545")));
+    println!("eth_chainId: {via:.0} us through the proxy, {direct:.0} us direct");
+
+    // Snapshot, a cast IOC, revert: Core state is as before.
+    let snap = ok(&["snapshot", name]);
+    let held = info(&network, &rpc, json!({ "type": "clearinghouseState", "user": ADDR_A }));
+    cast_action(&network, &rpc, KEY_A, &limit_order(0, true, (best_ask * 101 / 100) as u64, 100_000, false, 3, 0));
+    let mut moved = info(&network, &rpc, json!({ "type": "clearinghouseState", "user": ADDR_A }));
+    assert_eq!(moved["assetPositions"][0]["position"]["szi"], "0.002");
+    ok(&["revert", name, snap["id"].as_str().unwrap()]);
+    let mut back = info(&network, &rpc, json!({ "type": "clearinghouseState", "user": ADDR_A }));
+    let mut held = held;
+    for v in [&mut held, &mut back, &mut moved] {
+        v["time"] = json!(0);
+    }
+    assert_eq!(back, held);
+
+    ok(&["down", name]);
+    assert_gone(name);
+    println!("whole run: {:.1} s", started.elapsed().as_secs_f64());
+}
+
 fn alloy_hex(s: &str) -> String {
     s.bytes().map(|b| format!("{b:02x}")).collect()
 }
