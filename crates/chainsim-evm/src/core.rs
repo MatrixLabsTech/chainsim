@@ -32,6 +32,18 @@ pub const HYPE_EXTRA_DECIMALS: u32 = 10;
 pub const HYPE_SYSTEM: Address = Address::repeat_byte(0x22);
 /// Spot orders use asset ids from 10000.
 pub const SPOT_ASSET_BASE: u32 = 10_000;
+/// Orders on builder-deployed (HIP-3) perps use asset 100000 + perp index, where
+/// the perp index is dex * 10000 + the index in the dex's meta. The read
+/// precompiles take the perp index.
+pub const HIP3_ASSET_BASE: u32 = 100_000;
+pub const DEX_SIZE: u32 = 10_000;
+/// The spot side in sendAsset's dex fields.
+pub const SPOT_DEX: u32 = u32::MAX;
+
+/// The perp dex of a perp index: 0 for the main dex.
+pub fn dex_of(perp: u32) -> u32 {
+    perp / DEX_SIZE
+}
 /// The default leverage of a new cross position, capped by the perp's maximum.
 pub const DEFAULT_LEVERAGE: u32 = 20;
 /// How many action results the state keeps.
@@ -52,7 +64,12 @@ pub const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4
 
 /// The system address of a spot token: 0x20, then zeros, then the index big-endian.
 pub fn system_address(token: u64) -> Address {
-    if token == HYPE_TOKEN {
+    system_address_for(token, HYPE_TOKEN)
+}
+
+/// The system address of a spot token on a network whose HYPE token index is `hype`.
+pub fn system_address_for(token: u64, hype: u64) -> Address {
+    if token == hype {
         return HYPE_SYSTEM;
     }
     let mut b = [0u8; 20];
@@ -63,8 +80,13 @@ pub fn system_address(token: u64) -> Address {
 
 /// The token a system address stands for, if it is one.
 pub fn system_token(a: Address) -> Option<u64> {
+    system_token_for(a, HYPE_TOKEN)
+}
+
+/// The token a system address stands for on a network whose HYPE token index is `hype`.
+pub fn system_token_for(a: Address, hype: u64) -> Option<u64> {
     if a == HYPE_SYSTEM {
-        return Some(HYPE_TOKEN);
+        return Some(hype);
     }
     let b = a.as_slice();
     (b[0] == 0x20 && b[1..12].iter().all(|x| *x == 0)).then(|| u64::from_be_bytes(b[12..].try_into().expect("8 bytes")))
@@ -87,6 +109,12 @@ pub struct Perp {
     /// Hourly funding rate, 12 decimals.
     #[serde(rename = "f", default, skip_serializing_if = "is_zero")]
     pub funding_e12: i64,
+    /// Isolated margin only (meta's onlyIsolated or strictIsolated).
+    #[serde(rename = "is", default, skip_serializing_if = "is_false")]
+    pub isolated_only: bool,
+    /// The collateral token of the perp's dex (0 is USDC).
+    #[serde(rename = "co", default, skip_serializing_if = "is_zero_u")]
+    pub collateral: u64,
 }
 
 fn is_zero_u(v: &u64) -> bool {
@@ -103,6 +131,8 @@ pub struct TokenMeta {
     pub wei_decimals: u8,
     #[serde(rename = "e", default, skip_serializing_if = "Option::is_none")]
     pub evm: Option<(String, i8)>,
+    #[serde(rename = "z", default)]
+    pub sz_decimals: u8,
 }
 
 /// One side of a book: (price x8, size x8), best first.
@@ -172,6 +202,38 @@ pub struct Account {
     /// Whether this address's EVM transactions go into big blocks.
     #[serde(rename = "bb", default, skip_serializing_if = "is_false")]
     pub big_blocks: bool,
+    /// Perp USD balances of builder-deployed dexes, x6 (dex 0 is `usd`).
+    #[serde(rename = "du", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dex_usd: BTreeMap<u32, i64>,
+    /// Borrow and lend positions per token.
+    #[serde(rename = "ld", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lend: BTreeMap<u64, crate::lend::Lend>,
+    /// Account abstraction (action 16): 0 default, 1 disabled, 2 unified account, 3 portfolio margin.
+    #[serde(rename = "ab", default, skip_serializing_if = "is_zero_u8")]
+    pub abstraction: u8,
+}
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
+}
+
+impl Account {
+    /// The perp USD balance of a dex, x6.
+    pub fn usd_of(&self, dex: u32) -> i64 {
+        if dex == 0 {
+            self.usd
+        } else {
+            self.dex_usd.get(&dex).copied().unwrap_or(0)
+        }
+    }
+
+    pub fn usd_mut(&mut self, dex: u32) -> &mut i64 {
+        if dex == 0 {
+            &mut self.usd
+        } else {
+            self.dex_usd.entry(dex).or_default()
+        }
+    }
 }
 
 /// One fill, as the info API's userFills reports it.
@@ -281,9 +343,18 @@ pub struct State {
     /// The block time of the last big block, seconds.
     #[serde(rename = "lb", default)]
     pub last_big_block: u64,
+    /// The HYPE token index (150 on mainnet, 1105 on testnet). Zero means 150.
+    #[serde(rename = "ht", default)]
+    pub hype_token: u64,
+    /// Borrow and lend reserves per token.
+    #[serde(rename = "rv", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reserves: BTreeMap<u64, crate::lend::Reserve>,
     /// The block time of the step being applied, for history lines.
     #[serde(skip)]
     now: u64,
+    /// Whether a reserve changed since the answers were last written.
+    #[serde(skip)]
+    pub reserves_dirty: bool,
 }
 
 /// An event the fork emitted, in the order Core applies it.
@@ -354,6 +425,8 @@ pub struct Applied {
     /// Resting orders filled by a price move.
     pub fills: usize,
     pub liquidated: Vec<Address>,
+    /// Whether any borrow and lend reserve changed, so 0x812 is rewritten.
+    pub reserves: bool,
 }
 
 /// The perp universe and asset contexts from the info API at `up`, kept for
@@ -367,6 +440,20 @@ pub struct Meta {
     pub universe: Vec<(String, u8, u32, bool)>,
     #[serde(rename = "c")]
     pub ctxs: Vec<Vec<Option<String>>>,
+    /// Builder-deployed dexes the copy has fetched, by name.
+    #[serde(rename = "d", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dexes: BTreeMap<String, DexMeta>,
+}
+
+/// A builder-deployed dex's meta: its index, collateral token and universe.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DexMeta {
+    #[serde(rename = "i")]
+    pub index: u32,
+    #[serde(rename = "k")]
+    pub collateral: u64,
+    #[serde(rename = "m")]
+    pub meta: Box<Meta>,
 }
 
 /// The context fields a [`Meta`] keeps, in order.
@@ -381,7 +468,7 @@ impl Meta {
                 .collect()
         });
         let ctxs = v[1].as_array().map_or(vec![], |c| c.iter().map(|x| META_CTX_FIELDS.iter().map(|k| x[*k].as_str().map(str::to_string)).collect()).collect());
-        Self { universe, ctxs }
+        Self { universe, ctxs, dexes: BTreeMap::new() }
     }
 }
 
@@ -491,6 +578,9 @@ enum Action {
     UsdClass { ntl: u64, to_perp: bool },
     CancelOid { asset: u32, oid: u64 },
     CancelCloid { asset: u32, cloid: u128 },
+    SendAsset { destination: Address, source_dex: u32, destination_dex: u32, token: u64, wei: u64 },
+    BorrowLend { op: u8, token: u64, wei: u64 },
+    SetAbstraction { user: Address, abstraction: u8 },
     Other(u32),
 }
 
@@ -536,6 +626,17 @@ fn parse_action(p: &[u8]) -> Action {
         7 => (|| Some(Action::UsdClass { ntl: small_word(b, 0, 64)? as u64, to_perp: bool_word(b, 1)? }))(),
         10 => (|| Some(Action::CancelOid { asset: small_word(b, 0, 32)? as u32, oid: small_word(b, 1, 64)? as u64 }))(),
         11 => (|| Some(Action::CancelCloid { asset: small_word(b, 0, 32)? as u32, cloid: small_word(b, 1, 128)? }))(),
+        13 => (|| {
+            Some(Action::SendAsset {
+                destination: address_word(b, 0)?,
+                source_dex: small_word(b, 2, 32)? as u32,
+                destination_dex: small_word(b, 3, 32)? as u32,
+                token: small_word(b, 4, 64)? as u64,
+                wei: small_word(b, 5, 64)? as u64,
+            })
+        })(),
+        15 => (|| Some(Action::BorrowLend { op: small_word(b, 0, 8)? as u8, token: small_word(b, 1, 64)? as u64, wei: small_word(b, 2, 64)? as u64 }))(),
+        16 => (|| Some(Action::SetAbstraction { user: address_word(b, 0)?, abstraction: small_word(b, 1, 8)? as u8 }))(),
         _ => None,
     };
     parsed.unwrap_or(Action::Other(id))
@@ -624,29 +725,55 @@ impl State {
         self.accounts.entry(user).or_default()
     }
 
-    /// A user's margin figures at the current marks.
+    /// The HYPE token index of this network.
+    pub fn hype(&self) -> u64 {
+        if self.hype_token == 0 {
+            HYPE_TOKEN
+        } else {
+            self.hype_token
+        }
+    }
+
+    fn mark_of(&self, perp: u32, p: &Pos) -> u64 {
+        let size = p.szi_x8.unsigned_abs().max(1);
+        self.perps.get(&perp).map_or_else(|| (p.entry_ntl as u128 * X16_TO_X6 / size as u128) as u64, |x| x.mark_x8)
+    }
+
+    /// A user's main-dex margin figures at the current marks.
     pub fn margin(&self, user: Address) -> Margin {
+        self.margin_dex(user, 0)
+    }
+
+    /// A user's cross margin figures on one perp dex, x6. Isolated positions
+    /// hold their own margin and stay out of these figures.
+    pub fn margin_dex(&self, user: Address, dex: u32) -> Margin {
         let Some(acct) = self.accounts.get(&user) else { return Margin::default() };
         let mut m = Margin::default();
         let (mut upnl, mut signed_entry) = (0i128, 0i128);
-        for (asset, p) in &acct.positions {
-            if p.szi_x8 == 0 {
-                continue;
-            }
-            let size = p.szi_x8.unsigned_abs();
-            let mark = self.perps.get(asset).map_or_else(|| (p.entry_ntl as u128 * X16_TO_X6 / size as u128) as u64, |x| x.mark_x8);
-            let value = notional(size, mark);
+        for (perp, p) in acct.positions.iter().filter(|(a, p)| dex_of(**a) == dex && !p.isolated && p.szi_x8 != 0) {
+            let value = notional(p.szi_x8.unsigned_abs(), self.mark_of(*perp, p));
             let sign: i128 = if p.szi_x8 > 0 { 1 } else { -1 };
             m.ntl_pos += value;
             m.margin_used += value / p.leverage.max(1) as u64;
             upnl += sign * (value as i128 - p.entry_ntl as i128);
             signed_entry += sign * p.entry_ntl as i128;
         }
-        let order_margin: u64 = self.orders.iter().filter(|o| o.user == user && o.asset < SPOT_ASSET_BASE).map(|o| notional(o.sz_x8, o.px_x8) / self.leverage_of(user, o.asset) as u64).sum();
-        m.account_value = (acct.usd as i128 + upnl) as i64;
-        m.raw_usd = (acct.usd as i128 - signed_entry) as i64;
+        let order_margin: u64 = self.orders.iter().filter(|o| o.user == user && dex_of(o.asset) == dex).map(|o| notional(o.sz_x8, o.px_x8) / self.leverage_of(user, o.asset) as u64).sum();
+        let usd = acct.usd_of(dex);
+        m.account_value = (usd as i128 + upnl) as i64;
+        m.raw_usd = (usd as i128 - signed_entry) as i64;
         m.withdrawable = (m.account_value as i128 - m.margin_used as i128 - order_margin as i128).max(0) as u64;
         m
+    }
+
+    /// An isolated position's equity (its margin plus unrealized PnL) and
+    /// maintenance margin, x6.
+    pub fn isolated_health(&self, perp: u32, p: &Pos) -> (i64, u64) {
+        let value = notional(p.szi_x8.unsigned_abs(), self.mark_of(perp, p));
+        let sign: i128 = if p.szi_x8 > 0 { 1 } else { -1 };
+        let upnl = sign * (value as i128 - p.entry_ntl as i128);
+        let max_lev = self.perps.get(&perp).map_or(1, |x| x.max_leverage.max(1)) as u64;
+        ((p.isolated_raw_usd as i128 + upnl) as i64, value / (2 * max_lev))
     }
 
     fn leverage_of(&self, user: Address, asset: u32) -> u32 {
@@ -662,7 +789,7 @@ impl State {
     fn fill(&mut self, user: Address, asset: u32, is_buy: bool, q: u64, px: u64, oid: u64, crossed: bool, fee: u64, liquidation: bool) {
         let start = self.accounts.get(&user).and_then(|a| a.positions.get(&asset)).map_or(0, |p| p.szi_x8);
         let closed_pnl = self.fill_raw(user, asset, is_buy, q, px);
-        self.charge(user, fee);
+        self.charge(user, asset, fee);
         let tid = self.next_tid.max(1);
         self.next_tid = tid + 1;
         let time_ms = self.now * 1000;
@@ -672,18 +799,31 @@ impl State {
         fills.drain(..drop);
     }
 
-    /// Applies one fill to a user's position: size and price x8. Returns the realized PnL, x6.
+    /// Applies one fill to a user's position: size and price x8. Returns the
+    /// realized PnL, x6. The dex's USD balance takes the PnL. An isolated
+    /// position takes margin from it as it grows and gives back its share as
+    /// it shrinks.
     fn fill_raw(&mut self, user: Address, asset: u32, is_buy: bool, q: u64, px: u64) -> i64 {
         let lev = self.leverage_of(user, asset);
+        let isolated = self.perps.get(&asset).is_some_and(|p| p.isolated_only);
+        let dex = dex_of(asset);
         let acct = self.account(user);
         let pos = acct.positions.entry(asset).or_insert(Pos { leverage: lev, ..Default::default() });
         if pos.leverage == 0 {
             pos.leverage = lev;
         }
+        if pos.szi_x8 == 0 {
+            pos.isolated = isolated;
+        }
         let dq: i64 = if is_buy { q as i64 } else { -(q as i64) };
         if pos.szi_x8 == 0 || (pos.szi_x8 > 0) == is_buy {
             pos.szi_x8 += dq;
             pos.entry_ntl += notional(q, px);
+            if pos.isolated {
+                let add = (notional(q, px) / pos.leverage.max(1) as u64) as i64;
+                pos.isolated_raw_usd += add;
+                *acct.usd_mut(dex) -= add;
+            }
             return 0;
         }
         let size = pos.szi_x8.unsigned_abs();
@@ -691,18 +831,26 @@ impl State {
         let closed_entry = (pos.entry_ntl as u128 * closing as u128 / size as u128) as u64;
         let exit = notional(closing, px) as i64;
         let realized = if pos.szi_x8 > 0 { exit - closed_entry as i64 } else { closed_entry as i64 - exit };
+        let released = if pos.isolated { (pos.isolated_raw_usd as i128 * closing as i128 / size as i128) as i64 } else { 0 };
+        pos.isolated_raw_usd -= released;
         pos.entry_ntl -= closed_entry;
         pos.szi_x8 += if is_buy { closing as i64 } else { -(closing as i64) };
         let left = q - closing;
+        let mut reopen = 0i64;
         if left > 0 {
             pos.szi_x8 = if is_buy { left as i64 } else { -(left as i64) };
             pos.entry_ntl = notional(left, px);
+            if pos.isolated {
+                reopen = (notional(left, px) / pos.leverage.max(1) as u64) as i64;
+                pos.isolated_raw_usd += reopen;
+            }
         }
         if pos.szi_x8 == 0 {
             pos.entry_ntl = 0;
             pos.funding_paid = 0;
+            pos.isolated_raw_usd = 0;
         }
-        acct.usd += realized;
+        *acct.usd_mut(dex) += realized + released - reopen;
         realized
     }
 
@@ -713,12 +861,17 @@ impl State {
     /// A limit order: matched against the book and other users' resting
     /// orders, then the remainder rests (GTC, ALO) or is dropped (IOC).
     #[allow(clippy::too_many_arguments)]
-    fn limit(&mut self, user: Address, asset: u32, is_buy: bool, px: u64, mut sz: u64, reduce_only: bool, tif: u8, cloid: u128, applied: &mut Applied) -> String {
-        if asset >= SPOT_ASSET_BASE {
-            return "rejected: spot orders are not modeled".into();
-        }
+    fn limit(&mut self, user: Address, order_asset: u32, is_buy: bool, px: u64, mut sz: u64, reduce_only: bool, tif: u8, cloid: u128, applied: &mut Applied) -> String {
+        let asset = match order_asset {
+            a if a >= HIP3_ASSET_BASE => a - HIP3_ASSET_BASE,
+            a if a >= SPOT_ASSET_BASE => return "rejected: spot orders are not modeled".into(),
+            a => a,
+        };
         if !self.perps.contains_key(&asset) || !self.books.contains_key(&asset) {
-            return format!("rejected: no book for perp {asset}, run chainsim set <name> hypercore book {asset} --live");
+            return format!("rejected: no book for perp {asset}, run chainsim set <name> hypercore book {} --live", self.coin(asset));
+        }
+        if let Some(t) = self.perps.get(&asset).map(|p| p.collateral).filter(|t| *t != 0) {
+            return format!("rejected: the dex of {} uses token {t} as collateral, and only USDC dexes are modeled", self.coin(asset));
         }
         if !(1..=3).contains(&tif) {
             return format!("rejected: unknown time in force {tif}");
@@ -747,7 +900,7 @@ impl State {
         // Margin for the part that adds exposure, at the limit price.
         let reducing = if pos != 0 && (pos > 0) != is_buy { sz.min(pos.unsigned_abs()) } else { 0 };
         let need = notional(sz - reducing, px) / self.leverage_of(user, asset) as u64;
-        if need > self.margin(user).withdrawable {
+        if need > self.margin_dex(user, dex_of(asset)).withdrawable {
             return format!("rejected: insufficient margin, needs {} USD", fmt_dec(need as i128, 6));
         }
         let order_oid = self.next_oid.max(1);
@@ -809,7 +962,8 @@ impl State {
         parts.join(", ")
     }
 
-    fn cancel(&mut self, user: Address, asset: u32, matches: impl Fn(&Order) -> bool) -> String {
+    fn cancel(&mut self, user: Address, order_asset: u32, matches: impl Fn(&Order) -> bool) -> String {
+        let asset = if order_asset >= HIP3_ASSET_BASE { order_asset - HIP3_ASSET_BASE } else { order_asset };
         match self.orders.iter().position(|o| o.user == user && o.asset == asset && matches(o)) {
             Some(i) => format!("canceled oid {}", self.orders.remove(i).oid),
             None => "rejected: no such open order".into(),
@@ -818,7 +972,7 @@ impl State {
 
     /// The EVM amount for a Core amount of `token`, or None when the token has no EVM side.
     fn evm_amount(&self, token: u64, wei: u64) -> Option<(Option<Address>, U256)> {
-        if token == HYPE_TOKEN {
+        if token == self.hype() {
             return Some((None, U256::from(wei) * U256::from(10u64).pow(U256::from(HYPE_EXTRA_DECIMALS))));
         }
         let (addr, extra) = self.tokens.get(&token)?.evm.clone()?;
@@ -831,7 +985,7 @@ impl State {
     /// The Core amount for an EVM amount of `token` (cut to Core's precision).
     fn core_amount(&self, token: u64, amount: U256) -> Option<u64> {
         let ten = U256::from(10u64);
-        let v = if token == HYPE_TOKEN {
+        let v = if token == self.hype() {
             amount / ten.pow(U256::from(HYPE_EXTRA_DECIMALS))
         } else {
             let (_, extra) = self.tokens.get(&token)?.evm.clone()?;
@@ -845,42 +999,72 @@ impl State {
     }
 
     fn spot_send(&mut self, user: Address, destination: Address, token: u64, wei: u64, applied: &mut Applied) -> String {
-        let have = self.accounts.get(&user).and_then(|a| a.spot.get(&token)).map_or(0, |s| s.0.saturating_sub(s.1));
-        if wei > have {
-            return format!("rejected: insufficient spot balance of token {token}");
+        let to_evm = system_token_for(destination, self.hype()) == Some(token);
+        let evm = if to_evm {
+            match self.evm_amount(token, wei) {
+                Some(e) => Some(e),
+                None => return format!("rejected: token {token} has no EVM side"),
+            }
+        } else {
+            None
+        };
+        if let Err(why) = self.debit_spot(user, token, wei) {
+            return why;
         }
-        if system_token(destination) == Some(token) {
-            let Some((evm, amount)) = self.evm_amount(token, wei) else { return format!("rejected: token {token} has no EVM side") };
-            self.account(user).spot.entry(token).or_default().0 -= wei;
+        if let Some((evm, amount)) = evm {
             self.queue_credit(user, evm, amount, applied);
             return format!("sent {wei} wei of token {token} to the EVM");
         }
-        self.account(user).spot.entry(token).or_default().0 -= wei;
-        self.account(destination).spot.entry(token).or_default().0 += wei;
+        self.credit_spot(destination, token, wei);
         applied.users.insert(destination);
         format!("sent {wei} wei of token {token} to {destination}")
     }
 
     fn usd_class(&mut self, user: Address, ntl: u64, to_perp: bool) -> String {
         // Spot USDC (token 0) has 8 wei decimals, perp USD 6.
-        let wei = ntl as u128 * 100;
+        let wei = ntl * 100;
         if to_perp {
-            let have = self.accounts.get(&user).and_then(|a| a.spot.get(&0)).map_or(0, |s| s.0.saturating_sub(s.1));
-            if wei > have as u128 {
-                return "rejected: insufficient spot USDC".into();
+            if let Err(why) = self.debit_spot(user, 0, wei) {
+                return why.replace("spot balance of token 0", "spot USDC");
             }
-            let a = self.account(user);
-            a.spot.entry(0).or_default().0 -= wei as u64;
-            a.usd += ntl as i64;
+            self.account(user).usd += ntl as i64;
         } else {
             if ntl > self.margin(user).withdrawable {
                 return "rejected: insufficient withdrawable perp USD".into();
             }
-            let a = self.account(user);
-            a.usd -= ntl as i64;
-            a.spot.entry(0).or_default().0 += wei as u64;
+            self.account(user).usd -= ntl as i64;
+            self.credit_spot(user, 0, wei);
         }
         format!("moved {} USD to {}", fmt_dec(ntl as i128, 6), if to_perp { "perp" } else { "spot" })
+    }
+
+    /// sendAsset (action 13): USDC between perp dexes and spot (dex
+    /// [`SPOT_DEX`]), to the sender or another user. Perp dex balances are USD
+    /// x6, spot USDC is wei with 8 decimals.
+    #[allow(clippy::too_many_arguments)]
+    fn send_asset(&mut self, user: Address, destination: Address, source_dex: u32, destination_dex: u32, token: u64, wei: u64, applied: &mut Applied) -> String {
+        if token != 0 {
+            return format!("rejected: sendAsset of token {token} is not modeled, only USDC");
+        }
+        let ntl = wei / 100;
+        if source_dex == SPOT_DEX {
+            if let Err(why) = self.debit_spot(user, 0, wei) {
+                return why;
+            }
+        } else {
+            if ntl > self.margin_dex(user, source_dex).withdrawable {
+                return format!("rejected: insufficient withdrawable USD on perp dex {source_dex}");
+            }
+            *self.account(user).usd_mut(source_dex) -= ntl as i64;
+        }
+        if destination_dex == SPOT_DEX {
+            self.credit_spot(destination, 0, ntl * 100);
+        } else {
+            *self.account(destination).usd_mut(destination_dex) += ntl as i64;
+        }
+        applied.users.insert(destination);
+        let side = |d: u32| if d == SPOT_DEX { "spot".to_string() } else { format!("perp dex {d}") };
+        format!("moved {} USD from {} to {} of {destination}", fmt_dec(ntl as i128, 6), side(source_dex), side(destination_dex))
     }
 
     fn coin(&self, asset: u32) -> String {
@@ -896,8 +1080,9 @@ impl State {
         h.drain(..drop);
     }
 
-    fn charge(&mut self, user: Address, usd: u64) {
-        self.account(user).usd -= usd as i64;
+    /// Takes a fee from the USD balance of a perp's dex.
+    fn charge(&mut self, user: Address, perp: u32, usd: u64) {
+        *self.account(user).usd_mut(dex_of(perp)) -= usd as i64;
     }
 
     fn queue_credit(&mut self, to: Address, token: Option<Address>, amount: U256, applied: &mut Applied) {
@@ -923,14 +1108,18 @@ impl State {
     /// The maintenance margin of a user's positions at the current marks, x6:
     /// half the initial margin at the perp's maximum leverage.
     pub fn maintenance(&self, user: Address) -> u64 {
+        self.maintenance_dex(user, 0)
+    }
+
+    /// The cross maintenance margin of a user's positions on one dex.
+    pub fn maintenance_dex(&self, user: Address, dex: u32) -> u64 {
         let Some(acct) = self.accounts.get(&user) else { return 0 };
         acct.positions
             .iter()
-            .filter(|(_, p)| p.szi_x8 != 0)
+            .filter(|(a, p)| p.szi_x8 != 0 && !p.isolated && dex_of(**a) == dex)
             .map(|(a, p)| {
                 let perp = self.perps.get(a);
-                let mark = perp.map_or(0, |x| x.mark_x8);
-                notional(p.szi_x8.unsigned_abs(), mark) / (2 * perp.map_or(1, |x| x.max_leverage.max(1)) as u64)
+                notional(p.szi_x8.unsigned_abs(), self.mark_of(*a, p)) / (2 * perp.map_or(1, |x| x.max_leverage.max(1)) as u64)
             })
             .sum()
     }
@@ -958,6 +1147,7 @@ impl State {
         self.liquidate(&mut applied);
         // Everyone holding this perp sees new margin figures.
         applied.margin_users.extend(self.accounts.iter().filter(|(_, a)| a.positions.get(&asset).is_some_and(|p| p.szi_x8 != 0)).map(|(u, _)| *u));
+        applied.reserves = self.take_reserves_dirty();
         applied
     }
 
@@ -1002,7 +1192,7 @@ impl State {
         let ctx = meta.ctxs.get(asset as usize);
         let px = |i: usize| ctx.and_then(|c| c.get(i)).and_then(|v| v.as_deref()).and_then(|s| parse_dec(s, 8)).unwrap_or(0) as u64;
         let funding = ctx.and_then(|c| c.get(2)).and_then(|v| v.as_deref()).and_then(|s| parse_dec(s, 12)).unwrap_or(0) as i64;
-        self.perps.insert(asset, Perp { name: u.0.clone(), sz_decimals: u.1, max_leverage: u.2, mark_x8: px(0), oracle_x8: px(1), funding_e12: funding });
+        self.perps.insert(asset, Perp { name: u.0.clone(), sz_decimals: u.1, max_leverage: u.2, mark_x8: px(0), oracle_x8: px(1), funding_e12: funding, ..Default::default() });
         true
     }
 
@@ -1024,6 +1214,7 @@ impl State {
         applied.margin_users.extend(step.margin_users);
         applied.fills += step.fills;
         applied.liquidated.extend(step.liquidated);
+        applied.reserves |= step.reserves;
         applied
     }
 
@@ -1034,30 +1225,55 @@ impl State {
     fn liquidate(&mut self, applied: &mut Applied) {
         let users: Vec<Address> = self.accounts.iter().filter(|(_, a)| a.positions.values().any(|p| p.szi_x8 != 0)).map(|(u, _)| *u).collect();
         for user in users {
-            let (value, mm) = (self.margin(user).account_value, self.maintenance(user));
-            if value >= mm as i64 {
-                continue;
-            }
-            let open: Vec<(u32, i64)> = self.accounts[&user].positions.iter().filter(|(_, p)| p.szi_x8 != 0).map(|(a, p)| (*a, p.szi_x8)).collect();
-            let mut closed = Vec::new();
-            for (asset, szi) in open {
-                let mark = self.perps.get(&asset).map_or(0, |p| p.mark_x8);
-                self.fill(user, asset, szi < 0, szi.unsigned_abs(), mark, 0, true, 0, true);
-                if let Some(p) = self.account(user).positions.get_mut(&asset) {
-                    p.funding_paid = 0;
+            // Isolated positions, each against its own margin.
+            let isolated: Vec<(u32, Pos)> = self.accounts[&user].positions.iter().filter(|(_, p)| p.szi_x8 != 0 && p.isolated).map(|(a, p)| (*a, *p)).collect();
+            for (asset, p) in isolated {
+                let (equity, mm) = self.isolated_health(asset, &p);
+                if equity >= mm as i64 {
+                    continue;
                 }
-                closed.push(format!("{} {} at {}", fmt_dec(szi as i128, 8), self.coin(asset), fmt_dec(mark as i128, 8)));
+                let mark = self.mark_of(asset, &p);
+                self.fill(user, asset, p.szi_x8 < 0, p.szi_x8.unsigned_abs(), mark, 0, true, 0, true);
+                self.orders.retain(|o| !(o.user == user && o.asset == asset));
+                // A loss past the position's own margin is the backstop's, not the dex balance's.
+                let shortfall = (-equity).max(0);
+                *self.account(user).usd_mut(dex_of(asset)) += shortfall;
+                let absorbed = if shortfall > 0 { format!(", shortfall {} USD absorbed", fmt_dec(shortfall as i128, 6)) } else { String::new() };
+                let coin = self.coin(asset);
+                self.note(user, format!("liquidated: isolated {coin} equity {} USD below maintenance margin {} USD, closed {} {coin} at {}{absorbed}", fmt_dec(equity as i128, 6), fmt_dec(mm as i128, 6), fmt_dec(p.szi_x8 as i128, 8), fmt_dec(mark as i128, 8)));
+                applied.users.insert(user);
+                if !applied.liquidated.contains(&user) {
+                    applied.liquidated.push(user);
+                }
             }
-            self.orders.retain(|o| o.user != user);
-            // A negative balance is the backstop liquidator's loss, not the account's.
-            let acct = self.account(user);
-            let shortfall = (-acct.usd).max(0);
-            acct.usd = acct.usd.max(0);
-            let absorbed = if shortfall > 0 { format!(", shortfall {} USD absorbed", fmt_dec(shortfall as i128, 6)) } else { String::new() };
-            self.note(user, format!("liquidated: account value {} USD below maintenance margin {} USD, closed {}{absorbed}", fmt_dec(value as i128, 6), fmt_dec(mm as i128, 6), closed.join(", ")));
-            applied.users.insert(user);
-            applied.liquidated.push(user);
+            // Cross positions, per dex.
+            let dexes: BTreeSet<u32> = self.accounts[&user].positions.iter().filter(|(_, p)| p.szi_x8 != 0 && !p.isolated).map(|(a, _)| dex_of(*a)).collect();
+            for dex in dexes {
+                let (value, mm) = (self.margin_dex(user, dex).account_value, self.maintenance_dex(user, dex));
+                if value >= mm as i64 {
+                    continue;
+                }
+                let open: Vec<(u32, i64)> = self.accounts[&user].positions.iter().filter(|(a, p)| p.szi_x8 != 0 && !p.isolated && dex_of(**a) == dex).map(|(a, p)| (*a, p.szi_x8)).collect();
+                let mut closed = Vec::new();
+                for (asset, szi) in open {
+                    let mark = self.perps.get(&asset).map_or(0, |p| p.mark_x8);
+                    self.fill(user, asset, szi < 0, szi.unsigned_abs(), mark, 0, true, 0, true);
+                    closed.push(format!("{} {} at {}", fmt_dec(szi as i128, 8), self.coin(asset), fmt_dec(mark as i128, 8)));
+                }
+                self.orders.retain(|o| !(o.user == user && dex_of(o.asset) == dex));
+                // A negative balance is the backstop liquidator's loss, not the account's.
+                let acct = self.account(user);
+                let shortfall = (-acct.usd_of(dex)).max(0);
+                *acct.usd_mut(dex) += shortfall;
+                let absorbed = if shortfall > 0 { format!(", shortfall {} USD absorbed", fmt_dec(shortfall as i128, 6)) } else { String::new() };
+                self.note(user, format!("liquidated: account value {} USD below maintenance margin {} USD, closed {}{absorbed}", fmt_dec(value as i128, 6), fmt_dec(mm as i128, 6), closed.join(", ")));
+                applied.users.insert(user);
+                if !applied.liquidated.contains(&user) {
+                    applied.liquidated.push(user);
+                }
+            }
         }
+        self.lend_liquidate(applied);
     }
 
     /// Pays funding for every interval boundary up to `time`: each position
@@ -1072,6 +1288,10 @@ impl State {
         while self.funding_time + FUNDING_INTERVAL <= time {
             self.funding_time += FUNDING_INTERVAL;
             self.now = self.funding_time;
+            // Borrow and lend interest is indexed on the same hour.
+            if self.accrue_interest(applied) {
+                paid = true;
+            }
             let users: Vec<Address> = self.accounts.keys().copied().collect();
             for user in users {
                 let open: Vec<(u32, i64)> = self.accounts[&user].positions.iter().filter(|(_, p)| p.szi_x8 != 0).map(|(a, p)| (*a, p.szi_x8)).collect();
@@ -1084,7 +1304,15 @@ impl State {
                     let pay = (szi as i128 * px as i128 / X16_TO_X6 as i128 * perp.funding_e12 as i128 / 1_000_000_000_000) as i64;
                     let rate = fmt_dec(perp.funding_e12 as i128, 12);
                     let acct = self.account(user);
-                    acct.usd -= pay;
+                    let isolated = acct.positions.get(&asset).is_some_and(|p| p.isolated);
+                    if isolated {
+                        // An isolated position pays from its own margin.
+                        if let Some(p) = acct.positions.get_mut(&asset) {
+                            p.isolated_raw_usd -= pay;
+                        }
+                    } else {
+                        *acct.usd_mut(dex_of(asset)) -= pay;
+                    }
                     if let Some(p) = acct.positions.get_mut(&asset) {
                         p.funding_paid += pay;
                     }
@@ -1119,23 +1347,26 @@ impl State {
                         Action::UsdClass { ntl, to_perp } => self.usd_class(*user, ntl, to_perp),
                         Action::CancelOid { asset, oid } => self.cancel(*user, asset, |o| o.oid == oid),
                         Action::CancelCloid { asset, cloid } => self.cancel(*user, asset, |o| o.cloid == cloid && cloid != 0),
+                        Action::SendAsset { destination, source_dex, destination_dex, token, wei } => self.send_asset(*user, destination, source_dex, destination_dex, token, wei, &mut applied),
+                        Action::BorrowLend { op, token, wei } => self.borrow_lend(*user, op, token, wei),
+                        Action::SetAbstraction { user: target, abstraction } => self.set_abstraction(*user, target, abstraction),
                         Action::Other(id) => format!("recorded: action {id} is not modeled"),
                     }
                 }
-                Event::HypeIn { user, amount } => match self.core_amount(HYPE_TOKEN, *amount) {
+                Event::HypeIn { user, amount } => match self.core_amount(self.hype(), *amount) {
                     Some(wei) => {
-                        self.account(*user).spot.entry(HYPE_TOKEN).or_default().0 += wei;
+                        self.credit_spot(*user, self.hype(), wei);
                         applied.users.insert(*user);
                         format!("credited {wei} wei of HYPE on Core")
                     }
                     None => "rejected: amount too large".into(),
                 },
                 Event::TokenIn { contract, from, to, value } => {
-                    let token = system_token(*to).expect("filtered");
+                    let Some(token) = system_token_for(*to, self.hype()) else { continue };
                     let linked = self.tokens.get(&token).and_then(|t| t.evm.as_ref()).and_then(|(a, _)| a.parse::<Address>().ok()) == Some(*contract);
                     match self.core_amount(token, *value).filter(|_| linked) {
                         Some(wei) => {
-                            self.account(*from).spot.entry(token).or_default().0 += wei;
+                            self.credit_spot(*from, token, wei);
                             applied.users.insert(*from);
                             format!("credited {wei} wei of token {token} on Core")
                         }
@@ -1155,6 +1386,7 @@ impl State {
             self.now = time;
             self.liquidate(&mut applied);
         }
+        applied.reserves = self.take_reserves_dirty();
         applied
     }
 
@@ -1168,15 +1400,35 @@ impl State {
                 out.push(hypercore::spot_balance(*user, *token, s.0, s.1, s.2));
             }
             for (asset, p) in &acct.positions {
-                let Ok(perp) = u16::try_from(*asset) else { continue };
                 let pos = hypercore::Position { szi: self.sz_to_raw(*asset, p.szi_x8), entry_ntl: p.entry_ntl, isolated_raw_usd: p.isolated_raw_usd, leverage: p.leverage, is_isolated: p.isolated };
-                out.push(hypercore::position(*user, perp, pos));
+                // 0x800 takes a uint16 perp index, 0x813 a uint32 one.
+                if let Ok(perp) = u16::try_from(*asset) {
+                    out.push(hypercore::position(*user, perp, pos));
+                }
+                out.push(hypercore::position2(*user, *asset, pos));
             }
-            let m = self.margin(*user);
-            out.push(Entry { precompile: hypercore::WITHDRAWABLE, calldata: word_addr(*user).to_vec(), result: word_u(m.withdrawable as u128).to_vec() });
+            out.extend(self.margin_answers(*user));
+            out.extend(self.lend_user_answers(*user));
+        }
+        out
+    }
+
+    /// Withdrawable (0x803, main dex) and the margin summary (0x80f) of every dex the user has value on.
+    fn margin_answers(&self, user: Address) -> Vec<Entry> {
+        let mut dexes: BTreeSet<u32> = BTreeSet::from([0]);
+        if let Some(a) = self.accounts.get(&user) {
+            dexes.extend(a.dex_usd.keys());
+            dexes.extend(a.positions.keys().map(|p| dex_of(*p)));
+        }
+        let mut out = Vec::new();
+        for dex in dexes {
+            let m = self.margin_dex(user, dex);
+            if dex == 0 {
+                out.push(Entry { precompile: hypercore::WITHDRAWABLE, calldata: word_addr(user).to_vec(), result: word_u(m.withdrawable as u128).to_vec() });
+            }
             out.push(Entry {
                 precompile: hypercore::ACCOUNT_MARGIN_SUMMARY,
-                calldata: [word_u(0), word_addr(*user)].concat(),
+                calldata: [word_u(dex as u128), word_addr(user)].concat(),
                 result: [word_i(m.account_value), word_u(m.margin_used as u128), word_u(m.ntl_pos as u128), word_i(m.raw_usd)].concat(),
             });
         }
@@ -1184,19 +1436,26 @@ impl State {
     }
 
     /// The answers an apply or a price step changed: every answer for its
-    /// users, and the margin answers for its margin users.
+    /// users, the margin answers for its margin users, and the reserves when
+    /// any moved.
     pub fn answers_for(&self, applied: &Applied) -> Vec<Entry> {
         let mut out = self.answers(&applied.users);
         for user in applied.margin_users.difference(&applied.users) {
-            let m = self.margin(*user);
-            out.push(Entry { precompile: hypercore::WITHDRAWABLE, calldata: word_addr(*user).to_vec(), result: word_u(m.withdrawable as u128).to_vec() });
-            out.push(Entry {
-                precompile: hypercore::ACCOUNT_MARGIN_SUMMARY,
-                calldata: [word_u(0), word_addr(*user)].concat(),
-                result: [word_i(m.account_value), word_u(m.margin_used as u128), word_u(m.ntl_pos as u128), word_i(m.raw_usd)].concat(),
-            });
+            out.extend(self.margin_answers(*user));
+        }
+        if applied.reserves {
+            out.extend(self.reserve_answers());
         }
         out
+    }
+
+    /// Whether reserves changed since the last call, for [`Applied::reserves`].
+    pub fn take_reserves_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.reserves_dirty)
+    }
+
+    pub fn now_secs(&self) -> u64 {
+        self.now
     }
 
     /// The status lines of applied actions at these (block, log index) places.
@@ -1207,30 +1466,105 @@ impl State {
     /// A user's Core state in the info API's shapes: `clearinghouseState`,
     /// `spotClearinghouseState`, and the open orders.
     pub fn info(&self, user: Address, time_ms: u64) -> Value {
-        let m = self.margin(user);
+        let acct = self.accounts.get(&user).cloned().unwrap_or_default();
         let usd = |v: i128| fmt_dec(v, 6);
-        let summary = json!({
-            "accountValue": usd(m.account_value as i128), "totalNtlPos": usd(m.ntl_pos as i128),
-            "totalRawUsd": usd(m.raw_usd as i128), "totalMarginUsed": usd(m.margin_used as i128),
+        let balances: Vec<Value> = acct
+            .spot
+            .iter()
+            .map(|(token, s)| {
+                let meta = self.tokens.get(token);
+                let w = meta.map_or(8, |t| t.wei_decimals as u32);
+                let mut b = json!({
+                    "coin": meta.map_or_else(|| token.to_string(), |t| t.name.clone()), "token": token,
+                    "total": fmt_dec(s.0 as i128, w), "hold": fmt_dec(s.1 as i128, w), "entryNtl": usd(s.2 as i128),
+                });
+                if let Some(l) = acct.lend.get(token) {
+                    b["supplied"] = json!(fmt_dec(l.supply_value as i128, w));
+                    b["borrowed"] = json!(fmt_dec(l.borrow_value as i128, w));
+                }
+                b
+            })
+            .collect();
+        let orders: Vec<Value> = self
+            .orders
+            .iter()
+            .filter(|o| o.user == user)
+            .map(|o| {
+                json!({
+                    "coin": self.coin(o.asset), "asset": o.asset,
+                    "side": if o.is_buy { "B" } else { "A" }, "limitPx": fmt_dec(o.px_x8 as i128, 8), "sz": fmt_dec(o.sz_x8 as i128, 8),
+                    "oid": o.oid, "cloid": (o.cloid != 0).then(|| format!("0x{:032x}", o.cloid)),
+                    "tif": match o.tif { 1 => "Alo", 2 => "Gtc", _ => "Ioc" },
+                })
+            })
+            .collect();
+        let mut dexes = serde_json::Map::new();
+        let other: BTreeSet<u32> = acct.dex_usd.keys().copied().chain(acct.positions.keys().map(|p| dex_of(*p))).filter(|d| *d != 0).collect();
+        for dex in other {
+            dexes.insert(self.dex_name(dex), self.clearinghouse(user, dex, time_ms));
+        }
+        let mut out = json!({
+            "user": user.to_string(),
+            "clearinghouseState": self.clearinghouse(user, 0, time_ms),
+            "spotClearinghouseState": { "balances": balances, "portfolioMarginEnabled": acct.abstraction == 3 },
+            "openOrders": orders,
+            "history": acct.history.iter().map(|(t, e)| json!({ "time": t * 1000, "event": e })).collect::<Vec<_>>(),
+            "userFills": acct.fills.iter().rev().map(|f| self.fill_json(f)).collect::<Vec<_>>(),
         });
+        if !dexes.is_empty() {
+            out["dexes"] = Value::Object(dexes);
+        }
+        if !acct.lend.is_empty() {
+            out["borrowLendUserState"] = self.lend_info(&json!({ "type": "borrowLendUserState", "user": user.to_string() })).and_then(Result::ok).unwrap_or(Value::Null);
+        }
+        out
+    }
+
+    /// The name of a builder-deployed dex, from its perps' "dex:coin" names.
+    pub fn dex_name(&self, dex: u32) -> String {
+        self.perps.iter().find(|(a, _)| dex_of(**a) == dex).and_then(|(_, p)| p.name.split_once(':').map(|(d, _)| d.to_string())).unwrap_or_else(|| dex.to_string())
+    }
+
+    /// The dex index of a dex name: "" is the main dex.
+    pub fn dex_index(&self, name: &str, meta: &Meta) -> Option<u32> {
+        if name.is_empty() {
+            return Some(0);
+        }
+        let prefix = format!("{name}:");
+        self.perps.iter().find(|(_, p)| p.name.starts_with(&prefix)).map(|(a, _)| dex_of(*a)).or_else(|| meta.dexes.get(name).map(|d| d.index))
+    }
+
+    /// One dex's clearinghouseState for a user, in the info API's shape.
+    pub fn clearinghouse(&self, user: Address, dex: u32, time_ms: u64) -> Value {
+        let m = self.margin_dex(user, dex);
+        let usd = |v: i128| fmt_dec(v, 6);
         let acct = self.accounts.get(&user).cloned().unwrap_or_default();
         let mut positions = Vec::new();
-        for (asset, p) in acct.positions.iter().filter(|(_, p)| p.szi_x8 != 0) {
+        let (mut iso_value, mut iso_margin, mut iso_ntl) = (0i128, 0i128, 0i128);
+        for (asset, p) in acct.positions.iter().filter(|(a, p)| p.szi_x8 != 0 && dex_of(**a) == dex) {
             let perp = self.perps.get(asset);
             let size = p.szi_x8.unsigned_abs();
-            let mark = perp.map_or(0, |x| x.mark_x8);
-            let value = notional(size, mark) as i128;
+            let value = notional(size, self.mark_of(*asset, p)) as i128;
             let sign: i128 = if p.szi_x8 > 0 { 1 } else { -1 };
             let upnl = sign * (value - p.entry_ntl as i128);
-            let margin = value / p.leverage.max(1) as i128;
+            let margin = if p.isolated { p.isolated_raw_usd as i128 + upnl } else { value / p.leverage.max(1) as i128 };
+            if p.isolated {
+                iso_value += p.isolated_raw_usd as i128 + upnl;
+                iso_margin += margin;
+                iso_ntl += value;
+            }
             let entry_px = (p.entry_ntl as u128 * X16_TO_X6 / size as u128) as i128;
             let roe = if p.entry_ntl > 0 { upnl * p.leverage as i128 * 10_000_000_000 / p.entry_ntl as i128 } else { 0 };
+            let mut lev = json!({ "type": if p.isolated { "isolated" } else { "cross" }, "value": p.leverage });
+            if p.isolated {
+                lev["rawUsd"] = json!(usd((p.isolated_raw_usd as i128) - sign * p.entry_ntl as i128));
+            }
             positions.push(json!({
                 "type": "oneWay",
                 "position": {
                     "coin": perp.map_or_else(|| asset.to_string(), |x| x.name.clone()),
                     "szi": fmt_dec(p.szi_x8 as i128, 8),
-                    "leverage": { "type": if p.isolated { "isolated" } else { "cross" }, "value": p.leverage },
+                    "leverage": lev,
                     "entryPx": fmt_dec(entry_px, 8),
                     "positionValue": usd(value),
                     "unrealizedPnl": usd(upnl),
@@ -1242,41 +1576,18 @@ impl State {
                 },
             }));
         }
-        let balances: Vec<Value> = acct
-            .spot
-            .iter()
-            .map(|(token, s)| {
-                let meta = self.tokens.get(token);
-                let w = meta.map_or(8, |t| t.wei_decimals as u32);
-                json!({
-                    "coin": meta.map_or_else(|| token.to_string(), |t| t.name.clone()), "token": token,
-                    "total": fmt_dec(s.0 as i128, w), "hold": fmt_dec(s.1 as i128, w), "entryNtl": usd(s.2 as i128),
-                })
-            })
-            .collect();
-        let orders: Vec<Value> = self
-            .orders
-            .iter()
-            .filter(|o| o.user == user)
-            .map(|o| {
-                json!({
-                    "coin": self.perps.get(&o.asset).map_or_else(|| o.asset.to_string(), |x| x.name.clone()), "asset": o.asset,
-                    "side": if o.is_buy { "B" } else { "A" }, "limitPx": fmt_dec(o.px_x8 as i128, 8), "sz": fmt_dec(o.sz_x8 as i128, 8),
-                    "oid": o.oid, "cloid": (o.cloid != 0).then(|| format!("0x{:032x}", o.cloid)),
-                    "tif": match o.tif { 1 => "Alo", 2 => "Gtc", _ => "Ioc" },
-                })
-            })
-            .collect();
+        let cross = json!({
+            "accountValue": usd(m.account_value as i128), "totalNtlPos": usd(m.ntl_pos as i128),
+            "totalRawUsd": usd(m.raw_usd as i128), "totalMarginUsed": usd(m.margin_used as i128),
+        });
+        let total = json!({
+            "accountValue": usd(m.account_value as i128 + iso_value), "totalNtlPos": usd(m.ntl_pos as i128 + iso_ntl),
+            "totalRawUsd": usd(m.raw_usd as i128), "totalMarginUsed": usd(m.margin_used as i128 + iso_margin),
+        });
         json!({
-            "user": user.to_string(),
-            "clearinghouseState": {
-                "marginSummary": summary, "crossMarginSummary": summary, "crossMaintenanceMarginUsed": "0.0",
-                "withdrawable": usd(m.withdrawable as i128), "assetPositions": positions, "time": time_ms,
-            },
-            "spotClearinghouseState": { "balances": balances },
-            "openOrders": orders,
-            "history": acct.history.iter().map(|(t, e)| json!({ "time": t * 1000, "event": e })).collect::<Vec<_>>(),
-            "userFills": acct.fills.iter().rev().map(|f| self.fill_json(f)).collect::<Vec<_>>(),
+            "marginSummary": total, "crossMarginSummary": cross,
+            "crossMaintenanceMarginUsed": usd(self.maintenance_dex(user, dex) as i128),
+            "withdrawable": usd(m.withdrawable as i128), "assetPositions": positions, "time": time_ms,
         })
     }
 
@@ -1315,9 +1626,9 @@ impl State {
 
     /// A perp's asset context: the snapshot from `up`, with the copy's own
     /// mark, oracle, funding and mid where the copy tracks the perp.
-    fn asset_ctx(&self, asset: u32, meta: &Meta) -> Value {
+    fn asset_ctx(&self, asset: u32, index: u32, meta: &Meta) -> Value {
         let mut ctx = serde_json::Map::new();
-        if let Some(c) = meta.ctxs.get(asset as usize) {
+        if let Some(c) = meta.ctxs.get(index as usize) {
             for (k, v) in META_CTX_FIELDS.iter().zip(c) {
                 ctx.insert(k.to_string(), json!(v));
             }
@@ -1353,16 +1664,24 @@ impl State {
     /// or a malformed request, is an error message.
     pub fn info_request(&self, meta: &Meta, req: &Value, time_ms: u64) -> std::result::Result<Value, String> {
         let kind = req["type"].as_str().ok_or("the request has no type")?;
+        if let Some(answer) = self.lend_info(req) {
+            return answer;
+        }
+        // Builder-deployed dexes by name, "" being the main dex.
+        let dex_name = req["dex"].as_str().unwrap_or("");
+        let dex = self.dex_index(dex_name, meta).ok_or_else(|| format!("the copy has no perp dex {dex_name}: run chainsim set <name> hypercore book {dex_name}:<coin> --live"))?;
+        let empty = Meta::default();
+        let dmeta = if dex == 0 { meta } else { meta.dexes.get(dex_name).map_or(&empty, |d| &*d.meta) };
         let user = || -> std::result::Result<Address, String> { req["user"].as_str().and_then(|u| u.parse().ok()).ok_or_else(|| format!("{kind} needs a user address")) };
         let asset_of = |coin: &str| -> Option<u32> {
             self.perps.iter().find(|(_, p)| p.name == coin).map(|(a, _)| *a).or_else(|| meta.universe.iter().position(|u| u.0 == coin).map(|i| i as u32))
         };
         Ok(match kind {
-            "clearinghouseState" => self.info(user()?, time_ms)["clearinghouseState"].clone(),
+            "clearinghouseState" => self.clearinghouse(user()?, dex, time_ms),
             "spotClearinghouseState" => self.info(user()?, time_ms)["spotClearinghouseState"].clone(),
             "openOrders" => {
                 let who = user()?;
-                let mut orders: Vec<&Order> = self.orders.iter().filter(|o| o.user == who).collect();
+                let mut orders: Vec<&Order> = self.orders.iter().filter(|o| o.user == who && dex_of(o.asset) == dex).collect();
                 orders.sort_by(|a, b| b.oid.cmp(&a.oid));
                 json!(orders
                     .iter()
@@ -1383,10 +1702,12 @@ impl State {
                 let fills = self.accounts.get(&who).map_or(&[][..], |a| a.fills.as_slice());
                 json!(fills.iter().rev().map(|f| self.fill_json(f)).collect::<Vec<_>>())
             }
-            "meta" => json!({ "universe": self.universe(meta) }),
+            "meta" => json!({ "universe": self.universe(dmeta) }),
             "metaAndAssetCtxs" => {
-                let n = meta.universe.len().max(self.perps.keys().max().map_or(0, |m| *m as usize + 1));
-                json!([{ "universe": self.universe(meta) }, (0..n as u32).map(|a| self.asset_ctx(a, meta)).collect::<Vec<_>>()])
+                let base = dex * DEX_SIZE;
+                let tracked = self.perps.keys().filter(|a| dex_of(**a) == dex).max().map_or(0, |m| (*m - base) as usize + 1);
+                let n = dmeta.universe.len().max(tracked);
+                json!([{ "universe": self.universe(dmeta) }, (0..n as u32).map(|i| self.asset_ctx(base + i, i, dmeta)).collect::<Vec<_>>()])
             }
             "l2Book" => {
                 let coin = req["coin"].as_str().ok_or("l2Book needs a coin")?;
@@ -1395,12 +1716,12 @@ impl State {
             }
             "allMids" => {
                 let mut mids = serde_json::Map::new();
-                for (i, u) in meta.universe.iter().enumerate() {
-                    if let Some(m) = meta.ctxs.get(i).and_then(|c| c.get(7).cloned().flatten().or_else(|| c.first().cloned().flatten())) {
+                for (i, u) in dmeta.universe.iter().enumerate() {
+                    if let Some(m) = dmeta.ctxs.get(i).and_then(|c| c.get(7).cloned().flatten().or_else(|| c.first().cloned().flatten())) {
                         mids.insert(u.0.clone(), json!(m));
                     }
                 }
-                for (a, p) in &self.perps {
+                for (a, p) in self.perps.iter().filter(|(a, _)| dex_of(**a) == dex) {
                     let mid = match self.best(*a) {
                         (Some(b), Some(x)) => (b as u128 + x as u128) / 2,
                         _ => p.mark_x8 as u128,
@@ -1440,7 +1761,15 @@ impl State {
     /// Perps must already be in `perps`; positions in other perps are skipped
     /// and returned by name.
     pub fn mirror_perps(&mut self, user: Address, ch: &Value) -> Vec<String> {
-        let by_name: BTreeMap<String, u32> = self.perps.iter().map(|(a, p)| (p.name.clone(), *a)).collect();
+        self.mirror_dex(user, 0, ch)
+    }
+
+    /// Sets a user's positions and USD balance on one perp dex from that
+    /// dex's `clearinghouseState`. Isolated positions keep their margin
+    /// (marginUsed less unrealized PnL), and the dex balance is set so the
+    /// cross account value matches at the copy's marks.
+    pub fn mirror_dex(&mut self, user: Address, dex: u32, ch: &Value) -> Vec<String> {
+        let by_name: BTreeMap<String, u32> = self.perps.iter().filter(|(a, _)| dex_of(**a) == dex).map(|(a, p)| (p.name.clone(), *a)).collect();
         let mut positions = BTreeMap::new();
         let mut skipped = Vec::new();
         for ap in ch["assetPositions"].as_array().cloned().unwrap_or_default() {
@@ -1456,19 +1785,24 @@ impl State {
             };
             let leverage = p["leverage"]["value"].as_u64().unwrap_or(DEFAULT_LEVERAGE as u64) as u32;
             let isolated = p["leverage"]["type"] == "isolated";
-            positions.insert(asset, Pos { szi_x8: szi as i64, entry_ntl: notional(szi.unsigned_abs() as u64, entry_px as u64), leverage, isolated, ..Default::default() });
+            let dec6 = |k: &str| p[k].as_str().and_then(|s| parse_dec(s, 6)).unwrap_or(0) as i64;
+            let isolated_raw_usd = if isolated { dec6("marginUsed") - dec6("unrealizedPnl") } else { 0 };
+            positions.insert(asset, Pos { szi_x8: szi as i64, entry_ntl: notional(szi.unsigned_abs() as u64, entry_px as u64), leverage, isolated, isolated_raw_usd, ..Default::default() });
         }
-        let account_value = ch["marginSummary"]["accountValue"].as_str().and_then(|s| parse_dec(s, 6)).unwrap_or(0);
+        let summary = if ch["crossMarginSummary"].is_object() { &ch["crossMarginSummary"] } else { &ch["marginSummary"] };
+        let account_value = summary["accountValue"].as_str().and_then(|s| parse_dec(s, 6)).unwrap_or(0);
         let acct = self.account(user);
-        // Old positions go to zero, so their answers are rewritten.
-        for p in acct.positions.values_mut() {
-            *p = Pos { leverage: p.leverage, ..Default::default() };
+        // Old positions on this dex go to zero, so their answers are rewritten.
+        for (a, p) in acct.positions.iter_mut() {
+            if dex_of(*a) == dex {
+                *p = Pos { leverage: p.leverage, ..Default::default() };
+            }
         }
         acct.positions.extend(positions);
-        acct.usd = 0;
-        // Pick the USD balance that gives the same account value at our marks.
-        let upnl = self.margin(user).account_value as i128;
-        self.account(user).usd = (account_value - upnl) as i64;
+        *acct.usd_mut(dex) = 0;
+        // Pick the USD balance that gives the same cross account value at our marks.
+        let upnl = self.margin_dex(user, dex).account_value as i128;
+        *self.account(user).usd_mut(dex) = (account_value - upnl) as i64;
         skipped
     }
 
@@ -1527,9 +1861,9 @@ mod tests {
         s.perps.insert(0, Perp { name: "BTC".into(), sz_decimals: 5, max_leverage: 40, mark_x8: 100 * ONE_X8 as u64, ..Default::default() });
         let x = |v: u64| v * ONE_X8 as u64;
         s.books.insert(0, Book { bids: vec![(x(99), x(1)), (x(98), x(3))], asks: vec![(x(101), x(1)), (x(102), x(2))], time: 1 });
-        s.tokens.insert(0, TokenMeta { name: "USDC".into(), wei_decimals: 8, evm: None });
-        s.tokens.insert(HYPE_TOKEN, TokenMeta { name: "HYPE".into(), wei_decimals: 8, evm: None });
-        s.tokens.insert(200, TokenMeta { name: "TKN".into(), wei_decimals: 6, evm: Some(("0x00000000000000000000000000000000000000aa".into(), 12)) });
+        s.tokens.insert(0, TokenMeta { name: "USDC".into(), wei_decimals: 8, evm: None, sz_decimals: 8 });
+        s.tokens.insert(HYPE_TOKEN, TokenMeta { name: "HYPE".into(), wei_decimals: 8, evm: None, sz_decimals: 2 });
+        s.tokens.insert(200, TokenMeta { name: "TKN".into(), wei_decimals: 6, evm: Some(("0x00000000000000000000000000000000000000aa".into(), 12)), sz_decimals: 2 });
         s.account(ALICE).usd = 10_000 * 1_000_000;
         s.cursor = Some((10, "0x10".into()));
         s
@@ -1964,6 +2298,7 @@ mod tests {
                 vec![some("2000.0"), some("2001.0"), some("0.00001"), some("1.0"), some("1990.0"), some("10.0"), some("0.0"), some("2000.5"), some("1.0")],
                 vec![some("1.0"), some("1.0"), some("0.0"), None, None, None, None, None, None],
             ],
+            dexes: BTreeMap::new(),
         }
     }
 
@@ -2086,6 +2421,207 @@ mod tests {
         assert_eq!(m.universe, vec![("BTC".into(), 5, 40, false), ("X".into(), 0, 3, true)]);
         assert_eq!(m.ctxs[0][..3], [Some("1.0".to_string()), Some("2.0".to_string()), Some("0.1".to_string())]);
         assert_eq!(m.ctxs[1], vec![None; 9]);
+    }
+
+    /// The xyz dex (1) with one cross perp and one isolated-only perp, both USDC.
+    fn hip3() -> State {
+        let mut s = state();
+        let x = |v: u64| v * ONE_X8 as u64;
+        s.perps.insert(10_000, Perp { name: "xyz:XYZ100".into(), sz_decimals: 4, max_leverage: 20, mark_x8: x(1000), ..Default::default() });
+        s.perps.insert(10_001, Perp { name: "xyz:TSLA".into(), sz_decimals: 3, max_leverage: 10, mark_x8: x(400), isolated_only: true, ..Default::default() });
+        s.books.insert(10_000, Book { bids: vec![(x(999), x(5))], asks: vec![(x(1001), x(5))], time: 1 });
+        s.books.insert(10_001, Book { bids: vec![(x(399), x(5))], asks: vec![(x(401), x(5))], time: 1 });
+        s
+    }
+
+    #[test]
+    fn hip3_asset_ids_map_to_perp_indexes_with_their_own_dex_margin() {
+        let mut s = hip3();
+        assert_eq!((dex_of(10_001), dex_of(159), HIP3_ASSET_BASE + 10_000), (1, 0, 110_000));
+        // No USD on dex 1 yet: the order is refused although the main dex has 10,000.
+        assert!(run(&mut s, 11, ALICE, limit_order(110_000, true, x8(1001.0), x8(1.0), false, 3, 0)).starts_with("rejected: insufficient margin"));
+        // sendAsset (13) moves 500 USD from the main dex (0) to dex 1.
+        let send = encode_action(13, &[word_addr(ALICE), word_addr(Address::ZERO), word_u(0), word_u(1), word_u(0), word_u(50_000_000_000)].concat());
+        assert_eq!(run(&mut s, 12, ALICE, send), format!("moved 500.0 USD from perp dex 0 to perp dex 1 of {ALICE}"));
+        assert_eq!((s.accounts[&ALICE].usd, s.accounts[&ALICE].usd_of(1)), (usd(9_500.0), usd(500.0)));
+        // Asset 110000 is perp 10000, filled against its own book.
+        assert_eq!(run(&mut s, 13, ALICE, limit_order(110_000, true, x8(1001.0), x8(1.0), false, 3, 0)), "filled 1.0 at 1001.0, fee 0.45045 USD");
+        assert_eq!(s.accounts[&ALICE].positions[&10_000].szi_x8, x8(1.0) as i64);
+        // The fee came off dex 1, not the main dex.
+        assert_eq!((s.accounts[&ALICE].usd, s.accounts[&ALICE].usd_of(1)), (usd(9_500.0), usd(500.0) - usd(0.45045)));
+        assert_eq!(s.margin_dex(ALICE, 1).margin_used, usd(50.0) as u64);
+        assert_eq!(s.margin_dex(ALICE, 0).margin_used, 0);
+        // The answers: 0x800 for perp 10000 (it fits a uint16), 0x813, and 0x80f for dex 1.
+        let answers = s.answers(&BTreeSet::from([ALICE]));
+        assert!(answers.iter().any(|e| e.precompile == hypercore::POSITION && e.calldata == [word_addr(ALICE), word_u(10_000)].concat() && e.result[..32] == word_i(10_000)));
+        assert!(answers.iter().any(|e| e.precompile == hypercore::POSITION2 && e.calldata == [word_addr(ALICE), word_u(10_000)].concat()));
+        assert!(answers.iter().any(|e| e.precompile == hypercore::ACCOUNT_MARGIN_SUMMARY && e.calldata == [word_u(1), word_addr(ALICE)].concat()));
+        // A dex with another collateral token is refused.
+        s.perps.get_mut(&10_000).unwrap().collateral = 360;
+        assert!(run(&mut s, 14, ALICE, limit_order(110_000, true, x8(1001.0), x8(1.0), false, 3, 0)).starts_with("rejected: the dex of xyz:XYZ100 uses token 360"));
+        // Spot ids stay refused, and cancels map the asset the same way.
+        assert_eq!(run(&mut s, 15, ALICE, limit_order(10_107, true, 1, 1, false, 3, 0)), "rejected: spot orders are not modeled");
+        assert_eq!(s.dex_name(1), "xyz");
+    }
+
+    #[test]
+    fn an_isolated_hip3_position_liquidates_alone_while_cross_positions_survive() {
+        let mut s = hip3();
+        s.account(ALICE).dex_usd.insert(1, usd(1_000.0));
+        // Cross BTC on the main dex, isolated TSLA (max 10x) at 10x on dex 1: 400 notional holds 40 of margin.
+        run(&mut s, 11, ALICE, limit_order(0, true, x8(101.0), x8(1.0), false, 3, 0));
+        assert_eq!(run(&mut s, 12, ALICE, limit_order(110_001, true, x8(401.0), x8(1.0), false, 3, 0)), "filled 1.0 at 401.0, fee 0.18045 USD");
+        let p = s.accounts[&ALICE].positions[&10_001];
+        assert!(p.isolated);
+        assert_eq!((p.leverage, p.isolated_raw_usd), (10, usd(40.1)));
+        assert_eq!(s.accounts[&ALICE].usd_of(1), usd(1_000.0) - usd(40.1) - usd(0.18045));
+        // Isolated margin stays out of the dex's cross figures.
+        assert_eq!(s.margin_dex(ALICE, 1).margin_used, 0);
+        // TSLA falls to 365: equity 40.1 - 36 = 4.1, maintenance 365 / 20 = 18.25. Liquidated.
+        let a = s.set_price(10_001, x8(365.0), 100);
+        assert_eq!(a.liquidated, vec![ALICE]);
+        assert_eq!(s.accounts[&ALICE].positions[&10_001].szi_x8, 0);
+        assert!(s.accounts[&ALICE].history.last().unwrap().1.starts_with("liquidated: isolated xyz:TSLA equity 4.1 USD below maintenance margin 18.25 USD"));
+        // The cross BTC position and the dex balance outside the isolated margin survive.
+        assert_eq!(s.accounts[&ALICE].positions[&0].szi_x8, x8(1.0) as i64);
+        assert_eq!(s.accounts[&ALICE].usd_of(1), usd(1_000.0) - usd(40.1) - usd(0.18045) + usd(4.1));
+        let ch = s.clearinghouse(ALICE, 0, 0);
+        assert_eq!(ch["assetPositions"][0]["position"]["coin"], "BTC");
+    }
+
+    #[test]
+    fn an_isolated_loss_past_its_margin_stays_off_the_dex_balance() {
+        let mut s = hip3();
+        s.account(ALICE).dex_usd.insert(1, usd(100.0));
+        run(&mut s, 11, ALICE, limit_order(110_001, true, x8(401.0), x8(1.0), false, 3, 0));
+        let before = s.accounts[&ALICE].usd_of(1);
+        // A gap to 300 loses 101 on 40.1 of margin: the dex keeps what was outside it.
+        s.set_price(10_001, x8(300.0), 100);
+        assert_eq!(s.accounts[&ALICE].usd_of(1), before);
+        assert!(s.accounts[&ALICE].history.last().unwrap().1.ends_with("shortfall 60.9 USD absorbed"));
+    }
+
+    /// USDC (borrowable) and HYPE (LTV 0.65) reserves, HYPE at 50.
+    fn lend() -> State {
+        let mut s = state();
+        s.reserves.insert(0, crate::lend::Reserve { ltv_bps: 0, oracle_x8: ONE_X8 as u64, supplied: 1_000_000 * 100_000_000, borrowed: 500_000 * 100_000_000, rate_e12: 50_000_000_000 });
+        s.reserves.insert(HYPE_TOKEN, crate::lend::Reserve { ltv_bps: 6_500, oracle_x8: 50 * ONE_X8 as u64, supplied: 0, borrowed: 0, rate_e12: 50_000_000_000 });
+        s.account(BOB).spot.insert(HYPE_TOKEN, Spot(10 * 100_000_000, 0, 0));
+        s
+    }
+
+    fn borrow_lend(op: u8, token: u64, wei: u64) -> Vec<u8> {
+        encode_action(15, &[word_u(op as u128), word_u(token as u128), word_u(wei as u128)].concat())
+    }
+
+    #[test]
+    fn supply_borrow_interest_and_repay() {
+        let mut s = lend();
+        // Supply all 10 HYPE (wei 0 means all): 500 USD of collateral, 325 at LTV 0.65.
+        assert_eq!(run(&mut s, 11, BOB, borrow_lend(0, HYPE_TOKEN, 0)), "supplied 1000000000 wei of token 150");
+        assert_eq!(s.reserves[&HYPE_TOKEN].supplied, 1_000_000_000);
+        // A plain account cannot borrow: the spot send needs a balance.
+        let send = |wei: u64| encode_action(6, &[word_addr(ALICE), word_u(0), word_u(wei as u128)].concat());
+        assert_eq!(run(&mut s, 12, BOB, send(100 * 100_000_000)), "rejected: insufficient spot balance of token 0");
+        // Portfolio margin (action 16, abstraction 3) borrows the 100 USDC it lacks.
+        assert_eq!(run(&mut s, 13, BOB, encode_action(16, &[word_addr(BOB), word_u(3)].concat())), "abstraction set to portfolioMargin");
+        assert_eq!(run(&mut s, 14, BOB, send(100 * 100_000_000)), format!("sent 10000000000 wei of token 0 to {ALICE}"));
+        let l = s.accounts[&BOB].lend[&0];
+        assert_eq!((l.borrow_basis, l.borrow_value), (10_000_000_000, 10_000_000_000));
+        assert_eq!(s.reserves[&0].borrowed, 500_100 * 100_000_000);
+        assert_eq!(s.accounts[&ALICE].spot[&0].0, 10_000_000_000);
+        // Health factor 325 / 100.
+        assert_eq!(s.health_factor_e12(BOB), Some(3_250_000_000_000));
+        // Two hours of interest at utilization 0.5001: 0.05 a year on the borrow.
+        let t0 = 1_793_599_200;
+        s.apply(&[], (15, "0xf".into()), t0);
+        let a = s.apply(&[], (16, "0x10".into()), t0 + 2 * 3600);
+        assert!(a.reserves && a.users.contains(&BOB));
+        let hourly = 10_000_000_000u64 * 5 / 100 / 8760;
+        let after = s.accounts[&BOB].lend[&0].borrow_value;
+        assert!(after >= 10_000_000_000 + 2 * hourly && after <= 10_000_000_000 + 2 * hourly + 2, "{after}");
+        assert_eq!(s.accounts[&BOB].lend[&0].borrow_basis, 10_000_000_000);
+        // A credit of USDC repays first: 50 USDC sent back goes to the borrow.
+        run(&mut s, 17, ALICE, encode_action(6, &[word_addr(BOB), word_u(0), word_u(50 * 100_000_000)].concat()));
+        assert_eq!(s.accounts[&BOB].lend[&0].borrow_value, after - 50 * 100_000_000);
+        assert_eq!(s.accounts[&BOB].spot[&0].0, 0);
+        // The precompile answers: 0x811 for (BOB, 0) and 0x812 per reserve.
+        let ans = s.lend_user_answers(BOB);
+        let usdc = ans.iter().find(|e| e.calldata == [word_addr(BOB), word_u(0)].concat()).unwrap();
+        assert_eq!(usdc.result[32..64], word_u((after - 50 * 100_000_000) as u128));
+        let reserve = s.reserve_answers().into_iter().find(|e| e.calldata == word_u(0).to_vec()).unwrap();
+        // 500 bps borrow, oracle 1 in USDC's raw units (szDecimals 8), LTV 0.
+        assert_eq!((reserve.result[..32].to_vec(), reserve.result[128..160].to_vec(), reserve.result[160..192].to_vec()), (word_u(500).to_vec(), word_u(1).to_vec(), word_u(0).to_vec()));
+        let info = s.lend_info(&json!({ "type": "borrowLendUserState", "user": BOB.to_string() })).unwrap().unwrap();
+        assert_eq!((info["health"].as_str(), info["tokenToState"][0][0].clone()), (Some("healthy"), json!(0)));
+        assert_eq!(s.lend_info(&json!({ "type": "borrowLendReserveState", "token": 150 })).unwrap().unwrap()["ltv"], "0.65");
+        // Withdrawing the collateral that backs the borrow is refused, a part is fine.
+        assert!(run(&mut s, 18, BOB, borrow_lend(1, HYPE_TOKEN, 0)).starts_with("rejected: withdrawing"));
+        assert_eq!(run(&mut s, 19, BOB, borrow_lend(1, HYPE_TOKEN, 100_000_000)), "withdrew 100000000 wei of token 150");
+        assert_eq!(s.accounts[&BOB].spot[&HYPE_TOKEN].0, 100_000_000);
+    }
+
+    #[test]
+    fn borrowing_stops_at_health_one_and_liquidation_takes_collateral() {
+        let mut s = lend();
+        run(&mut s, 11, BOB, borrow_lend(0, HYPE_TOKEN, 0));
+        run(&mut s, 12, BOB, encode_action(16, &[word_addr(BOB), word_u(2)].concat()));
+        let send = |wei: u64| encode_action(6, &[word_addr(ALICE), word_u(0), word_u(wei as u128)].concat());
+        // 325 USD of LTV-weighted collateral: 325.000001 (the smallest USD step) is refused, 325 is fine.
+        assert!(run(&mut s, 13, BOB, send(32_500_000_100)).contains("below 1"));
+        assert!(run(&mut s, 14, BOB, send(32_500_000_000)).starts_with("sent"));
+        assert_eq!(s.health_factor_e12(BOB), Some(1_000_000_000_000));
+        // Liquidation value 500 x (0.5 + 0.325) = 412.5: 325 borrowed is 0.79 of it. HYPE to 40:
+        // 400 x 0.825 = 330, 325 / 330 = 0.985 > 0.95: liquidated on the next margin step.
+        s.reserves.get_mut(&HYPE_TOKEN).unwrap().oracle_x8 = 40 * ONE_X8 as u64;
+        let mut a = Applied::default();
+        s.lend_liquidate(&mut a);
+        assert_eq!(a.liquidated, vec![BOB]);
+        let l = s.accounts[&BOB].lend.clone();
+        assert_eq!(l[&0].borrow_value, 0);
+        // 325 USD of HYPE at 40 is 8.125 HYPE taken, 1.875 left.
+        assert_eq!(l[&HYPE_TOKEN].supply_value, 187_500_000);
+        // At 41 the ratio is 325 / 338.25 = 0.96, at 42 it is 0.938: 42 survives.
+        let mut s2 = lend();
+        run(&mut s2, 11, BOB, borrow_lend(0, HYPE_TOKEN, 0));
+        run(&mut s2, 12, BOB, encode_action(16, &[word_addr(BOB), word_u(3)].concat()));
+        run(&mut s2, 13, BOB, send(32_500_000_000));
+        s2.reserves.get_mut(&HYPE_TOKEN).unwrap().oracle_x8 = 42 * ONE_X8 as u64;
+        let mut a = Applied::default();
+        s2.lend_liquidate(&mut a);
+        assert!(a.liquidated.is_empty());
+        let info = s2.lend_info(&json!({ "type": "borrowLendUserState", "user": BOB.to_string() })).unwrap().unwrap();
+        assert_eq!(info["health"], "atRisk");
+    }
+
+    #[test]
+    fn the_stablecoin_rate_follows_utilization() {
+        let r = |s: u64, b: u64| crate::lend::Reserve { supplied: s, borrowed: b, ..Default::default() };
+        assert_eq!(r(100, 50).borrow_rate_e12(), 50_000_000_000);
+        // 0.05 + 4.75 x (0.9 - 0.8) = 0.525
+        assert_eq!(r(100, 90).borrow_rate_e12(), 525_000_000_000);
+        // Measured on mainnet: utilization 0.7937664526 gives supply 0.0357194904.
+        let u = r(1_000_000_000_000, 793_766_452_600);
+        assert_eq!(u.supply_rate_e12() / 1_000_000, 35_719);
+    }
+
+    #[test]
+    fn testnet_hype_index_moves_the_system_address_and_bridge() {
+        let mut s = state();
+        s.hype_token = 1105;
+        s.tokens.insert(1105, TokenMeta { name: "HYPE".into(), wei_decimals: 8, evm: None, sz_decimals: 2 });
+        assert_eq!(s.hype(), 1105);
+        assert_eq!((system_address_for(1105, 1105), system_token_for(HYPE_SYSTEM, 1105)), (HYPE_SYSTEM, Some(1105)));
+        // On testnet, token 150 is an ordinary token with an 0x20 system address.
+        assert_eq!(system_address_for(150, 1105).to_string().to_lowercase(), "0x2000000000000000000000000000000000000096");
+        let e = Logged { block: 11, log_index: 0, event: Event::HypeIn { user: BOB, amount: U256::from(10u64).pow(U256::from(18u64)) } };
+        s.apply(&[e], (11, "0xb".into()), 0);
+        assert_eq!(s.accounts[&BOB].spot[&1105].0, 100_000_000);
+        assert!(!s.accounts[&BOB].spot.contains_key(&HYPE_TOKEN));
+        let a = s.apply(&[act(12, BOB, encode_action(6, &[word_addr(HYPE_SYSTEM), word_u(1105), word_u(100_000_000)].concat()))], (12, "0xc".into()), 0);
+        assert_eq!(a.credits[0].amount, U256::from(10u64).pow(U256::from(18u64)));
+        // Mainnet keeps 150.
+        assert_eq!(State::new().hype(), HYPE_TOKEN);
     }
 
     #[test]

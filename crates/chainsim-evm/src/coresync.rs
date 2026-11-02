@@ -61,7 +61,7 @@ fn unblob(code: &Value, address: &str) -> Result<Option<Vec<u8>>> {
 pub fn decode_state(code: &Value) -> Result<Option<State>> {
     match unblob(code, STATE_ADDRESS)? {
         None => Ok(None),
-        Some(b) => State::from_bytes(&b).map(Some).ok_or_else(|| Error::new(ErrorCode::Internal, "the HyperCore state on the fork does not decode").next("chainsim down <name> && chainsim up hyperevm-mainnet")),
+        Some(b) => State::from_bytes(&b).map(Some).ok_or_else(|| Error::new(ErrorCode::Internal, "the HyperCore state on the fork does not decode").next("chainsim down <name>, then chainsim up <chain> --name <name>")),
     }
 }
 

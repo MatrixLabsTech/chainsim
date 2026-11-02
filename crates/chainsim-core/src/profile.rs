@@ -56,6 +56,15 @@ pub struct HyperCoreSettings {
     pub tokens: Vec<u32>,
     /// Spot pair indexes whose spot info and spot price are seeded.
     pub spots: Vec<u32>,
+    /// The Hyperliquid info API: the public URL and the variable that replaces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub info: Option<Upstream>,
+    /// The HYPE spot token index (150 on mainnet).
+    #[serde(default, rename = "hypeToken", skip_serializing_if = "Option::is_none")]
+    pub hype_token: Option<u64>,
+    /// Builder-deployed perp dexes whose meta `up` takes, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dexes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

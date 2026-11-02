@@ -7,6 +7,7 @@ pub mod core;
 mod corefork;
 pub mod coresync;
 pub mod hypercore;
+pub mod lend;
 pub mod units;
 
 use std::collections::HashMap;
@@ -86,6 +87,8 @@ pub struct EvmAdapter {
 struct Engine<'a> {
     control: Control<'a>,
     url: Target,
+    /// The Hyperliquid info API URL and its variable, on HyperEVM profiles.
+    info: Option<(String, String)>,
 }
 
 impl Engine<'_> {
@@ -349,7 +352,7 @@ impl EvmAdapter {
 
     fn engine<'a>(&'a self, handle: &ForkHandle, profile: &Profile) -> Engine<'a> {
         let secret = profile.upstream_is_secret().then(|| profile.upstream_url());
-        Engine { control: Control::new(&self.docker, handle.control_container.clone(), secret).with_env(&profile.upstream.env), url: Target::Engine(handle.rpc_url(profile)) }
+        Engine { control: Control::new(&self.docker, handle.control_container.clone(), secret).with_env(&profile.upstream.env), url: Target::Engine(handle.rpc_url(profile)), info: corefork::info_source(profile) }
     }
 
     /// The fork, its profile, and a running engine, or an error an agent can act on.
@@ -443,7 +446,7 @@ impl EvmAdapter {
 
         let handle = self.docker.find(name).await?.ok_or_else(|| Error::new(ErrorCode::EngineFailed, "the engine container vanished after start"))?;
         let eng = self.engine(&handle, profile);
-        let direct = Engine { control: Control::new(&self.docker, handle.control_container.clone(), secret.clone()).with_env(&profile.upstream.env), url: Target::Engine(engine_url(&handle, profile)) };
+        let direct = Engine { control: Control::new(&self.docker, handle.control_container.clone(), secret.clone()).with_env(&profile.upstream.env), url: Target::Engine(engine_url(&handle, profile)), info: None };
         let started = Instant::now();
         loop {
             if !self.docker.is_running(&handle.engine_container).await {

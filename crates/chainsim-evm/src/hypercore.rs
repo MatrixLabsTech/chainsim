@@ -29,6 +29,9 @@ pub const PERP_ASSET_INFO: u16 = 0x80a;
 pub const SPOT_INFO: u16 = 0x80b;
 pub const TOKEN_INFO: u16 = 0x80c;
 pub const ACCOUNT_MARGIN_SUMMARY: u16 = 0x80f;
+pub const BORROW_LEND_USER: u16 = 0x811;
+pub const BORROW_LEND_RESERVE: u16 = 0x812;
+pub const POSITION2: u16 = 0x813;
 
 /// The CoreWriter system contract, and its `RawAction(address indexed user, bytes data)` event.
 pub const CORE_WRITER: &str = "0x3333333333333333333333333333333333333333";
@@ -147,7 +150,7 @@ pub fn default_writes(result: &[u8]) -> Vec<(String, String)> {
 /// reads empty Core state: position, spot balance, withdrawable and the
 /// account margin summary.
 pub fn zero_defaults() -> Vec<(u16, Vec<u8>)> {
-    [(POSITION, 5), (SPOT_BALANCE, 3), (WITHDRAWABLE, 1), (ACCOUNT_MARGIN_SUMMARY, 4)].into_iter().map(|(p, words)| (p, vec![0u8; 32 * words])).collect()
+    [(POSITION, 5), (SPOT_BALANCE, 3), (WITHDRAWABLE, 1), (ACCOUNT_MARGIN_SUMMARY, 4), (BORROW_LEND_USER, 4), (POSITION2, 5)].into_iter().map(|(p, words)| (p, vec![0u8; 32 * words])).collect()
 }
 
 /// The mock's runtime bytecode as 0x hex, for `anvil_setCode`.
@@ -246,6 +249,15 @@ pub struct Position {
 pub fn position(user: Address, perp: u16, p: Position) -> Entry {
     Entry {
         precompile: POSITION,
+        calldata: concat(&[word_addr(user), word_u(perp as u128)]),
+        result: concat(&[word_i(p.szi), word_u(p.entry_ntl as u128), word_i(p.isolated_raw_usd), word_u(p.leverage as u128), word_bool(p.is_isolated)]),
+    }
+}
+
+/// A perp position at 0x813, which takes a uint32 perp index (builder-deployed perps included).
+pub fn position2(user: Address, perp: u32, p: Position) -> Entry {
+    Entry {
+        precompile: POSITION2,
         calldata: concat(&[word_addr(user), word_u(perp as u128)]),
         result: concat(&[word_i(p.szi), word_u(p.entry_ntl as u128), word_i(p.isolated_raw_usd), word_u(p.leverage as u128), word_bool(p.is_isolated)]),
     }
@@ -626,7 +638,7 @@ mod tests {
         assert_eq!(run(&code, &sb.calldata, &storage), (true, sb.result.clone()));
         let other = spot_balance(Address::repeat_byte(0xd0), 150, 0, 0, 0);
         assert_eq!(run(&code, &other.calldata, &storage), (true, vec![0u8; 96]));
-        assert_eq!(zero_defaults().iter().map(|(p, r)| (*p, r.len())).collect::<Vec<_>>(), [(POSITION, 160), (SPOT_BALANCE, 96), (WITHDRAWABLE, 32), (ACCOUNT_MARGIN_SUMMARY, 128)]);
+        assert_eq!(zero_defaults().iter().map(|(p, r)| (*p, r.len())).collect::<Vec<_>>(), [(POSITION, 160), (SPOT_BALANCE, 96), (WITHDRAWABLE, 32), (ACCOUNT_MARGIN_SUMMARY, 128), (BORROW_LEND_USER, 128), (POSITION2, 160)]);
     }
 
     #[test]
@@ -678,7 +690,7 @@ mod tests {
 
     #[test]
     fn seeds_cover_the_profile_lists() {
-        let s = chainsim_core::profile::HyperCoreSettings { perps: vec![0, 159], tokens: vec![0, 150], spots: vec![107] };
+        let s = chainsim_core::profile::HyperCoreSettings { perps: vec![0, 159], tokens: vec![0, 150], spots: vec![107], info: None, hype_token: None, dexes: vec![] };
         let q = seeds(&s);
         assert_eq!(q.len(), 1 + 3 * 2 + 2 + 2);
         assert_eq!((q[0].precompile, q[0].calldata.len()), (L1_BLOCK_NUMBER, 0));
@@ -695,7 +707,7 @@ mod tests {
         let mut spot = word_u(32).to_vec();
         spot.extend(concat(&[word_u(96), word_u(150), word_u(0), word_u(4)]));
         spot.extend(pad_words(b"@107"));
-        let s = chainsim_core::profile::HyperCoreSettings { perps: vec![0], tokens: vec![], spots: vec![107] };
+        let s = chainsim_core::profile::HyperCoreSettings { perps: vec![0], tokens: vec![], spots: vec![107], info: None, hype_token: None, dexes: vec![] };
         let q = seeds(&s);
         let answers = [word_u(1_205_855_504).to_vec(), word_u(784_200).to_vec(), word_u(784_549).to_vec(), perp, spot, word_u(46_000).to_vec()];
         let seeded: Vec<_> = q.into_iter().zip(answers).collect();
