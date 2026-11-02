@@ -67,7 +67,10 @@ error codes from the binary.
   answers `POST /info` from the copy, including borrowLendUserState, borrowLendReserveState and
   allBorrowLendReserveStates, with `"dex"` for builder-deployed dexes. `wsUrl` is the proxy too: a
   transaction sent over a WebSocket is applied to HyperCore after its block, as over HTTP, and
-  `eth_subscribe` works as on anvil. `describe
+  `eth_subscribe` works as on anvil. Other clients' requests wait while a chainsim command
+  changes HyperCore state, and `time --replay` changes it one candle at a time, so a request
+  waits at most one candle and a transaction sent between candles is applied before the next
+  one. `describe
   hyperevm-mainnet` lists the info request types and RPC methods the proxy serves, and in
   `limits` what HyperCore does not model.
 - On Sui, `selftest` has a `funding-health` part that fails when the funder or the USDC holder

@@ -28,6 +28,8 @@ builder-deployed perps, borrow and lend, and testnet.
   crosses and liquidates accounts below maintenance margin, `time --replay` plays a past stretch
   of mainnet candles as the price path, funding accrues every hour of the fork's clock, and every
   fill pays maker or taker fees.
+- A replay steps one candle at a time, so other clients are served while it runs, and a
+  transaction one of them sends between two candles is applied before the next candle.
 - Builder-deployed (HIP-3) perps, such as xyz:XYZ100, with their own dex balance and margin,
   isolated margin where the perp is isolated only, and their mainnet books.
 - Borrow and lend: supply and withdraw through CoreWriter, implicit borrowing for portfolio margin
