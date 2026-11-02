@@ -297,8 +297,9 @@ A sender without HYPE for gas gets a top-up first, reported as `topUp`.
 
 ## Set
 
-Besides `set precompile` and `set hypercore`, `set storage`, `set code` and `set balance` work
-as on the other EVM chains. `set token`, `set owner`, `set object` and `set resource` exit 3.
+Besides `set precompile` and `set hypercore`, `set storage`, `set code`, `set balance` and
+`set token` work as on the other EVM chains, and so do `time` and `mine`. `set owner`,
+`set object` and `set resource` exit 3.
 
 ## Snapshot and revert
 

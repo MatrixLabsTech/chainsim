@@ -89,7 +89,8 @@ The values are a dated snapshot. To refresh them:
 ## send and set
 
 The same as on Ethereum: `send --as` with `--sig`, `--data` or `--value` (in ETH), and
-`set storage`, `set code` and `set balance`. `set token` and `set owner` exit 3. A `set code`
+`set storage`, `set code`, `set balance` and `set token`. `set owner` exits 3. `time` and `mine`
+work as on Ethereum. A `set code`
 at `0x6C` replaces the mock for the rest of the fork's life.
 
 ## selftest

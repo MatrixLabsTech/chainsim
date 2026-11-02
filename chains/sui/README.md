@@ -134,7 +134,7 @@ fork point (see Fund below).
 chainsim fund sui-mainnet 0xc0ffee --native 25
 ```
 
-On Sui, `fund` gives SUI only, by a transfer on the copy from the profile's funder,
+On Sui, `fund --native` gives SUI by a transfer on the copy from the profile's funder,
 `0x935029ca5219502a47ac9b69f556ccf6e2198b5e7815cf50f68846f723739cbd`. It is labeled Binance 1 on
 CoinCarp's Sui rich list and held 27.59 million SUI in address-owned coins when we checked on
 2026-10-09. The transfer carries no signature: `sui-fork` executes a transaction with an empty
@@ -144,7 +144,10 @@ signature list as its sender. Nothing is sent on Sui Mainnet.
   `set balance` (below) can lower one.
 - `fund` refuses an address that owns any object on Sui Mainnet (exit 7), so you fund only fresh
   test addresses.
-- `fund --token` exits 3 on Sui. Use `set token` for tokens.
+- `fund --token USDC:<amount>` moves Circle's native USDC on the copy from the profile's USDC
+  holder, `0x60dd01bc037e2c1ea2aaf02187701f9f4453ba323338d2f2f521957065b0984d`, labeled Bybit 1 on
+  CoinCarp's Sui rich list, which held 448,681 USDC in address-owned coins when we checked on
+  2026-11-01. USDC is the only profile token. `set token` covers any other coin type.
 
 `fund` works only on a fork point within about an hour of the upstream head. `up` seeds the
 funder's coins into the copy's owned-object index, and the public GraphQL endpoint keeps

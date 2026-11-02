@@ -74,12 +74,27 @@ padded to 32 bytes.
 
 The same as on Ethereum: `send --as` with `--sig`, `--data` or `--value` (in USDC), and
 `set storage`, `set code` and `set balance`. `set balance` writes the native balance, so the
-read-back also shows the USDC ERC-20 view. `set token` and `set owner` exit 3.
+read-back also shows the USDC ERC-20 view. `set token` sets a token balance as `fund --token`
+does, and `set token <address> USDC <amount>` sets the native balance. `set owner` exits 3.
 
 Gas is paid in USDC, so a sender that cannot pay is topped up in native USDC.
 
 ```sh
 chainsim set arc-mainnet balance 0xd8d244aF69B839999883F9f32a68C7F184012e8a 25
+```
+
+## Time and blocks
+
+`time` and `mine` work as on Ethereum:
+
+```sh
+chainsim time arc-mainnet --advance 3600
+chainsim mine arc-mainnet --blocks 3
+```
+
+```json
+{ "previous": 1793592670, "timestamp": 1793596270, "timestampUsecs": "1793596270000000", "height": 29099012 }
+{ "mined": 3, "height": 29099015, "timestamp": 1793596270, "timestampUsecs": "1793596270000000" }
 ```
 
 ## selftest

@@ -58,8 +58,9 @@ Every amount is in whole units of the token. `fund` reads each balance back and 
   arrays and tuples elsewhere, for example with `cast calldata`, and pass `--data`.
 - `set storage <address> <slot> <value>`, `set code <address> <hex or file>` and
   `set balance <address> <amount>` write state directly and read it back.
-- `set token` and `set owner` are not supported on EVM chains (exit 3). Use `fund --token` for
-  token balances, and `set storage` for the slot that records an owner.
+- `set token <address> <symbol or token address> <amount>` sets an ERC-20 balance the way
+  `fund --token` does, on any address, and reads it back. `--from` exits 3.
+- `set owner` exits 3. Use `set storage` for the slot that records an owner.
 
 ```sh
 chainsim set ethereum-mainnet code 0xd8d244aF69B839999883F9f32a68C7F184012e8a 0x600160005260206000f3
@@ -67,8 +68,33 @@ chainsim set ethereum-mainnet storage 0xd8d244aF69B839999883F9f32a68C7F184012e8a
 chainsim status ethereum-mainnet
 ```
 
+```sh
+chainsim set ethereum-mainnet token 0x0000000000000000000000000000000000c0ffee USDC 1234.5
+```
+
+```json
+{ "kind": "token", "address": "0x0000000000000000000000000000000000C0FFEE", "symbol": "USDC", "token": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "decimals": 6, "amount": "1234.5", "raw": "1234500000" }
+```
+
 `status` lists every `send` and `set` under `modifications`. The list lives in the fork's
 sidecar, so it is gone after `down`, and a `revert` does not shorten it.
+
+## Time and blocks
+
+```sh
+chainsim time ethereum-mainnet --advance 3600
+chainsim mine ethereum-mainnet --blocks 3
+```
+
+```json
+{ "previous": 1793592650, "timestamp": 1793596250, "timestampUsecs": "1793596250000000", "height": 26324617 }
+{ "mined": 3, "height": 26324620, "timestamp": 1793596251, "timestampUsecs": "1793596251000000" }
+```
+
+`time` sets the next block's timestamp with `evm_setNextBlockTimestamp` and mines that block.
+`time --to <unix seconds>` moves to a given time. `mine` produces up to 10,000 blocks per call
+with `anvil_mine`. A `revert` to a snapshot taken before both returned the fork to block
+26324616 at timestamp 1793592650.
 
 ## Old blocks need an archive upstream
 
