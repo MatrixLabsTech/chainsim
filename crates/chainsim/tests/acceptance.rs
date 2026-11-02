@@ -437,6 +437,160 @@ fn hyperevm_mainnet() {
     assert_gone(name);
 }
 
+/// A contract that forwards its calldata to the 0x800 position precompile
+/// with STATICCALL and returns the answer, or bubbles the revert up.
+const POSITION_READER: &str = concat!(
+    "0x",
+    "365f5f37",   // calldatacopy(0, 0, calldatasize)
+    "5f5f365f",   // retSize 0, retOffset 0, argsSize calldatasize, argsOffset 0
+    "6108005afa", // staticcall(gas, 0x800, ...)
+    "3d5f5f3e",   // returndatacopy(0, 0, returndatasize)
+    "61001857",   // success: jump to 0x18
+    "3d5ffd",     // revert(0, returndatasize)
+    "5b3d5ff3",   // 0x18: return(0, returndatasize)
+);
+
+/// HLP's strategy vaults, which hold perp positions on HyperCore mainnet.
+const HLP_CHILDREN: &[&str] = &[
+    "0x010461c14e146ac35fe42271bdc1134ee31c703a",
+    "0x2e3d94f0562703b25c83308a05046ddaf9a8dd14",
+    "0x2ed5c4484ea3ff8b57d5f2fb152a40d9f2b68308",
+    "0x31ca8395cf837de08b24da3f660e77761dfb974b",
+    "0x469f690213c467c39a23efacfd2816896009d7d8",
+    "0x5e177e5e39c0f4e421f5865a6d8beed8d921cb70",
+    "0xb0a55f13d22f66e6d495ac98113841b2326e9540",
+];
+
+/// The signed szi of a user's BTC (perp 0) position, read through the reader contract.
+fn read_btc_szi(name: &str, reader: &str, user: &str) -> i64 {
+    let data = format!("0x{:0>64}{:064x}", user.trim_start_matches("0x").to_lowercase(), 0);
+    let out = ok(&["call", name, "eth_call", &json!([{ "to": reader, "data": data }, "latest"]).to_string()]);
+    let hex = out.as_str().unwrap().trim_start_matches("0x").to_string();
+    assert_eq!(hex.len(), 320, "Position is 5 words: {hex}");
+    u64::from_str_radix(&hex[48..64], 16).unwrap() as i64
+}
+
+fn btc_position(state: &Value) -> Option<Value> {
+    state["clearinghouseState"]["assetPositions"].as_array()?.iter().map(|p| p["position"].clone()).find(|p| p["coin"] == "BTC")
+}
+
+fn send_action(name: &str, user: &str, payload: &[u8]) -> Value {
+    let hex = chainsim_evm::hypercore::to_hex(payload);
+    let sent = ok(&["send", name, "--as", user, "--to", "0x3333333333333333333333333333333333333333", "--sig", "sendRawAction(bytes)", &hex]);
+    assert_eq!(sent["status"], 1);
+    let actions = ok(&["call", name, "corewriter_actions"]);
+    actions.as_array().unwrap().last().cloned().unwrap()
+}
+
+fn native_balance(name: &str, who: &str) -> u128 {
+    let out = ok(&["call", name, "eth_getBalance", &json!([who, "latest"]).to_string()]);
+    u128::from_str_radix(out.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
+}
+
+/// The decimal string a fixed-point value of `d` decimals as an integer.
+fn fixed(s: &str, d: u32) -> i128 {
+    chainsim_evm::core::parse_dec(s, d).unwrap()
+}
+
+#[test]
+#[ignore]
+fn hyperevm_local_hypercore() {
+    use chainsim_evm::hypercore::{encode_action, limit_order, word_addr, word_u};
+    let name = "acc-hypercore";
+    chainsim(&["down", name]);
+    let started = Instant::now();
+
+    let t = Instant::now();
+    let fork = ok(&["up", "hyperevm-mainnet", "--name", name]);
+    println!("up: {:.1} s", t.elapsed().as_secs_f64());
+    let core = &fork["hypercore"]["core"];
+    assert_eq!(core["infoCalls"], 6, "{core}");
+    let btc = core["books"].as_array().unwrap().iter().find(|b| b["coin"] == "BTC").cloned().unwrap();
+    let (best_bid, best_ask) = (fixed(btc["bestBid"].as_str().unwrap(), 8), fixed(btc["bestAsk"].as_str().unwrap(), 8));
+    assert!(best_bid > 0 && best_ask > best_bid, "{btc}");
+
+    // Mirror a mainnet account with a BTC position, and read it back through
+    // the 0x800 precompile from a contract and through hypercore_state.
+    let reader = "0x000000000000000000000000000000000000c0de";
+    ok(&["set", name, "code", reader, POSITION_READER]);
+    let mut mirrored = None;
+    for user in HLP_CHILDREN {
+        let t = Instant::now();
+        let m = ok(&["set", name, "hypercore", "mirror", user]);
+        println!("mirror {user}: {} positions, {:.1} s, {} info and {} upstream calls", m["positions"], t.elapsed().as_secs_f64(), m["infoCalls"], m["upstreamCalls"]);
+        let state = ok(&["call", name, "hypercore_state", user]);
+        if let Some(p) = btc_position(&state) {
+            mirrored = Some((user.to_string(), p, state));
+            break;
+        }
+    }
+    let (whale, pos, state) = mirrored.expect("an HLP vault with a BTC position");
+    assert!(fixed(state["clearinghouseState"]["marginSummary"]["accountValue"].as_str().unwrap(), 6) > 0);
+    // BTC has szDecimals 5: the precompile's szi is the size times 1e5.
+    let szi = fixed(pos["szi"].as_str().unwrap(), 5) as i64;
+    assert_eq!(read_btc_szi(name, reader, &whale), szi, "{pos}");
+
+    // Bridge HYPE in: Core spot rises by the amount.
+    let wallet = fresh_address(21);
+    ok(&["fund", name, &wallet, "--native", "10"]);
+    let sent = ok(&["send", name, "--as", &wallet, "--to", "0x2222222222222222222222222222222222222222", "--value", "2"]);
+    assert_eq!(sent["status"], 1);
+    let state = ok(&["call", name, "hypercore_state", &wallet]);
+    assert_eq!(state["spotClearinghouseState"]["balances"], json!([{ "coin": "HYPE", "token": 150, "total": "2.0", "hold": "0.0", "entryNtl": "0.0" }]));
+
+    // USDC on spot, a USD class transfer to perp, then an IOC buy through
+    // CoreWriter fills at the snapshot's best ask.
+    ok(&["set", name, "hypercore", "spot-balance", &wallet, "0", "100000000000"]);
+    let moved = send_action(name, &wallet, &encode_action(7, &[word_u(500_000_000), word_u(1)].concat()));
+    assert_eq!(moved["result"], "moved 500.0 USD to perp", "{moved}");
+    let t = Instant::now();
+    let ioc = send_action(name, &wallet, &limit_order(0, true, (best_ask * 101 / 100) as u64, 100_000, false, 3, 0));
+    println!("IOC buy: {:.1} s, {}", t.elapsed().as_secs_f64(), ioc["result"]);
+    assert_eq!(ioc["result"], json!(format!("filled 0.001 at {}", btc["bestAsk"].as_str().unwrap())), "{ioc}");
+    assert_eq!(read_btc_szi(name, reader, &wallet), 100);
+    let state = ok(&["call", name, "hypercore_state", &wallet]);
+    assert_eq!(btc_position(&state).unwrap()["szi"], "0.001");
+
+    // A GTC bid below the book rests, and a cancel by cloid removes it.
+    let gtc = send_action(name, &wallet, &limit_order(0, true, (best_bid * 9 / 10) as u64, 100_000, false, 2, 77));
+    assert!(gtc["result"].as_str().unwrap().starts_with("0.001 resting as oid"), "{gtc}");
+    let state = ok(&["call", name, "hypercore_state", &wallet]);
+    assert_eq!(state["openOrders"].as_array().unwrap().len(), 1, "{state}");
+    let cancel = send_action(name, &wallet, &encode_action(11, &[word_u(0), word_u(77)].concat()));
+    assert!(cancel["result"].as_str().unwrap().starts_with("canceled oid"), "{cancel}");
+    assert_eq!(ok(&["call", name, "hypercore_state", &wallet])["openOrders"], json!([]));
+
+    // Spot send to the HYPE system address credits the EVM balance.
+    let before = native_balance(name, &wallet);
+    let back = send_action(name, &wallet, &encode_action(6, &[word_addr("0x2222222222222222222222222222222222222222".parse().unwrap()), word_u(150), word_u(100_000_000)].concat()));
+    assert!(back["result"].as_str().unwrap().contains("to the EVM"), "{back}");
+    let after = native_balance(name, &wallet);
+    assert!(after > before + 990_000_000_000_000_000, "1 HYPE back on the EVM, less gas: {before} -> {after}");
+    let state = ok(&["call", name, "hypercore_state", &wallet]);
+    let hype = state["spotClearinghouseState"]["balances"].as_array().unwrap().iter().find(|b| b["coin"] == "HYPE").cloned().unwrap();
+    assert_eq!(hype["total"], "1.0", "{state}");
+
+    // Snapshot, an order, revert: Core state is as before.
+    let core_of = |s: Value| {
+        let mut s = s;
+        s["clearinghouseState"]["time"] = json!(0);
+        s
+    };
+    let snap = ok(&["snapshot", name]);
+    let held = core_of(ok(&["call", name, "hypercore_state", &wallet]));
+    send_action(name, &wallet, &limit_order(0, true, (best_ask * 101 / 100) as u64, 200_000, false, 3, 0));
+    assert_ne!(core_of(ok(&["call", name, "hypercore_state", &wallet])), held);
+    ok(&["revert", name, snap["id"].as_str().unwrap()]);
+    assert_eq!(core_of(ok(&["call", name, "hypercore_state", &wallet])), held);
+    assert_eq!(read_btc_szi(name, reader, &wallet), 100);
+
+    let status = ok(&["status", name]);
+    println!("status hypercore: {}", status["hypercore"]["coreState"]);
+    ok(&["down", name]);
+    assert_gone(name);
+    println!("whole run: {:.1} s", started.elapsed().as_secs_f64());
+}
+
 fn alloy_hex(s: &str) -> String {
     s.bytes().map(|b| format!("{b:02x}")).collect()
 }
