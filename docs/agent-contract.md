@@ -65,8 +65,9 @@ error codes from the binary.
   and bridge transfers after every block for any client, mines small and big blocks per sender
   (`set hypercore big-blocks <user> on|off`, `eth_usingBigBlocks`, `eth_bigBlockGasPrice`) and
   answers `POST /info` from the copy, including borrowLendUserState, borrowLendReserveState and
-  allBorrowLendReserveStates, with `"dex"` for builder-deployed dexes. `wsUrl` is anvil itself: a transaction sent over a
-  WebSocket reaches HyperCore at the next HTTP request or chainsim command. `describe
+  allBorrowLendReserveStates, with `"dex"` for builder-deployed dexes. `wsUrl` is the proxy too: a
+  transaction sent over a WebSocket is applied to HyperCore after its block, as over HTTP, and
+  `eth_subscribe` works as on anvil. `describe
   hyperevm-mainnet` lists the info request types and RPC methods the proxy serves, and in
   `limits` what HyperCore does not model.
 - On Sui, `selftest` has a `funding-health` part that fails when the funder or the USDC holder

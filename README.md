@@ -200,21 +200,25 @@ the same JSON contract and exit codes as every other chain.
   and a spot send back to a system address credits the EVM balance.
 - `set hypercore mirror <user>` copies a mainnet account's positions, margin and spot balances
   onto the copy, so a test starts from a real position and acts as that account with `send --as`.
-- `set hypercore price` moves a perp: positions reprice, resting orders the move crosses fill,
-  and accounts below maintenance margin are liquidated. `time --replay BTC --from <date> --to
+- `set hypercore price` moves a perp, and with `--spot` a spot pair: positions reprice on their
+  margin tiers, resting orders the move crosses fill, borrow and lend collateral follows its spot
+  and perp prices, and accounts below maintenance margin are liquidated. `time --replay BTC --from <date> --to
   <date>` plays a past stretch of mainnet candles as the price path.
 - Funding accrues every hour of the fork's clock, from mainnet's last rate or one set with `set
-  hypercore funding`, and every fill pays maker or taker fees.
+  hypercore funding`, HIP-3 perps use the HIP-3 premium formula on their book, and every fill
+  pays maker or taker fees.
 - `call hypercore_state <user>` returns an account's Core state in the info API's own shapes,
   with its fills, funding and liquidations, and `call corewriter_actions` shows each action with
   what it did.
-- An RPC proxy in front of the fork applies HyperCore after every block for any client, such as
-  forge, cast or a frontend, mines small and big blocks per sender, and serves the Hyperliquid
-  info API for the copy at `/info`.
+- An RPC proxy in front of the fork applies HyperCore after every block for any client, over HTTP
+  or WebSocket, such as forge, cast or a frontend, mines small and big blocks per sender, and
+  serves the Hyperliquid info API for the copy at `/info`.
 - Builder-deployed (HIP-3) perps trade on their own dex balance, with isolated margin where the
-  perp is isolated only, and borrow and lend supplies, borrows against collateral and accrues
-  interest, read back through `0x811` and `0x812`.
-- `hyperevm-testnet` forks HyperEVM Testnet with the same HyperCore features.
+  perp is isolated only and `set hypercore isolated-margin` to add or remove it, and borrow and
+  lend supplies, borrows against collateral, accrues interest and liquidates in 20% steps, read
+  back through `0x811` and `0x812`.
+- `hyperevm-testnet` forks HyperEVM Testnet with the same HyperCore features, PURR bridging both
+  ways included.
 - `snapshot` and `revert` carry Core state with the rest of the fork.
 
 ```sh

@@ -217,6 +217,11 @@ position on the copy, so margin and withdrawable answers follow it.
   [--isolated-raw-usd <n>] [--isolated]` sets a user's perp position in the copy's Core state.
   A negative `szi` is a short. Give the account perp USD first, with `spot-balance` and a USD
   class transfer, or the next price move or funding payment liquidates it.
+- `set <name> hypercore price <spot pair> <px> --spot` sets a spot pair's price (`0x808`), in its
+  raw units (8 minus the base token's szDecimals decimals). Borrow and lend collateral priced by
+  that pair follows it.
+- `set <name> hypercore isolated-margin <user> <perp> <+usd|-usd>` adds or removes USD margin on an
+  isolated position (see [HIP-3](#builder-deployed-perps-hip-3)).
 - `set <name> precompile <address> <calldata> --result <hex>` stores any other answer, for any
   precompile from `0x800` to `0x813`.
 
@@ -380,8 +385,10 @@ A test moves the market on the copy and watches what follows. Each move runs the
 1. The perp's mark and oracle prices take the new value, and every position reprices: unrealized
    PnL, margin used, withdrawable and the margin summary follow it.
 2. Resting orders the move crosses fill at their own limit price, as makers.
-3. Accounts whose account value falls below their maintenance margin are liquidated. The same
-   check runs after each funding payment.
+3. Borrow and lend collateral that follows the perp takes its new price.
+4. Accounts whose account value falls below their maintenance margin are liquidated, and borrow
+   and lend accounts past the portfolio margin ratio are liquidated in steps. The same check runs
+   after each funding payment and on every replayed candle.
 
 The rules follow Hyperliquid's documentation on
 [margining](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/margining),
@@ -390,8 +397,11 @@ The rules follow Hyperliquid's documentation on
 [fees](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees), simplified where the
 profile limits say:
 
-- Maintenance margin is half the initial margin at the perp's maximum leverage, so 1/80 of the
-  position's value for BTC at 40x.
+- Margin follows the perp's margin table from the info API meta. A position's tier is the one
+  whose lower bound is the highest at or below its notional. Maintenance margin is the notional
+  over twice the tier's max leverage, less the tier's maintenance deduction, so 1/80 of the
+  position's value for BTC at 40x up to 150,000,000 USD and 1/40 less 1,875,000 USD above it.
+  A table id below 50 is one tier at that leverage, as the info API lists only the others.
 - A liquidation closes every position of the account at the mark price and cancels its open
   orders. Collateral that remains stays with the account. A balance below zero is reset to zero,
   the loss the backstop liquidator takes on mainnet.
@@ -496,8 +506,13 @@ from the 2026-11-02 run:
 { "rpcUrl": "http://hyperevm-mainnet:8545", "wsUrl": "ws://hyperevm-mainnet-engine:8545", "hostRpcUrl": null }
 ```
 
-`wsUrl` is anvil's own address, since the proxy serves HTTP. A transaction sent over a
-WebSocket reaches HyperCore at the next HTTP request or chainsim command.
+`wsUrl` is the proxy as well (`ws://hyperevm-mainnet:8545`). Over a WebSocket, every request takes
+the same path as over HTTP, so a transaction sent there is mined into its own block and HyperCore
+catches up after it. `eth_subscribe` and `eth_unsubscribe` go to a socket of the client's own on
+anvil, so `newHeads`, `logs` and `newPendingTransactions` behave as on anvil. In the 2026-11-02 run,
+a `newHeads` subscription saw three blocks mined over the same socket, a CoreWriter IOC sent with
+`cast send --rpc-url ws://…` read back through `0x800` and `/info` at once, and `eth_chainId` took
+292 µs through the proxy against 133 µs on anvil's own socket.
 
 ### Any client
 
@@ -586,6 +601,16 @@ dex 1, so xyz:XYZ100 is perp 10000 and asset 110000.
 - Perps meta marks `onlyIsolated` hold isolated margin per position: the order's leverage sets
   the margin at open, liquidation checks the position against its own margin, and a loss past it
   stays off the dex balance.
+- `set hypercore isolated-margin <user> <perp> <+usd|-usd>` adds or removes margin on an isolated
+  position, as the exchange's `updateIsolatedMargin`. Adding takes the amount from the dex's
+  withdrawable balance. Removing must leave at least the larger of the initial margin and 10% of
+  the position's value.
+- Funding uses the HIP-3 premium: the mid of the impact bid and ask on the copy's book over the
+  oracle price, less 1. The hourly rate is the dex's funding multiplier times the premium plus
+  `clamp(interest rate - premium, -0.0005, 0.0005)`, over 8, capped at 4%. `perpDexs` gives each
+  perp's multiplier, interest rate (0.0001 unless set) and clamp at the time the perp is added.
+  Measured on mainnet: xyz:TSLA with premium -0.0001887542 and multiplier 0.5 pays 0.00000625.
+- Margin tiers come from the dex's own meta, as on the main dex.
 - `0x800` (uint16 perp) and `0x813` (uint32 perp) answer positions, `0x80f` takes the dex, and
   `/info` takes `"dex": "xyz"` for meta, metaAndAssetCtxs, clearinghouseState, openOrders and
   allMids. `call hypercore_state` lists builder dexes under `dexes`.
@@ -617,9 +642,17 @@ pages.
   supplied collateral, while the health factor (LTV-weighted collateral over borrowed value)
   stays at or above 1. A later credit of that token repays first.
 - Stablecoins accrue `0.05 + 4.75 * max(0, utilization - 0.8)` a year, indexed every hour of the
-  fork's clock, and suppliers earn it times utilization, less 10%. Past a 0.95 ratio between the
-  borrowed value and the collateral weighted by `0.5 + 0.5 * LTV`, the backstop takes collateral
-  at the oracle price.
+  fork's clock, and suppliers earn it times utilization, less 10%.
+- A collateral token's price is the median of its spot price against USDC, the mark and the
+  oracle price of the perp on the same asset (UBTC follows BTC). `set hypercore price 159 <px>`
+  on the HYPE perp and `set hypercore price 107 <px> --spot` on HYPE/USDC both move HYPE
+  collateral. Measured on mainnet: the UBTC reserve price followed the UBTC/USDC spot mark, the
+  middle of the three.
+- The portfolio margin ratio for a borrowed token is (20 USDC + the cross maintenance margin of
+  every dex + the borrowed value) over (the token's balance, with the account value of the dexes
+  it margins, + the supplied collateral times its price times `0.5 + 0.5 * LTV`). Past 0.95 the
+  backstop at `0xbbbb…bbbb` takes 20% of each collateral at a time, at its price, against the
+  borrows, until the ratio is back at or below 0.95.
 - `0x811` answers a user's borrow and supply (basis and value, token wei) and `0x812` a reserve
   (rates and utilization in bps, oracle price, LTV, totals). `/info` answers borrowLendUserState,
   borrowLendReserveState and allBorrowLendReserveStates, and `set hypercore mirror` copies a
@@ -630,6 +663,12 @@ it did not hold. `0x811` read a USDC borrow of 10,000,000,000 wei and 10 HYPE su
 showed USDC's total borrowed up by the same amount, and after `time --advance 7200` the borrow read
 10,000,114,154 wei, two hours at 5% a year. A mirror of a mainnet portfolio margin account copied
 its 3 borrow and lend tokens.
+
+In another 2026-11-02 run, a wallet supplied 10 HYPE at 86.128 and borrowed 473 USDC. HYPE at 85%
+of that left it healthy. At 65% the backstop took 6 HYPE in three steps, worth 335.8992 USD, and
+`0x811` and borrowLendUserState read 4 HYPE supplied and 137.1008 USDC borrowed. On xyz:HOOD, an
+isolated long took 50 USD of added margin, `0x813` read the margin back, and a CoreWriter close
+returned it to the xyz balance.
 
 ## HyperEVM testnet
 

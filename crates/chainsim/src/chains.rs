@@ -42,7 +42,7 @@ pub fn feature_rows() -> Vec<(String, String)> {
         rows.push((format!("set.{}", kind.name()), format!("set {}", kind.name())));
     }
     rows.push(("set.hypercore".into(), "set hypercore".into()));
-    for (k, l) in [("hypercoreBook", "set hypercore book"), ("hypercoreMirror", "set hypercore mirror"), ("hypercoreFunding", "set hypercore funding"), ("hypercoreBigBlocks", "set hypercore big-blocks"), ("hypercoreState", "call hypercore_state"), ("infoApi", "info API (/info)")] {
+    for (k, l) in [("hypercoreBook", "set hypercore book"), ("hypercoreMirror", "set hypercore mirror"), ("hypercoreFunding", "set hypercore funding"), ("hypercoreBigBlocks", "set hypercore big-blocks"), ("hypercoreSpotPrice", "set hypercore price --spot"), ("hypercoreIsolatedMargin", "set hypercore isolated-margin"), ("hypercoreState", "call hypercore_state"), ("infoApi", "info API (/info)")] {
         rows.push((k.into(), l.into()));
     }
     for (k, l) in [("snapshotRevert", "snapshot, revert"), ("time", "time"), ("timeReplay", "time --replay"), ("mine", "mine"), ("call", "call"), ("selftest", "selftest")] {
@@ -74,6 +74,8 @@ fn features(p: &Profile) -> Value {
         "hypercoreMirror": core,
         "hypercoreFunding": core,
         "hypercoreBigBlocks": core,
+        "hypercoreSpotPrice": core,
+        "hypercoreIsolatedMargin": core,
         "infoApi": core,
         "hypercoreState": core && has("call"),
         "snapshotRevert": has("snapshot") && has("revert"),
@@ -162,7 +164,7 @@ mod tests {
             let want = c["chain"] == "hyperevm-mainnet" || c["chain"] == "hyperevm-testnet";
             assert_eq!(c["features"]["set"]["precompile"], json!(want), "{}", c["chain"]);
             assert_eq!(c["features"]["set"]["hypercore"], json!(want), "{}", c["chain"]);
-            for k in ["hypercoreBook", "hypercoreMirror", "hypercoreFunding", "hypercoreBigBlocks", "hypercoreState", "infoApi", "timeReplay"] {
+            for k in ["hypercoreBook", "hypercoreMirror", "hypercoreFunding", "hypercoreBigBlocks", "hypercoreSpotPrice", "hypercoreIsolatedMargin", "hypercoreState", "infoApi", "timeReplay"] {
                 assert_eq!(c["features"][k], json!(want), "{k} on {}", c["chain"]);
             }
         }

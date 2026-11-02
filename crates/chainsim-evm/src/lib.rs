@@ -55,7 +55,7 @@ const MINING_METHODS: &[&str] = &["eth_sendTransaction", "eth_sendRawTransaction
 /// The `call` methods chainsim answers itself on HyperEVM.
 pub const HYPERCORE_CALLS: &[&str] = &["corewriter_actions", "hypercore_state"];
 /// The `set hypercore` helpers.
-pub const HYPERCORE_SETS: &[&str] = &["price", "spot-balance", "position", "book", "mirror", "funding", "big-blocks"];
+pub const HYPERCORE_SETS: &[&str] = &["price", "spot-balance", "position", "book", "mirror", "funding", "big-blocks", "isolated-margin"];
 /// The info API request types the HyperEVM proxy answers at `/info`.
 pub const HYPERCORE_INFO: &[&str] = &[
     "clearinghouseState", "spotClearinghouseState", "openOrders", "userFills", "meta", "metaAndAssetCtxs", "l2Book", "allMids",
