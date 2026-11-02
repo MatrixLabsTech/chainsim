@@ -52,12 +52,12 @@
           "amd64": {
             "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/sui-fork-chainsim-mainnet-v1.82.3-de683df9e4e0/sui-fork-mainnet-v1.82.3-de683df9e4e0-linux-amd64.tar.gz",
             "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/sui-fork-chainsim-mainnet-v1.82.3-de683df9e4e0/sui-fork-mainnet-v1.82.3-de683df9e4e0-linux-amd64.tar.gz.sha256",
-            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+            "sha256": "646e221bb57be5a62e8da87b38cc479b95369489a02dcc56ec0c95787a650f84"
           },
           "arm64": {
             "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/sui-fork-chainsim-mainnet-v1.82.3-de683df9e4e0/sui-fork-mainnet-v1.82.3-de683df9e4e0-linux-arm64.tar.gz",
             "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/sui-fork-chainsim-mainnet-v1.82.3-de683df9e4e0/sui-fork-mainnet-v1.82.3-de683df9e4e0-linux-arm64.tar.gz.sha256",
-            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+            "sha256": "78e104f90cafd8b948c37a136aa468fcfaa1e76c7434a24443c6f32d1ff7001e"
           }
         },
         "source": {
