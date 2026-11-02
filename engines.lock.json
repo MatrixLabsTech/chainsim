@@ -118,22 +118,22 @@
     },
     "hyperevm-proxy": {
       "name": "chainsim HyperEVM proxy",
-      "version": "0.1.7-91525609f3a4",
+      "version": "0.1.7-c83535863c73",
       "user": "10001:10001",
       "build": {
-        "image": "chainsim/hyperevm-proxy:0.1.7-91525609f3a4",
+        "image": "chainsim/hyperevm-proxy:0.1.7-c83535863c73",
         "context": "hyperevm-proxy",
         "base": "debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3",
         "tarballs": {
           "amd64": {
-            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.7-91525609f3a4/hyperevm-proxy-0.1.7-91525609f3a4-linux-amd64.tar.gz",
-            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.7-91525609f3a4/hyperevm-proxy-0.1.7-91525609f3a4-linux-amd64.tar.gz.sha256",
-            "sha256": "1cda54f23082d3fe991b3614d2e47800ba6f578ddc665c331b998cd35b415a05"
+            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.7-c83535863c73/hyperevm-proxy-0.1.7-c83535863c73-linux-amd64.tar.gz",
+            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.7-c83535863c73/hyperevm-proxy-0.1.7-c83535863c73-linux-amd64.tar.gz.sha256",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
           },
           "arm64": {
-            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.7-91525609f3a4/hyperevm-proxy-0.1.7-91525609f3a4-linux-arm64.tar.gz",
-            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.7-91525609f3a4/hyperevm-proxy-0.1.7-91525609f3a4-linux-arm64.tar.gz.sha256",
-            "sha256": "db7c622c73df334d499bdb99003bbc6385fefb5e38b73768fc4640ae79c14cfc"
+            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.7-c83535863c73/hyperevm-proxy-0.1.7-c83535863c73-linux-arm64.tar.gz",
+            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.7-c83535863c73/hyperevm-proxy-0.1.7-c83535863c73-linux-arm64.tar.gz.sha256",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
           }
         }
       }
