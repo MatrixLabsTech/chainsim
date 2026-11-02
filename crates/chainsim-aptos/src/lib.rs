@@ -50,6 +50,7 @@ const GAS_TOP_UP: u64 = OCTAS;
 const MAX_MINE: u64 = 100;
 const ACCOUNT: &str = "0x1::account::Account";
 const FA_METADATA: &str = "0x1::fungible_asset::Metadata";
+const OBJECT_GROUP: &str = "0x1::object::ObjectGroup";
 
 /// A throwaway receiver for the selftest transfer, never active on mainnet.
 const ST_RECEIVER: &str = "0xc5e2";
@@ -793,13 +794,29 @@ impl Adapter for AptosAdapter {
                     return Err(Error::new(ErrorCode::Usage, "--bcs is empty"));
                 }
                 let tag = canonical_struct_tag(struct_tag)?;
-                let before = s.resource(&who, &tag).await?;
-                s.write_delta(&[(key, state_value_hex(&bytes))]).await?;
-                let read = s.resource(&who, &tag).await?;
-                if read.is_null() || (read == before && !before.is_null()) {
-                    return Err(Error::new(ErrorCode::ReadbackMismatch, format!("{tag} at {who} did not read back the new value: a member of a resource group, such as an object or fungible store resource, is stored in its group and cannot be set this way"))
-                        .next(format!("chainsim send {name} --as <address> --to '<its module's function>' changes it through its module")));
+                // A member of a resource group lives inside its group's state value, so a
+                // plain write would read back on the session but never reach the VM.
+                let group = s.cli("view-resource-group 0x1::object::ObjectGroup", &["move", "sim", "view-resource-group", "--session", SESSION, "--account", &who, "--resource-group", OBJECT_GROUP]).await?;
+                if group.as_object().is_some_and(|g| g.contains_key(&tag)) {
+                    return Err(Error::unsupported(
+                        &format!("set resource on {tag}, a member of {OBJECT_GROUP} at {who},"),
+                        format!("chainsim send {name} --as <address> --to '<its module's function>' changes it through its module"),
+                    ));
                 }
+                // Keep the delta, so bytes that do not decode as the resource leave the copy as it was.
+                let backup = s.exec(vec!["sh".into(), "-c".into(), format!("exec 9>{LOCK}; flock 9; cp {SESSION}/delta.json {DATA}/delta.bak")]).await?;
+                if backup.exit_code != 0 {
+                    return Err(Error::new(ErrorCode::EngineFailed, "could not keep a copy of the session delta"));
+                }
+                s.write_delta(&[(key, state_value_hex(&bytes))]).await?;
+                let read = match s.resource(&who, &tag).await {
+                    Ok(v) if !v.is_null() => v,
+                    other => {
+                        s.exec(vec!["sh".into(), "-c".into(), format!("exec 9>{LOCK}; flock 9; mv {DATA}/delta.bak {SESSION}/delta.json")]).await?;
+                        let why = other.err().map(|e| e.message).unwrap_or_else(|| "it reads back empty".into());
+                        return Err(Error::new(ErrorCode::Usage, format!("--bcs is not a valid {tag}, so the copy was left as it was: {why}")));
+                    }
+                };
                 (
                     json!({ "kind": "resource", "address": who, "structTag": tag, "value": read }),
                     json!({ "kind": "set-resource", "address": who, "structTag": tag, "bytes": bytes.len() }),

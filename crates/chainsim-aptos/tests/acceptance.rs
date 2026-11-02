@@ -138,7 +138,11 @@ async fn aptos_mainnet() {
     assert_eq!(set["value"]["sequence_number"], "0");
     // A member of a resource group does not take a plain write.
     let group = a.set(name, &SetRequest { kind: SetKind::Resource { struct_tag: "0x1::fungible_asset::Metadata".into(), bcs: "00".into() }, address: USDC.into(), value: String::new() }).await.unwrap_err();
-    assert_eq!(group.code, ErrorCode::ReadbackMismatch, "{group:?}");
+    assert_eq!(group.code, ErrorCode::Unsupported, "{group:?}");
+    // Bytes that do not decode leave the copy as it was.
+    let bad = a.set(name, &SetRequest { kind: SetKind::Resource { struct_tag: "0x1::account::Account".into(), bcs: "00".into() }, address: other.clone(), value: String::new() }).await.unwrap_err();
+    assert_eq!(bad.code, ErrorCode::Usage, "{bad:?}");
+    assert_eq!(a.call(name, "resource", json!([other, "0x1::account::Account"]), None).await.unwrap()["authentication_key"], format!("0x{}", "09".repeat(32)));
 
     // snapshot, a transfer, revert: the balances come back.
     let before = (usdc(&a, name, &me).await, usdc(&a, name, HOLDER).await);
