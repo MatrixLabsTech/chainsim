@@ -245,32 +245,35 @@ enum HyperCoreWhat {
         #[arg(long)]
         isolated: bool,
     },
+    /// Refresh one perp's order book on the copy from the Hyperliquid info API.
+    Book {
+        /// The perp, by name (BTC) or index (0).
+        coin: String,
+        /// Read the book from the info API now (the only source).
+        #[arg(long, required = true)]
+        live: bool,
+    },
+    /// Copy a mainnet account's HyperCore state and EVM balances onto the copy.
+    Mirror { user: String },
 }
 
-/// `set hypercore`: one `set precompile` per answer the helper encodes.
+/// `set hypercore`: a change to the copy's local HyperCore state.
 async fn set_hypercore(name: &str, what: HyperCoreWhat) -> Result<Value> {
-    use chainsim_evm::hypercore;
-    use chainsim_evm::units::parse_address;
-    let (helper, entries) = match what {
-        HyperCoreWhat::Price { perp, px } => ("price", hypercore::price(perp, px)),
-        HyperCoreWhat::SpotBalance { user, token, total, hold, entry_ntl } => ("spot-balance", vec![hypercore::spot_balance(parse_address(&user)?, token, total, hold, entry_ntl)]),
-        HyperCoreWhat::Position { user, perp, szi, entry_ntl, leverage, isolated_raw_usd, isolated } => {
-            let p = hypercore::Position { szi, entry_ntl, isolated_raw_usd, leverage, is_isolated: isolated };
-            ("position", vec![hypercore::position(parse_address(&user)?, perp, p)])
-        }
-    };
-    let adapter = adapter_of(name).await?;
-    let mut sets = Vec::new();
-    for e in entries {
-        let hex = hypercore::to_hex;
-        let req = SetRequest { kind: SetKind::Precompile { calldata: hex(&e.calldata), result: Some(hex(&e.result)) }, address: hypercore::address(e.precompile), value: String::new() };
-        let mut out = adapter.set(name, &req).await?;
-        if let Some(o) = out.as_object_mut() {
-            o.remove("note");
-        }
-        sets.push(out);
+    use chainsim_evm::CoreOp;
+    let docker = Docker::connect().await?;
+    let handle = docker.find(name).await?.ok_or_else(|| Error::fork_not_found(name))?;
+    let profile = profile::get(&handle.chain)?;
+    if profile.family != "evm" {
+        return Err(Error::unsupported(&format!("set hypercore on {}", profile.key), "only HyperEVM has HyperCore"));
     }
-    Ok(json!({ "kind": "hypercore", "helper": helper, "sets": sets, "note": chainsim_core::mods::NOTE }))
+    let op = match what {
+        HyperCoreWhat::Price { perp, px } => CoreOp::Price { perp, px },
+        HyperCoreWhat::SpotBalance { user, token, total, hold, entry_ntl } => CoreOp::SpotBalance { user, token, total, hold, entry_ntl },
+        HyperCoreWhat::Position { user, perp, szi, entry_ntl, leverage, isolated_raw_usd, isolated } => CoreOp::Position { user, perp, szi, entry_ntl, leverage, isolated_raw_usd, isolated },
+        HyperCoreWhat::Book { coin, live: _ } => CoreOp::Book { coin },
+        HyperCoreWhat::Mirror { user } => CoreOp::Mirror { user },
+    };
+    EvmAdapter::connect().await?.hypercore(name, op).await
 }
 
 /// The adapter for a profile family.
@@ -307,7 +310,10 @@ fn describe_profile(p: &Profile, lock: &EngineLock) -> Value {
         "native": p.native,
         "tokens": p.tokens,
         "overrides": p.overrides.iter().map(|o| json!({ "kind": o.kind, "target": o.target, "note": o.note })).collect::<Vec<_>>(),
-        "hypercore": p.hypercore,
+        "hypercore": p.hypercore.as_ref().map(|h| json!({
+            "perps": h.perps, "tokens": h.tokens, "spots": h.spots,
+            "set": chainsim_evm::HYPERCORE_SETS, "call": chainsim_evm::HYPERCORE_CALLS,
+        })),
         "limits": p.limits,
     })
 }
@@ -335,7 +341,7 @@ fn describe(chain: Option<&str>) -> Result<Value> {
             "revert <name> <id>",
             "call <name> <method> [<params-json>] [--from <address>]  (HyperEVM: call <name> corewriter_actions [{\"fromBlock\": <n>}])",
             "send <name> --as <address> --to <address> (--sig \"<fn(types)>\" [<arg>...] | --data <hex>) [--value <amount>]",
-            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex> | precompile <address> <calldata hex> (--result <hex> | --live) | hypercore (price <perp> <px> | spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>] | position <user> <perp> <szi> <entryNtl> [--leverage <n>] [--isolated-raw-usd <n>] [--isolated])",
+            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex> | precompile <address> <calldata hex> (--result <hex> | --live) | hypercore (price <perp> <px> | spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>] | position <user> <perp> <szi> <entryNtl> [--leverage <n>] [--isolated-raw-usd <n>] [--isolated] | book <coin> --live | mirror <user>)",
             "time <name> (--advance <seconds> | --to <unix seconds>)",
             "mine <name> [--blocks <n>]",
             "selftest <name>",
@@ -528,6 +534,8 @@ async fn run(command: Command) -> Result<Value> {
         Command::Revert { name, id } => to_value(adapter_of(&name).await?.revert(&name, &id).await),
         Command::Call { name, method, params, from } => {
             let params: Value = match params {
+                // hypercore_state takes a bare address as well as a JSON array.
+                Some(p) if method == "hypercore_state" && p.trim_start().starts_with("0x") => json!([p.trim()]),
                 Some(p) => serde_json::from_str(&p).map_err(|e| Error::new(ErrorCode::Usage, format!("params are not JSON: {e}")))?,
                 None => json!([]),
             };

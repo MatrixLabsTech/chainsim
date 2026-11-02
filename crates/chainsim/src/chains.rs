@@ -42,6 +42,9 @@ pub fn feature_rows() -> Vec<(String, String)> {
         rows.push((format!("set.{}", kind.name()), format!("set {}", kind.name())));
     }
     rows.push(("set.hypercore".into(), "set hypercore".into()));
+    for (k, l) in [("hypercoreBook", "set hypercore book"), ("hypercoreMirror", "set hypercore mirror"), ("hypercoreState", "call hypercore_state")] {
+        rows.push((k.into(), l.into()));
+    }
     for (k, l) in [("snapshotRevert", "snapshot, revert"), ("time", "time"), ("mine", "mine"), ("call", "call"), ("selftest", "selftest")] {
         rows.push((k.into(), l.into()));
     }
@@ -59,12 +62,17 @@ fn features(p: &Profile) -> Value {
     // `set hypercore` encodes answers for `set precompile`.
     let precompile = set["precompile"].clone();
     set.insert("hypercore".into(), precompile);
+    // The local HyperCore: on HyperEVM only.
+    let core = has("set") && p.hypercore.is_some();
     json!({
         "up": has("up"),
         "fundNative": has("fund") && p.native.is_some(),
         "fundTokens": has("fund") && !p.tokens.is_empty(),
         "sendAs": has("send"),
         "set": set,
+        "hypercoreBook": core,
+        "hypercoreMirror": core,
+        "hypercoreState": core && has("call"),
         "snapshotRevert": has("snapshot") && has("revert"),
         "time": has("time"),
         "mine": has("mine"),
@@ -150,6 +158,9 @@ mod tests {
             let want = c["chain"] == "hyperevm-mainnet";
             assert_eq!(c["features"]["set"]["precompile"], json!(want), "{}", c["chain"]);
             assert_eq!(c["features"]["set"]["hypercore"], json!(want), "{}", c["chain"]);
+            for k in ["hypercoreBook", "hypercoreMirror", "hypercoreState"] {
+                assert_eq!(c["features"][k], json!(want), "{k} on {}", c["chain"]);
+            }
         }
         assert_eq!(chain(&d, "robinhood-mainnet")["engine"], "Foundry anvil v1.8.5");
     }
