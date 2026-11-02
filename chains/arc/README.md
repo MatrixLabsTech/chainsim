@@ -94,24 +94,3 @@ The Ethereum checks (`block`, `block-time`, `native-transfer`, `token-transfer` 
 chainsim selftest arc-mainnet
 chainsim down arc-mainnet
 ```
-
-## Limits
-
-The profile's `limits`, as `describe` and the `fork` object print them:
-
-- Transactions confirm on the copy only and never appear on Arc mainnet or its explorer.
-- The copy keeps chain id 5042, so a transaction signed for it is also valid on Arc mainnet. Use
-  test keys that hold no mainnet assets.
-- USDC is the native gas token with 18 decimals, and the USDC ERC-20 is a 6-decimal view of
-  the same balance.
-- arc-foundry v0.8.0-2 runs Arc's own USDC system contract and precompiles. It is built on an
-  older Foundry than v1.8.5, so some newer anvil RPC methods may be missing.
-- Accounts and storage the copy has not written are read from the upstream at the fork block
-  on first access, so the first read of each account is slower and depends on the upstream's
-  rate limit.
-- The `--gas-limit` and `--disable-block-gas-limit` options are not available, and there are no
-  blob transactions.
-- App indexers and explorers read the public chain, so they do not show what happens on the
-  copy.
-- An old `--block` needs an archive upstream: set `CHAINSIM_ARC_MAINNET_RPC` to an archive
-  provider URL to fork far behind the head.

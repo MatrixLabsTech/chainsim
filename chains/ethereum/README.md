@@ -99,21 +99,3 @@ leaves no trace:
 chainsim selftest ethereum-mainnet
 chainsim down ethereum-mainnet
 ```
-
-## Limits
-
-The profile's `limits`, as `describe` and the `fork` object print them:
-
-- Transactions confirm on the copy only and never appear on Ethereum mainnet or its explorers.
-- The copy keeps chain id 1, so a transaction signed for it is also valid on mainnet. Use test
-  keys that hold no mainnet assets.
-- Blocks are mined on demand, not every 12 seconds, and there is no beacon chain, blob data or
-  MEV.
-- Accounts and storage the copy has not written are read from the upstream at the fork block
-  on first access, so the first read of each account is slower and depends on the upstream's
-  rate limit.
-- The default upstream is a public endpoint that rate-limits bursts. Set
-  `CHAINSIM_ETHEREUM_MAINNET_RPC` to a provider URL for heavier runs.
-- App indexers and explorers read the public chain, so they do not show what happens on the
-  copy.
-- An old `--block` needs an archive upstream.

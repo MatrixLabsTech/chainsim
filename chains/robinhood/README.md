@@ -104,26 +104,3 @@ The Ethereum checks (`block`, `block-time`, `native-transfer`, `token-transfer` 
 chainsim selftest robinhood-mainnet
 chainsim down robinhood-mainnet
 ```
-
-## Limits
-
-The profile's `limits`, as `describe` and the `fork` object print them:
-
-- Transactions confirm on the copy only and never appear on Robinhood Chain or its explorers.
-- The copy keeps chain id 4663, so a transaction signed for it is also valid on Robinhood
-  Chain. Use test keys that hold no mainnet assets.
-- anvil answers ArbSys at `0x64` with Arbitrum block numbers, and mines blocks on demand
-  instead of following the sequencer.
-- ArbGasInfo at `0x6C` is a chainsim mock with fixed values measured on 2026-10-10 at block
-  85104168, so gas prices do not move with the chain. Functions outside the common pricing
-  getters revert.
-- There is no L1 data fee, so gas costs and estimates on the copy are lower than on the chain.
-  Retryable tickets and L1-to-L2 address aliasing do not exist on the copy.
-- Accounts and storage the copy has not written are read from the upstream at the fork block
-  on first access, so the first read of each account is slower and depends on the upstream's
-  rate limit.
-- The default upstream is rate-limited. Set `CHAINSIM_ROBINHOOD_MAINNET_RPC` to a provider URL
-  for heavier runs.
-- An old `--block` needs an archive upstream.
-- App indexers and explorers read the public chain, so they do not show what happens on the
-  copy.

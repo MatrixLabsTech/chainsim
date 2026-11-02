@@ -3,13 +3,8 @@
 # Sui
 
 chainsim runs a private copy of Sui Mainnet in Docker as the chain `sui-mainnet`. This page covers
-what differs from the EVM chains: the engine, how each command works on Sui, and what the copy
-cannot do. The commands and their JSON output are the same as on every chain. The
+what differs from the EVM chains: the engine and how each command works on Sui. The commands and their JSON output are the same as on every chain. The
 [README](../../README.md) covers the shared workflow.
-
-The limits listed here are a summary. The source of truth is the `limits` list in
-[`profiles/sui-mainnet.json`](../../profiles/sui-mainnet.json), which `chainsim describe sui-mainnet`
-and every fork object report word for word.
 
 ## What chainsim solves here
 
@@ -25,21 +20,6 @@ and every fork object report word for word.
 - Some state no transaction can reach, such as a protocol config that only an upgrade changes.
   chainsim builds its Sui engine with one added call that writes an object's contents, and
   `set object` decodes the object's fields so you name a field and its new value.
-
-## Maturity: experimental
-
-`describe` and the fork object report `"maturity": "experimental"`. The engine is a build of
-Mysten's `sui-fork`, which Mysten marks highly experimental, and the copy differs from Sui Mainnet in ways
-the EVM forks do not:
-
-- Transactions run one at a time, one per checkpoint, so runs are slow and cannot run in parallel.
-- The copy serves Sui gRPC only. It serves no JSON-RPC and no GraphQL, so apps that read through
-  GraphQL cannot run against it, and it has no CORS layer for a browser app.
-- The Clock (`0x6`) does not move unless you advance it.
-- There is no gas estimation and no dry run: every transaction names its gas budget, and a failed
-  transaction still executes and uses gas.
-- Sui signatures do not bind to a chain, so a transaction signed for the copy is also valid on
-  Sui Mainnet. Use test keys that hold no mainnet assets.
 
 ## Engine
 
@@ -110,8 +90,8 @@ The copy reads Sui Mainnet state from a GraphQL service, not from a full node:
 
 - The default is Mysten's public endpoint, `https://graphql.mainnet.sui.io/graphql`.
 - Set `CHAINSIM_SUI_MAINNET_GRAPHQL` to a provider's GraphQL URL to use it instead. chainsim keeps
-  the URL in the environment only, and removes it and its host from every message. The public
-  endpoint rate-limits, so heavier runs should use a provider.
+  the URL in the environment only, and removes it and its host from every message.
+  Use a provider URL for heavier runs.
 - An upstream failure exits 5, and `next` names `CHAINSIM_SUI_MAINNET_GRAPHQL`.
 - Objects load from the upstream on first use, so the first read of each object is slower.
 - With a provider URL, `sui-fork` treats the chain as unknown instead of mainnet (inferred from its

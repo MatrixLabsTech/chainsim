@@ -46,19 +46,21 @@ on every supported chain.
 
 ## Features
 
-- One CLI for Ethereum, Arc, Robinhood Chain, Sui and Aptos mainnet forks, each running in Docker.
-- One-line install from GitHub releases for Linux and macOS, and `chainsim doctor` to check the
-  setup: Docker, engines, plugin and upstreams.
-- `send --as` acts as any account without its key, including a protocol's admin.
-- `set` overrides state directly: balance, token, storage, code, owner, a Sui object's fields or an
-  Aptos resource, as each chain supports.
-- `time` and `mine` move a fork's clock and produce blocks, on chains whose engine supports them.
-- `fund` gives a test wallet native and token balances and reads them back.
-- `snapshot` and `revert` reset a fork between scenarios.
+- One command set for Ethereum, Arc, Robinhood Chain, Sui and Aptos mainnet forks, each running
+  in Docker, with the same JSON envelope and exit codes on every chain.
+- `send --as` sends as any account without its key on every chain, including a protocol's
+  admin. On Sui and Aptos, chainsim handles the Move authentication for you.
+- `fund` gives a test wallet native and token balances by symbol and reads them back, with no
+  balance slots, coin objects or fungible stores to look up.
+- `snapshot` and `revert` reset a fork between scenarios on every chain, Sui and Aptos included.
+- `set` overrides state directly: balance, token, storage, code and owner, a Sui object's
+  fields, or an Aptos resource.
 - `selftest` proves a fork is fit before a test spends anything on it.
 - Arc runs on Circle's own engine, so native USDC behaves as on Arc.
 - Robinhood Chain answers Arbitrum's ArbSys and ArbGasInfo precompiles.
 - JSON output, fixed exit codes and `error.next`, so an agent can branch on every result.
+- One-line install from GitHub releases for Linux and macOS, and `chainsim doctor` to check the
+  setup: Docker, engines, plugin and upstreams.
 - A Claude Code and Codex plugin, installed straight from GitHub, teaches agents the setup and
   the workflow.
 - Forks publish no host ports by default, and provider keys never appear in output.
@@ -126,25 +128,23 @@ the fork with `--publish`.
   results depend on a change mainnet would not allow.
 - The Claude Code and Codex plugin adds a skill that starts with a setup check through
   `chainsim doctor`, then walks through up, selftest, fund, snapshot and revert, and cleanup.
-- Codex's default sandbox blocks the Docker socket, so in Codex chainsim runs outside it after
-  an escalation.
 
 The full contract, with every error code, is in [docs/agent-contract.md](docs/agent-contract.md).
 
 ## Supported chains
 
-| Chain | Maturity | Engine | Details |
-| --- | --- | --- | --- |
-| <img src="assets/chains/ethereum.svg" height="32" alt="Ethereum"> &nbsp;**Ethereum mainnet** | stable | Foundry anvil v1.8.5 | [chains/ethereum](chains/ethereum/README.md) |
-| <img src="assets/chains/arc.svg" height="32" alt="Arc"> &nbsp;**Arc mainnet** | stable | Circle arc-foundry v0.8.0-2 | [chains/arc](chains/arc/README.md) |
-| <img src="assets/chains/robinhood-chain.png" height="32" alt="Robinhood Chain"> &nbsp;**Robinhood Chain mainnet** | stable | Foundry anvil v1.8.5 with an ArbGasInfo mock | [chains/robinhood](chains/robinhood/README.md) |
-| <img src="assets/chains/sui.svg" height="32" alt="Sui"> &nbsp;**Sui mainnet** | experimental | Mysten sui-fork mainnet-v1.81.1, built with chainsim's SetObject patch | [chains/sui](chains/sui/README.md) |
-| <img src="assets/chains/aptos.svg" height="32" alt="Aptos"> &nbsp;**Aptos mainnet** | experimental | Aptos CLI 9.6.0 simulation sessions | [chains/aptos](chains/aptos/README.md) |
+| Chain | Engine | Details |
+| --- | --- | --- |
+| <img src="assets/chains/ethereum.svg" height="32" alt="Ethereum"> &nbsp;**Ethereum mainnet** | Foundry anvil v1.8.5 | [chains/ethereum](chains/ethereum/README.md) |
+| <img src="assets/chains/arc.svg" height="32" alt="Arc"> &nbsp;**Arc mainnet** | Circle arc-foundry v0.8.0-2 | [chains/arc](chains/arc/README.md) |
+| <img src="assets/chains/robinhood-chain.png" height="32" alt="Robinhood Chain"> &nbsp;**Robinhood Chain mainnet** | Foundry anvil v1.8.5 with an ArbGasInfo mock | [chains/robinhood](chains/robinhood/README.md) |
+| <img src="assets/chains/sui.svg" height="32" alt="Sui"> &nbsp;**Sui mainnet** | Mysten sui-fork mainnet-v1.81.1, built with chainsim's SetObject patch | [chains/sui](chains/sui/README.md) |
+| <img src="assets/chains/aptos.svg" height="32" alt="Aptos"> &nbsp;**Aptos mainnet** | Aptos CLI 9.6.0 simulation sessions | [chains/aptos](chains/aptos/README.md) |
 
 The chain logos are trademarks of their owners and identify the chains only.
 
 Each chain page says what is specific to it: engine, tokens, funding, `send` and `set` support,
-selftest checks and limits. `chainsim describe` prints the same list from the binary.
+and selftest checks. `chainsim describe` prints the same from the binary.
 
 ## Aptos
 
@@ -197,10 +197,8 @@ on `PATH`, and prints a suggested Claude Code permission rule.
   </picture>
 </a>
 
-chainsim is built as the chain engine for [DeepQA](https://deepqa.app), MatrixLabs' agentic QA
-workflow for dApps, and MatrixLabs maintains it. DeepQA is moving its on-chain test runs onto
-chainsim forks. On Arc, the native USDC that chainsim's engine runs lets DeepQA's runner drop
-the testing-only USDC stand-in and balance-sync process it uses today.
+chainsim is maintained by MatrixLabs and is the chain engine behind [DeepQA](https://deepqa.app),
+MatrixLabs' agentic QA workflow for dApps.
 
 ## Documentation
 
