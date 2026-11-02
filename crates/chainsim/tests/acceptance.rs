@@ -1151,6 +1151,92 @@ fn hyperevm_websocket() {
     println!("whole run: {:.1} s", started.elapsed().as_secs_f64());
 }
 
+/// Waits of an eth_blockNumber request every 50 ms from another container
+/// while `run` runs, in ms, sorted.
+fn probe_waits(network: &str, rpc: &str, probe: &str, run: impl FnOnce()) -> Vec<f64> {
+    let _ = Command::new("docker").args(["rm", "-f", probe]).output();
+    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": [] }).to_string();
+    let script = format!("while true; do curl -s -o /dev/null -w '%{{time_total}}\\n' -X POST -H 'content-type: application/json' --data-raw '{body}' {rpc}; sleep 0.05; done");
+    docker(&["run", "-d", "--name", probe, "--network", network, "--entrypoint", "sh", CURL, "-c", &script]);
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    run();
+    let logs = docker(&["logs", probe]);
+    docker(&["rm", "-f", probe]);
+    let mut ms: Vec<f64> = logs.lines().filter_map(|l| l.trim().parse::<f64>().ok()).map(|s| s * 1000.0).collect();
+    ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    ms
+}
+
+fn wait_summary(ms: &[f64]) -> String {
+    let pct = |p: f64| ms[((ms.len() - 1) as f64 * p) as usize];
+    format!("{} requests, p50 {:.1} ms, p95 {:.1} ms, max {:.1} ms", ms.len(), pct(0.5), pct(0.95), ms[ms.len() - 1])
+}
+
+#[test]
+#[ignore]
+fn hyperevm_replay_releases_the_lease_per_candle() {
+    use chainsim_evm::hypercore::{encode_action, word_addr, word_u};
+    let name = "acc-lease";
+    chainsim(&["down", name]);
+    let started = Instant::now();
+    let fork = ok(&["up", "hyperevm-mainnet", "--name", name]);
+    let (network, rpc) = (fork["network"].as_str().unwrap().to_string(), fork["rpcUrl"].as_str().unwrap().to_string());
+    ok(&["set", name, "balance", ADDR_A, "10"]);
+    ok(&["set", name, "hypercore", "spot-balance", ADDR_A, "0", "100000000000"]);
+    let to = fresh_address(18);
+
+    // A client polls during a day of BTC candles, and A sends 1 USDC on Core while the replay runs.
+    let day = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / 86_400;
+    let (from, until) = (((day - 2) * 86_400).to_string(), ((day - 1) * 86_400).to_string());
+    let (mut replay, mut took, mut sent) = (Value::Null, 0.0, Value::Null);
+    let ms = probe_waits(&network, &rpc, &format!("chainsim-{name}-probe"), || {
+        std::thread::scope(|s| {
+            let send = s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                cast_action(&network, &rpc, KEY_A, &encode_action(6, &[word_addr(to.parse().unwrap()), word_u(0), word_u(100_000_000)].concat()))
+            });
+            let t = Instant::now();
+            replay = ok(&["time", name, "--replay", "BTC", "--from", &from, "--to", &until]);
+            took = t.elapsed().as_secs_f64();
+            sent = send.join().unwrap();
+        });
+    });
+    println!("replay: {took:.1} s, {replay}");
+    println!("eth_blockNumber during the replay: {}", wait_summary(&ms));
+    assert!(ms.len() > 20, "{} probes", ms.len());
+    assert!(ms[ms.len() - 1] < 1000.0, "a request waited {:.0} ms during the replay", ms[ms.len() - 1]);
+
+    // The replay ends at the last candle close.
+    assert!(replay["candles"].as_u64().unwrap() >= 24, "{replay}");
+    assert_eq!(replay["infoCalls"], 1);
+    let mark = ok(&["call", name, "eth_call", &json!([{ "to": "0x0000000000000000000000000000000000000806", "data": word(0) }, "latest"]).to_string()]);
+    let mark = u64::from_str_radix(mark.as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+    assert_eq!(json!(mark), replay["markPx"]);
+    assert_eq!(fixed(replay["lastClose"].as_str().unwrap(), 1) as u64, mark);
+
+    // The send that landed during the replay is applied once.
+    let block = u64::from_str_radix(sent["blockNumber"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+    let height = replay["height"].as_u64().unwrap();
+    println!("spot send in block {block}, replay ended at block {height}");
+    let spot = info(&network, &rpc, json!({ "type": "spotClearinghouseState", "user": to }));
+    let usdc = spot["balances"].as_array().unwrap().iter().find(|b| b["coin"] == "USDC").cloned().unwrap_or_else(|| panic!("{spot}"));
+    assert_eq!(fixed(usdc["total"].as_str().unwrap(), 8), 100_000_000, "{spot}");
+
+    // A book refresh holds the lease for one upstream l2Book read.
+    let mut book_took = 0.0;
+    let book_ms = probe_waits(&network, &rpc, &format!("chainsim-{name}-probe"), || {
+        let t = Instant::now();
+        ok(&["set", name, "hypercore", "book", "BTC", "--live"]);
+        book_took = t.elapsed().as_secs_f64();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    });
+    println!("book refresh: {book_took:.1} s, eth_blockNumber during it: {}", wait_summary(&book_ms));
+
+    ok(&["down", name]);
+    assert_gone(name);
+    println!("whole run: {:.1} s", started.elapsed().as_secs_f64());
+}
+
 #[test]
 #[ignore]
 fn hyperevm_lend_liquidation_and_isolated_margin() {
