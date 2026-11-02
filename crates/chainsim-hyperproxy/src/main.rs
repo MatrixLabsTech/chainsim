@@ -9,6 +9,8 @@
 //!   block type (small or big), and answers `eth_usingBigBlocks` and
 //!   `eth_bigBlockGasPrice`.
 //! - It answers `POST /info` from the copy's Core state.
+//! - It serves WebSocket clients on the same port: requests as over HTTP,
+//!   subscriptions through the engine's own socket ([`ws`]).
 //! - It holds the HyperCore lock: a chainsim command takes a lease with
 //!   `chainsim_coreLock` before it changes Core state, and the proxy applies
 //!   nothing while another holder has it.
@@ -17,6 +19,7 @@
 //! `CHAINSIM_PROXY_LISTEN` (default `0.0.0.0:8545`).
 
 mod lease;
+mod ws;
 
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
@@ -48,6 +51,8 @@ const MINING: &[&str] = &["evm_mine", "anvil_mine", "evm_revert", "anvil_revert"
 struct Engine {
     client: Client<HttpConnector, Full<Bytes>>,
     url: hyper::Uri,
+    /// The engine's WebSocket URL, on the same port.
+    ws: String,
 }
 
 impl Engine {
@@ -291,6 +296,9 @@ fn respond(status: StatusCode, body: Value) -> Response<Full<Bytes>> {
 }
 
 async fn serve(proxy: Arc<Proxy>, req: Request<Incoming>, peer: IpAddr) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
+    if ws::is_upgrade(&req) {
+        return Ok(ws::accept(proxy, req, peer));
+    }
     if req.method() == Method::OPTIONS {
         return Ok(respond(StatusCode::NO_CONTENT, Value::Null));
     }
@@ -318,7 +326,8 @@ async fn serve(proxy: Arc<Proxy>, req: Request<Incoming>, peer: IpAddr) -> std::
 async fn main() {
     let engine_url = std::env::var("CHAINSIM_PROXY_ENGINE").unwrap_or_else(|_| "http://127.0.0.1:8546".into());
     let listen: SocketAddr = std::env::var("CHAINSIM_PROXY_LISTEN").ok().and_then(|l| l.parse().ok()).unwrap_or_else(|| "0.0.0.0:8545".parse().expect("address"));
-    let engine = Engine { client: Client::builder(TokioExecutor::new()).build_http(), url: engine_url.parse().expect("CHAINSIM_PROXY_ENGINE is a URL") };
+    let ws = engine_url.replacen("http", "ws", 1);
+    let engine = Engine { client: Client::builder(TokioExecutor::new()).build_http(), url: engine_url.parse().expect("CHAINSIM_PROXY_ENGINE is a URL"), ws };
     // The engine first: the proxy takes over mining once it answers.
     let mut ready = false;
     for _ in 0..360 {
@@ -340,7 +349,7 @@ async fn main() {
         let proxy = proxy.clone();
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |req| serve(proxy.clone(), req, addr.ip()));
-            let _ = hyper::server::conn::http1::Builder::new().keep_alive(true).serve_connection(TokioIo::new(stream), service).await;
+            let _ = hyper::server::conn::http1::Builder::new().keep_alive(true).serve_connection(TokioIo::new(stream), service).with_upgrades().await;
         });
     }
 }

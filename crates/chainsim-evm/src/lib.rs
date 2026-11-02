@@ -511,10 +511,6 @@ impl EvmAdapter {
 
         let dev = self.dev_accounts(&eng).await;
         let mut fork = handle.fork(profile, dev);
-        if profile.hypercore.is_some() {
-            // WebSocket clients reach anvil directly: the proxy serves HTTP.
-            fork.ws_url = profile.ports.ws.map(|p| format!("ws://{}:{p}", engine_alias(&handle.alias)));
-        }
         fork.hypercore = seeded;
         Ok(fork)
     }
@@ -540,10 +536,6 @@ impl EvmAdapter {
     /// The fork object, with what `up` seeded on a HyperEVM fork.
     async fn fork_of(&self, handle: &ForkHandle, profile: &Profile, dev: Option<Vec<String>>) -> Fork {
         let mut fork = handle.fork(profile, dev);
-        if profile.hypercore.is_some() {
-            // WebSocket clients reach anvil directly: the proxy serves HTTP.
-            fork.ws_url = profile.ports.ws.map(|p| format!("ws://{}:{p}", engine_alias(&handle.alias)));
-        }
         if profile.hypercore.is_some() {
             fork.hypercore = Some(load_hypercore(&self.docker, &handle.name).await);
         }
