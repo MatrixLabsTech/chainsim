@@ -12,7 +12,7 @@
     {
       "name": "chainsim",
       "source": "./plugins/chainsim",
-      "description": "Local mainnet forks of Ethereum, Arc, Robinhood Chain, Solana and Sui in Docker, driven through the chainsim JSON CLI."
+      "description": "Local mainnet forks of Ethereum, Arc, Robinhood Chain, Sui and Aptos in Docker, driven through the chainsim JSON CLI."
     }
   ]
 }

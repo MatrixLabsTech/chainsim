@@ -1,6 +1,6 @@
 ---
 name: chainsim
-description: Local mainnet forks of Ethereum, Arc, Robinhood Chain, Solana and Sui. Use when work needs a chain fork, a funded test wallet on mainnet state, or time and state control on a local chain.
+description: Local mainnet forks of Ethereum, Arc, Robinhood Chain, Sui and Aptos. Use when work needs a chain fork, a funded test wallet on mainnet state, or time and state control on a local chain.
 ---
 
 # chainsim
@@ -23,8 +23,9 @@ Work through these steps in order. Each ends on a check you can make.
 2. **Learn the chain.** Run `chainsim describe <chain>`. Done when the `limits` that touch this
    task, and the `upstream` it reads from, are in your working notes or report.
 3. **Start the fork.** Run `chainsim up <chain>`. For a tool in a container, join its network
-   with `--network <net> --alias <host>`. For a tool on the host, add `--publish`. Done when you
-   hold the `fork` object it prints.
+   with `--network <net> --alias <host>`. For a tool on the host, add `--publish`. An Aptos fork
+   serves no RPC, so it takes neither and its `rpcUrl` is `null`. Done when you hold the `fork`
+   object it prints.
 4. **Prove it is fit.** Run `chainsim selftest <name>`. Done when it exits 0. On any other exit,
    follow `error.next`, and stop the task if it stays red.
 5. **Fund a fresh test wallet.** Run `chainsim fund <name> <address> --native <amount>` and
@@ -33,10 +34,11 @@ Work through these steps in order. Each ends on a check you can make.
 6. **Act as any account, or change contract state, when the task needs it.** To call a function
    only an admin, owner or other role holder may call, run `chainsim send <name> --as <address>
    --to <target> [<arg>...]` with the role holder's address: no key is needed. The target is a
-   contract with `--sig "<fn(types)>"` on EVM, or `package::module::function<T...>` on Sui. To
-   change state directly, run `chainsim set <name> balance|token|owner|object|storage|code ...`;
+   contract with `--sig "<fn(types)>"` on EVM, `package::module::function<T...>` on Sui, or
+   `address::module::function<T...>` with `<type>:<value>` arguments on Aptos. To change state
+   directly, run `chainsim set <name> balance|token|owner|object|resource|storage|code ...`.
    `chainsim describe <chain>` lists what each chain supports. Done when the receipt `status` is
-   1 or the read-back matches what you set.
+   1 (`success` on Aptos) or the read-back matches what you set.
 7. **Do the work.** Before each scenario run `chainsim snapshot <name>`, and after it
    `chainsim revert <name> <id>`. Done when every scenario has a pass or fail and each `revert`
    exited 0.
@@ -49,7 +51,8 @@ Work through these steps in order. Each ends on a check you can make.
 
 `fork` is what `up` returns and every later step reads. Its `rpcUrl` is in-network: containers on
 `fork.network` reach it, the host does not. From the host, use `chainsim call <name> <method>
-[<params-json>]`, or start the fork with `--publish` and use `fork.hostRpcUrl`.
+[<params-json>]`, or start the fork with `--publish` and use `fork.hostRpcUrl`. On Aptos,
+`rpcUrl` is `null`: read the fork with `chainsim call <name> view|resource|ledger`.
 
 Copy `fork.limits` into the report word for word: they are how the fork differs from the real
 chain. `fork.upstream` shows where it reads mainnet state and which variable takes a provider URL.

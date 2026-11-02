@@ -10,9 +10,10 @@ error codes from the binary.
 - Discover: `describe [<chain>]` lists the chains, or one chain's engine, maturity, operations,
   tokens, limits and error codes.
 - Run: `up <chain>`, `ls`, `status <name>`, `down <name> | --all`.
-- Use: `fund`, `snapshot`, `revert`, `call`, `send`, `set`, `selftest`. `set` takes a kind:
-  `balance`, `token`, `storage`, `code` or `owner`. `chainsim describe <chain>` and the chain
-  pages say which kinds each chain supports.
+- Use: `fund`, `snapshot`, `revert`, `call`, `send`, `set`, `time`, `mine`, `selftest`. `set`
+  takes a kind: `balance`, `token`, `storage`, `code`, `owner`, `object` or `resource`.
+  `chainsim describe <chain>` and the chain pages say which kinds and commands each chain
+  supports, and the rest exit 3.
 - Engines: `pull [<engine>]`, `engines`, `prune`.
 - Setup: `doctor`, and `install` for the plugin.
 
@@ -39,3 +40,5 @@ error codes from the binary.
   them back.
 - `describe` and the `fork` object carry each chain's `limits`: plain sentences on how the fork
   differs from the real chain, to copy into a report word for word.
+- The `fork` object's `rpcUrl` is the engine's in-network RPC URL, or `null` when the engine
+  serves no RPC (Aptos). `forkPoint.kind` is `block`, `checkpoint` (Sui) or `version` (Aptos).

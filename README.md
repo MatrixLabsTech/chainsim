@@ -22,10 +22,13 @@ on every supported chain.
   <a href="chains/sui/README.md"><img src="assets/chains/sui.svg" height="48" alt="Sui"></a>
 </p>
 
+<p align="center"><a href="chains/aptos/README.md">Aptos</a></p>
+
 ## What it solves
 
 - Every chain family forks with a different engine: anvil for Ethereum and Arbitrum chains,
-  Circle's arc-foundry tarballs for Arc, Mysten's gRPC-only `sui-fork` for Sui. Each has its own
+  Circle's arc-foundry tarballs for Arc, Mysten's gRPC-only `sui-fork` for Sui, the Aptos CLI's
+  simulation sessions for Aptos. Each has its own
   flags, readiness signal and funding method. chainsim pins each engine, pulls or builds it on
   first use, and puts all of them behind the same commands.
 - Testing admin-only paths of a deployed protocol normally needs keys nobody on the test team
@@ -43,12 +46,13 @@ on every supported chain.
 
 ## Features
 
-- One CLI for Ethereum, Arc, Robinhood Chain and Sui mainnet forks, each running in Docker.
+- One CLI for Ethereum, Arc, Robinhood Chain, Sui and Aptos mainnet forks, each running in Docker.
 - One-line install from GitHub releases for Linux and macOS, and `chainsim doctor` to check the
   setup: Docker, engines, plugin and upstreams.
 - `send --as` acts as any account without its key, including a protocol's admin.
-- `set` overrides state directly: balance, token, storage, code, owner or a Sui object's fields, as
-  each chain supports.
+- `set` overrides state directly: balance, token, storage, code, owner, a Sui object's fields or an
+  Aptos resource, as each chain supports.
+- `time` and `mine` move a fork's clock and produce blocks, on chains whose engine supports them.
 - `fund` gives a test wallet native and token balances and reads them back.
 - `snapshot` and `revert` reset a fork between scenarios.
 - `selftest` proves a fork is fit before a test spends anything on it.
@@ -98,7 +102,8 @@ chainsim down ethereum-mainnet
 
 `up` prints the `fork` object with the in-network `rpcUrl` and the chain's `limits`. A fork is
 reachable from containers on its Docker network. From the host, use `chainsim call`, or start
-the fork with `--publish`.
+the fork with `--publish`. An Aptos fork serves no RPC, so its `rpcUrl` is `null` and it is
+used through `chainsim call`, `send`, `fund` and `set`.
 
 ## Built for agents
 
@@ -135,6 +140,7 @@ The full contract, with every error code, is in [docs/agent-contract.md](docs/ag
 | <img src="assets/chains/arc.svg" height="32" alt="Arc"> &nbsp;**Arc mainnet** | stable | Circle arc-foundry v0.8.0-2 | [chains/arc](chains/arc/README.md) |
 | <img src="assets/chains/robinhood-chain.png" height="32" alt="Robinhood Chain"> &nbsp;**Robinhood Chain mainnet** | stable | Foundry anvil v1.8.5 with an ArbGasInfo mock | [chains/robinhood](chains/robinhood/README.md) |
 | <img src="assets/chains/sui.svg" height="32" alt="Sui"> &nbsp;**Sui mainnet** | experimental | Mysten sui-fork mainnet-v1.81.1, built with chainsim's SetObject patch | [chains/sui](chains/sui/README.md) |
+| **Aptos mainnet** | experimental | Aptos CLI 9.6.0 simulation sessions, no RPC | [chains/aptos](chains/aptos/README.md) |
 
 The chain logos are trademarks of their owners and identify the chains only.
 
