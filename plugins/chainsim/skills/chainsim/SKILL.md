@@ -19,7 +19,9 @@ Work through these steps in order. Each ends on a check you can make.
    socket, so run chainsim outside it by asking for the escalation. Find the chain under
    `data.chains`: when `upstream.set` is false the fork reads the public `upstream.default`, so
    check the chain's `limits` and tell the user when the task needs a provider URL in the
-   variable named by `upstream.env`. Done when `chainsim describe <chain>` exits 0.
+   variable named by `upstream.env`. On Aptos, check that `CHAINSIM_APTOS_API_KEY` is set: without
+   it the public endpoint's per-IP limit stops a run after a few operations, so ask the user for a
+   key from https://geomi.dev. Done when `chainsim describe <chain>` exits 0.
 2. **Learn the chain.** Run `chainsim describe <chain>`. Done when the `limits` that touch this
    task, and the `upstream` it reads from, are in your working notes or report.
 3. **Start the fork.** Run `chainsim up <chain>`. For a tool in a container, join its network

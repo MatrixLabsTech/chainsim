@@ -20,9 +20,9 @@ on every supported chain.
   <a href="chains/robinhood/README.md"><img src="assets/chains/robinhood-chain.png" height="48" alt="Robinhood Chain"></a>
   &nbsp;&nbsp;&nbsp;
   <a href="chains/sui/README.md"><img src="assets/chains/sui.svg" height="48" alt="Sui"></a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="chains/aptos/README.md"><img src="assets/chains/aptos.svg" height="48" alt="Aptos"></a>
 </p>
-
-<p align="center"><a href="chains/aptos/README.md">Aptos</a></p>
 
 ## What it solves
 
@@ -139,7 +139,7 @@ The full contract, with every error code, is in [docs/agent-contract.md](docs/ag
 | <img src="assets/chains/arc.svg" height="32" alt="Arc"> &nbsp;**Arc mainnet** | stable | Circle arc-foundry v0.8.0-2 | [chains/arc](chains/arc/README.md) |
 | <img src="assets/chains/robinhood-chain.png" height="32" alt="Robinhood Chain"> &nbsp;**Robinhood Chain mainnet** | stable | Foundry anvil v1.8.5 with an ArbGasInfo mock | [chains/robinhood](chains/robinhood/README.md) |
 | <img src="assets/chains/sui.svg" height="32" alt="Sui"> &nbsp;**Sui mainnet** | experimental | Mysten sui-fork mainnet-v1.81.1, built with chainsim's SetObject patch | [chains/sui](chains/sui/README.md) |
-| **Aptos mainnet** | experimental | Aptos CLI 9.6.0 simulation sessions | [chains/aptos](chains/aptos/README.md) |
+| <img src="assets/chains/aptos.svg" height="32" alt="Aptos"> &nbsp;**Aptos mainnet** | experimental | Aptos CLI 9.6.0 simulation sessions | [chains/aptos](chains/aptos/README.md) |
 
 The chain logos are trademarks of their owners and identify the chains only.
 
