@@ -166,7 +166,50 @@ pub struct Account {
     /// Recent fills from price moves, liquidations, funding and fees: (time, text).
     #[serde(rename = "h", default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<(u64, String)>,
+    /// Recent fills, newest last.
+    #[serde(rename = "fl", default, skip_serializing_if = "Vec::is_empty")]
+    pub fills: Vec<Fill>,
+    /// Whether this address's EVM transactions go into big blocks.
+    #[serde(rename = "bb", default, skip_serializing_if = "is_false")]
+    pub big_blocks: bool,
 }
+
+/// One fill, as the info API's userFills reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fill {
+    #[serde(rename = "a")]
+    pub asset: u32,
+    #[serde(rename = "p")]
+    pub px_x8: u64,
+    #[serde(rename = "s")]
+    pub sz_x8: u64,
+    #[serde(rename = "b")]
+    pub is_buy: bool,
+    /// Block time, ms.
+    #[serde(rename = "t")]
+    pub time_ms: u64,
+    /// The signed size before the fill, x8.
+    #[serde(rename = "sp")]
+    pub start_x8: i64,
+    /// Realized PnL, x6.
+    #[serde(rename = "cp")]
+    pub closed_pnl: i64,
+    #[serde(rename = "o")]
+    pub oid: u64,
+    /// Taker (true) or maker.
+    #[serde(rename = "x")]
+    pub crossed: bool,
+    /// Fee, x6.
+    #[serde(rename = "f")]
+    pub fee: u64,
+    #[serde(rename = "id")]
+    pub tid: u64,
+    #[serde(rename = "l", default, skip_serializing_if = "is_false")]
+    pub liquidation: bool,
+}
+
+/// How many fills an account keeps.
+const MAX_FILLS: usize = 50;
 
 /// A resting order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +230,11 @@ pub struct Order {
     pub sz_x8: u64,
     #[serde(rename = "t")]
     pub tif: u8,
+    /// When it was placed, ms, and its size then (x8).
+    #[serde(rename = "ts", default)]
+    pub time_ms: u64,
+    #[serde(rename = "os", default)]
+    pub orig_sz_x8: u64,
 }
 
 /// What became of one action: its block and log index, and a status line.
@@ -228,6 +276,11 @@ pub struct State {
     pub pending: Vec<Credit>,
     #[serde(rename = "nc", default)]
     pub next_credit: u64,
+    #[serde(rename = "nt", default)]
+    pub next_tid: u64,
+    /// The block time of the last big block, seconds.
+    #[serde(rename = "lb", default)]
+    pub last_big_block: u64,
     /// The block time of the step being applied, for history lines.
     #[serde(skip)]
     now: u64,
@@ -301,6 +354,72 @@ pub struct Applied {
     /// Resting orders filled by a price move.
     pub fills: usize,
     pub liquidated: Vec<Address>,
+}
+
+/// The perp universe and asset contexts from the info API at `up`, kept for
+/// `meta`, `metaAndAssetCtxs` and `allMids` on the copy. Universe entries are
+/// (name, szDecimals, maxLeverage, isDelisted). Context entries are, in order:
+/// markPx, oraclePx, funding, openInterest, prevDayPx, dayNtlVlm, premium,
+/// midPx, dayBaseVlm.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Meta {
+    #[serde(rename = "u")]
+    pub universe: Vec<(String, u8, u32, bool)>,
+    #[serde(rename = "c")]
+    pub ctxs: Vec<Vec<Option<String>>>,
+}
+
+/// The context fields a [`Meta`] keeps, in order.
+pub const META_CTX_FIELDS: [&str; 9] = ["markPx", "oraclePx", "funding", "openInterest", "prevDayPx", "dayNtlVlm", "premium", "midPx", "dayBaseVlm"];
+
+impl Meta {
+    /// From the info API's `metaAndAssetCtxs` answer.
+    pub fn from_info(v: &Value) -> Self {
+        let universe = v[0]["universe"].as_array().map_or(vec![], |u| {
+            u.iter()
+                .map(|x| (x["name"].as_str().unwrap_or_default().to_string(), x["szDecimals"].as_u64().unwrap_or(0) as u8, x["maxLeverage"].as_u64().unwrap_or(1) as u32, x["isDelisted"] == json!(true)))
+                .collect()
+        });
+        let ctxs = v[1].as_array().map_or(vec![], |c| c.iter().map(|x| META_CTX_FIELDS.iter().map(|k| x[*k].as_str().map(str::to_string)).collect()).collect());
+        Self { universe, ctxs }
+    }
+}
+
+/// HyperEVM block types: small blocks carry 3,000,000 gas, big blocks 30,000,000.
+pub const SMALL_BLOCK_GAS: u64 = 3_000_000;
+pub const BIG_BLOCK_GAS: u64 = 30_000_000;
+/// Big blocks come about a minute apart.
+pub const BIG_BLOCK_SECS: u64 = 60;
+/// The big-block gas price measured on the mainnet RPC (eth_bigBlockGasPrice), 0.1 gwei.
+pub const BIG_BLOCK_GAS_PRICE: u64 = 100_000_000;
+
+/// The gas limit of the block a transaction goes into.
+pub fn block_gas_limit(big: bool) -> u64 {
+    if big {
+        BIG_BLOCK_GAS
+    } else {
+        SMALL_BLOCK_GAS
+    }
+}
+
+/// The timestamp a big block needs, when the next block time `next` would
+/// come less than a minute after the last big block. None means `next` is fine.
+pub fn big_block_time(next: u64, last_big: u64) -> Option<u64> {
+    (last_big > 0 && next < last_big + BIG_BLOCK_SECS).then_some(last_big + BIG_BLOCK_SECS)
+}
+
+/// Why a transaction cannot go into its block type, or None.
+pub fn block_refusal(gas: u64, big: bool) -> Option<String> {
+    let limit = block_gas_limit(big);
+    (gas > limit).then(|| format!("exceeds block gas limit: the transaction asks {gas} gas and a {} block holds {limit}", if big { "big" } else { "small" }))
+}
+
+/// The longest replay: a month of hourly candles.
+pub const MAX_REPLAY_CANDLES: u64 = 744;
+
+/// How many hourly candles a replay from `from` to `to` (seconds, both ends included) covers.
+pub fn replay_candles(from: u64, to: u64) -> u64 {
+    to.saturating_sub(from) / FUNDING_INTERVAL + 1
 }
 
 fn hex_u64(v: &Value) -> Option<u64> {
@@ -537,8 +656,24 @@ impl State {
         }
     }
 
-    /// Applies one fill to a user's position: size and price x8.
-    fn fill(&mut self, user: Address, asset: u32, is_buy: bool, q: u64, px: u64) {
+    /// One fill for a user: the position moves, the fee is charged, and the
+    /// fill is recorded for userFills.
+    #[allow(clippy::too_many_arguments)]
+    fn fill(&mut self, user: Address, asset: u32, is_buy: bool, q: u64, px: u64, oid: u64, crossed: bool, fee: u64, liquidation: bool) {
+        let start = self.accounts.get(&user).and_then(|a| a.positions.get(&asset)).map_or(0, |p| p.szi_x8);
+        let closed_pnl = self.fill_raw(user, asset, is_buy, q, px);
+        self.charge(user, fee);
+        let tid = self.next_tid.max(1);
+        self.next_tid = tid + 1;
+        let time_ms = self.now * 1000;
+        let fills = &mut self.account(user).fills;
+        fills.push(Fill { asset, px_x8: px, sz_x8: q, is_buy, time_ms, start_x8: start, closed_pnl, oid, crossed, fee, tid, liquidation });
+        let drop = fills.len().saturating_sub(MAX_FILLS);
+        fills.drain(..drop);
+    }
+
+    /// Applies one fill to a user's position: size and price x8. Returns the realized PnL, x6.
+    fn fill_raw(&mut self, user: Address, asset: u32, is_buy: bool, q: u64, px: u64) -> i64 {
         let lev = self.leverage_of(user, asset);
         let acct = self.account(user);
         let pos = acct.positions.entry(asset).or_insert(Pos { leverage: lev, ..Default::default() });
@@ -549,7 +684,7 @@ impl State {
         if pos.szi_x8 == 0 || (pos.szi_x8 > 0) == is_buy {
             pos.szi_x8 += dq;
             pos.entry_ntl += notional(q, px);
-            return;
+            return 0;
         }
         let size = pos.szi_x8.unsigned_abs();
         let closing = q.min(size);
@@ -568,6 +703,7 @@ impl State {
             pos.funding_paid = 0;
         }
         acct.usd += realized;
+        realized
     }
 
     fn fmt_sz(&self, sz_x8: u64) -> String {
@@ -614,8 +750,10 @@ impl State {
         if need > self.margin(user).withdrawable {
             return format!("rejected: insufficient margin, needs {} USD", fmt_dec(need as i128, 6));
         }
+        let order_oid = self.next_oid.max(1);
+        self.next_oid = order_oid + 1;
         let mut left = sz;
-        let (mut filled, mut cost) = (0u64, 0u128);
+        let (mut filled, mut cost, mut taker_fee) = (0u64, 0u128, 0u64);
         for (mpx, oid) in makers {
             if left == 0 {
                 break;
@@ -640,34 +778,32 @@ impl State {
                     if self.orders[i].sz_x8 == 0 {
                         self.orders.remove(i);
                     }
-                    self.fill(maker, asset, !is_buy, q, mpx);
                     let f = fee(notional(q, mpx), true);
-                    self.charge(maker, f);
+                    self.fill(maker, asset, !is_buy, q, mpx, oid, false, f, false);
                     let coin = self.coin(asset);
                     self.note(maker, format!("{} {} {coin} at {} as maker, fee {} USD", if is_buy { "sold" } else { "bought" }, self.fmt_sz(q), fmt_dec(mpx as i128, 8), fmt_dec(f as i128, 6)));
                     applied.users.insert(maker);
                     q
                 }
             };
-            self.fill(user, asset, is_buy, q, mpx);
+            let f = fee(notional(q, mpx), false);
+            self.fill(user, asset, is_buy, q, mpx, order_oid, true, f, false);
+            taker_fee += f;
             left -= q;
             filled += q;
             cost += q as u128 * mpx as u128;
         }
         let mut parts = Vec::new();
         if filled > 0 {
-            let f = fee((cost / X16_TO_X6) as u64, false);
-            self.charge(user, f);
-            parts.push(format!("filled {} at {}, fee {} USD", self.fmt_sz(filled), fmt_dec((cost / filled as u128) as i128, 8), fmt_dec(f as i128, 6)));
+            parts.push(format!("filled {} at {}, fee {} USD", self.fmt_sz(filled), fmt_dec((cost / filled as u128) as i128, 8), fmt_dec(taker_fee as i128, 6)));
         }
         if left > 0 {
             if tif == 3 {
                 parts.push(format!("{} dropped (IOC)", self.fmt_sz(left)));
             } else {
-                let oid = self.next_oid.max(1);
-                self.next_oid = oid + 1;
-                self.orders.push(Order { oid, cloid, user, asset, is_buy, px_x8: px, sz_x8: left, tif });
-                parts.push(format!("{} resting as oid {oid}", self.fmt_sz(left)));
+                let time_ms = self.now * 1000;
+                self.orders.push(Order { oid: order_oid, cloid, user, asset, is_buy, px_x8: px, sz_x8: left, tif, time_ms, orig_sz_x8: sz });
+                parts.push(format!("{} resting as oid {order_oid}", self.fmt_sz(left)));
             }
         }
         parts.join(", ")
@@ -812,9 +948,8 @@ impl State {
         let crossed: Vec<Order> = self.orders.iter().filter(|o| o.asset == asset && if o.is_buy { o.px_x8 >= px } else { o.px_x8 <= px }).cloned().collect();
         for o in crossed {
             self.orders.retain(|x| x.oid != o.oid);
-            self.fill(o.user, asset, o.is_buy, o.sz_x8, o.px_x8);
             let f = fee(notional(o.sz_x8, o.px_x8), true);
-            self.charge(o.user, f);
+            self.fill(o.user, asset, o.is_buy, o.sz_x8, o.px_x8, o.oid, false, f, false);
             let coin = self.coin(asset);
             self.note(o.user, format!("oid {} {} {} {coin} at {} as the price moved to {}, fee {} USD", o.oid, if o.is_buy { "bought" } else { "sold" }, self.fmt_sz(o.sz_x8), fmt_dec(o.px_x8 as i128, 8), fmt_dec(px as i128, 8), fmt_dec(f as i128, 6)));
             applied.users.insert(o.user);
@@ -824,6 +959,60 @@ impl State {
         // Everyone holding this perp sees new margin figures.
         applied.margin_users.extend(self.accounts.iter().filter(|(_, a)| a.positions.get(&asset).is_some_and(|p| p.szi_x8 != 0)).map(|(u, _)| *u));
         applied
+    }
+
+    /// Replaces a perp's book (a refresh from the info API) at block time
+    /// `time`. Resting orders the new book crosses (a bid at or above its best
+    /// ask, an ask at or below its best bid) fill at their own price as
+    /// makers, as on a price move, and liquidation follows.
+    pub fn set_book(&mut self, asset: u32, book: Book, time: u64) -> Applied {
+        self.now = time;
+        let mut applied = Applied::default();
+        let (best_bid, best_ask) = (book.bids.first().map(|l| l.0), book.asks.first().map(|l| l.0));
+        self.books.insert(asset, book);
+        let crossed: Vec<Order> = self
+            .orders
+            .iter()
+            .filter(|o| o.asset == asset && if o.is_buy { best_ask.is_some_and(|a| o.px_x8 >= a) } else { best_bid.is_some_and(|b| o.px_x8 <= b) })
+            .cloned()
+            .collect();
+        for o in crossed {
+            self.orders.retain(|x| x.oid != o.oid);
+            let f = fee(notional(o.sz_x8, o.px_x8), true);
+            self.fill(o.user, asset, o.is_buy, o.sz_x8, o.px_x8, o.oid, false, f, false);
+            let coin = self.coin(asset);
+            self.note(o.user, format!("oid {} {} {} {coin} at {} as the book was refreshed, fee {} USD", o.oid, if o.is_buy { "bought" } else { "sold" }, self.fmt_sz(o.sz_x8), fmt_dec(o.px_x8 as i128, 8), fmt_dec(f as i128, 6)));
+            applied.users.insert(o.user);
+            applied.fills += 1;
+        }
+        if applied.fills > 0 {
+            self.liquidate(&mut applied);
+        }
+        applied
+    }
+
+    /// Adds a perp the state does not track yet from the meta snapshot `up`
+    /// took, so a price set on it has a mark to move. Returns false when the
+    /// snapshot has no such perp.
+    pub fn add_perp_from_meta(&mut self, asset: u32, meta: &Meta) -> bool {
+        if self.perps.contains_key(&asset) {
+            return true;
+        }
+        let Some(u) = meta.universe.get(asset as usize) else { return false };
+        let ctx = meta.ctxs.get(asset as usize);
+        let px = |i: usize| ctx.and_then(|c| c.get(i)).and_then(|v| v.as_deref()).and_then(|s| parse_dec(s, 8)).unwrap_or(0) as u64;
+        let funding = ctx.and_then(|c| c.get(2)).and_then(|v| v.as_deref()).and_then(|s| parse_dec(s, 12)).unwrap_or(0) as i64;
+        self.perps.insert(asset, Perp { name: u.0.clone(), sz_decimals: u.1, max_leverage: u.2, mark_x8: px(0), oracle_x8: px(1), funding_e12: funding });
+        true
+    }
+
+    /// Sets whether an address's EVM transactions go into big blocks.
+    pub fn set_big_blocks(&mut self, user: Address, on: bool) {
+        self.account(user).big_blocks = on;
+    }
+
+    pub fn uses_big_blocks(&self, user: Address) -> bool {
+        self.accounts.get(&user).is_some_and(|a| a.big_blocks)
     }
 
     /// One replayed candle: the block that carries it (funding up to its
@@ -853,7 +1042,7 @@ impl State {
             let mut closed = Vec::new();
             for (asset, szi) in open {
                 let mark = self.perps.get(&asset).map_or(0, |p| p.mark_x8);
-                self.fill(user, asset, szi < 0, szi.unsigned_abs(), mark);
+                self.fill(user, asset, szi < 0, szi.unsigned_abs(), mark, 0, true, 0, true);
                 if let Some(p) = self.account(user).positions.get_mut(&asset) {
                     p.funding_paid = 0;
                 }
@@ -1087,7 +1276,164 @@ impl State {
             "spotClearinghouseState": { "balances": balances },
             "openOrders": orders,
             "history": acct.history.iter().map(|(t, e)| json!({ "time": t * 1000, "event": e })).collect::<Vec<_>>(),
+            "userFills": acct.fills.iter().rev().map(|f| self.fill_json(f)).collect::<Vec<_>>(),
         })
+    }
+
+    /// The best bid and ask of a perp's book on the copy, with its own resting orders.
+    fn best(&self, asset: u32) -> (Option<u64>, Option<u64>) {
+        let book = self.books.get(&asset);
+        let bid = book.and_then(|b| b.bids.first().map(|l| l.0)).into_iter().chain(self.orders.iter().filter(|o| o.asset == asset && o.is_buy).map(|o| o.px_x8)).max();
+        let ask = book.and_then(|b| b.asks.first().map(|l| l.0)).into_iter().chain(self.orders.iter().filter(|o| o.asset == asset && !o.is_buy).map(|o| o.px_x8)).min();
+        (bid, ask)
+    }
+
+    /// The copy's book in the info API's `l2Book` shape: snapshot levels and
+    /// resting orders merged by price, best first.
+    fn l2_book(&self, asset: u32, time_ms: u64) -> Value {
+        let book = self.books.get(&asset).cloned().unwrap_or_default();
+        let side = |levels: &Levels, buy: bool| -> Vec<Value> {
+            let mut merged: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+            for (p, sz) in levels {
+                let e = merged.entry(*p).or_default();
+                e.0 += sz;
+                e.1 += 1;
+            }
+            for o in self.orders.iter().filter(|o| o.asset == asset && o.is_buy == buy) {
+                let e = merged.entry(o.px_x8).or_default();
+                e.0 += o.sz_x8;
+                e.1 += 1;
+            }
+            let mut out: Vec<(u64, (u64, u64))> = merged.into_iter().collect();
+            if buy {
+                out.reverse();
+            }
+            out.into_iter().map(|(p, (sz, n))| json!({ "px": fmt_dec(p as i128, 8), "sz": fmt_dec(sz as i128, 8), "n": n })).collect()
+        };
+        json!({ "coin": self.coin(asset), "time": time_ms, "levels": [side(&book.bids, true), side(&book.asks, false)] })
+    }
+
+    /// A perp's asset context: the snapshot from `up`, with the copy's own
+    /// mark, oracle, funding and mid where the copy tracks the perp.
+    fn asset_ctx(&self, asset: u32, meta: &Meta) -> Value {
+        let mut ctx = serde_json::Map::new();
+        if let Some(c) = meta.ctxs.get(asset as usize) {
+            for (k, v) in META_CTX_FIELDS.iter().zip(c) {
+                ctx.insert(k.to_string(), json!(v));
+            }
+        }
+        if let Some(p) = self.perps.get(&asset) {
+            let oracle = if p.oracle_x8 > 0 { p.oracle_x8 } else { p.mark_x8 };
+            ctx.insert("markPx".into(), json!(fmt_dec(p.mark_x8 as i128, 8)));
+            ctx.insert("oraclePx".into(), json!(fmt_dec(oracle as i128, 8)));
+            ctx.insert("funding".into(), json!(fmt_dec(p.funding_e12 as i128, 12)));
+            if let (Some(b), Some(a)) = self.best(asset) {
+                ctx.insert("midPx".into(), json!(fmt_dec(((b as u128 + a as u128) / 2) as i128, 8)));
+            }
+        }
+        Value::Object(ctx)
+    }
+
+    fn universe(&self, meta: &Meta) -> Vec<Value> {
+        meta.universe
+            .iter()
+            .map(|(name, d, lev, delisted)| {
+                let mut u = json!({ "name": name, "szDecimals": d, "maxLeverage": lev });
+                if *delisted {
+                    u["isDelisted"] = json!(true);
+                }
+                u
+            })
+            .collect()
+    }
+
+    /// Answers one info API request from the copy's state, in the info API's
+    /// own shapes: clearinghouseState, spotClearinghouseState, openOrders,
+    /// userFills, meta, metaAndAssetCtxs, l2Book and allMids. Any other type,
+    /// or a malformed request, is an error message.
+    pub fn info_request(&self, meta: &Meta, req: &Value, time_ms: u64) -> std::result::Result<Value, String> {
+        let kind = req["type"].as_str().ok_or("the request has no type")?;
+        let user = || -> std::result::Result<Address, String> { req["user"].as_str().and_then(|u| u.parse().ok()).ok_or_else(|| format!("{kind} needs a user address")) };
+        let asset_of = |coin: &str| -> Option<u32> {
+            self.perps.iter().find(|(_, p)| p.name == coin).map(|(a, _)| *a).or_else(|| meta.universe.iter().position(|u| u.0 == coin).map(|i| i as u32))
+        };
+        Ok(match kind {
+            "clearinghouseState" => self.info(user()?, time_ms)["clearinghouseState"].clone(),
+            "spotClearinghouseState" => self.info(user()?, time_ms)["spotClearinghouseState"].clone(),
+            "openOrders" => {
+                let who = user()?;
+                let mut orders: Vec<&Order> = self.orders.iter().filter(|o| o.user == who).collect();
+                orders.sort_by(|a, b| b.oid.cmp(&a.oid));
+                json!(orders
+                    .iter()
+                    .map(|o| {
+                        let mut v = json!({
+                            "coin": self.coin(o.asset), "side": if o.is_buy { "B" } else { "A" }, "limitPx": fmt_dec(o.px_x8 as i128, 8),
+                            "sz": fmt_dec(o.sz_x8 as i128, 8), "oid": o.oid, "timestamp": o.time_ms, "origSz": fmt_dec(o.orig_sz_x8.max(o.sz_x8) as i128, 8),
+                        });
+                        if o.cloid != 0 {
+                            v["cloid"] = json!(format!("0x{:032x}", o.cloid));
+                        }
+                        v
+                    })
+                    .collect::<Vec<_>>())
+            }
+            "userFills" => {
+                let who = user()?;
+                let fills = self.accounts.get(&who).map_or(&[][..], |a| a.fills.as_slice());
+                json!(fills.iter().rev().map(|f| self.fill_json(f)).collect::<Vec<_>>())
+            }
+            "meta" => json!({ "universe": self.universe(meta) }),
+            "metaAndAssetCtxs" => {
+                let n = meta.universe.len().max(self.perps.keys().max().map_or(0, |m| *m as usize + 1));
+                json!([{ "universe": self.universe(meta) }, (0..n as u32).map(|a| self.asset_ctx(a, meta)).collect::<Vec<_>>()])
+            }
+            "l2Book" => {
+                let coin = req["coin"].as_str().ok_or("l2Book needs a coin")?;
+                let asset = asset_of(coin).filter(|a| self.books.contains_key(a)).ok_or_else(|| format!("the copy has no book for {coin}: run chainsim set <name> hypercore book {coin} --live"))?;
+                self.l2_book(asset, time_ms)
+            }
+            "allMids" => {
+                let mut mids = serde_json::Map::new();
+                for (i, u) in meta.universe.iter().enumerate() {
+                    if let Some(m) = meta.ctxs.get(i).and_then(|c| c.get(7).cloned().flatten().or_else(|| c.first().cloned().flatten())) {
+                        mids.insert(u.0.clone(), json!(m));
+                    }
+                }
+                for (a, p) in &self.perps {
+                    let mid = match self.best(*a) {
+                        (Some(b), Some(x)) => (b as u128 + x as u128) / 2,
+                        _ => p.mark_x8 as u128,
+                    };
+                    mids.insert(p.name.clone(), json!(fmt_dec(mid as i128, 8)));
+                }
+                Value::Object(mids)
+            }
+            other => return Err(format!("the copy does not serve the info request type {other}")),
+        })
+    }
+
+    fn fill_json(&self, f: &Fill) -> Value {
+        let after = f.start_x8 + if f.is_buy { f.sz_x8 as i64 } else { -(f.sz_x8 as i64) };
+        let dir = match (f.start_x8.signum(), after.signum()) {
+            _ if f.liquidation => if f.start_x8 > 0 { "Close Long" } else { "Close Short" },
+            (0, 1) | (1, 1) => if f.is_buy { "Open Long" } else { "Close Long" },
+            (0, -1) | (-1, -1) => if f.is_buy { "Close Short" } else { "Open Short" },
+            (1, 0) => "Close Long",
+            (-1, 0) => "Close Short",
+            (1, -1) => "Long > Short",
+            (-1, 1) => "Short > Long",
+            _ => "Open Long",
+        };
+        let mut v = json!({
+            "coin": self.coin(f.asset), "px": fmt_dec(f.px_x8 as i128, 8), "sz": fmt_dec(f.sz_x8 as i128, 8), "side": if f.is_buy { "B" } else { "A" },
+            "time": f.time_ms, "startPosition": fmt_dec(f.start_x8 as i128, 8), "dir": dir, "closedPnl": fmt_dec(f.closed_pnl as i128, 6),
+            "hash": format!("0x{:064x}", f.tid), "oid": f.oid, "crossed": f.crossed, "fee": fmt_dec(f.fee as i128, 6), "tid": f.tid, "feeToken": "USDC",
+        });
+        if f.liquidation {
+            v["liquidation"] = json!({ "method": "market", "markPx": fmt_dec(f.px_x8 as i128, 8) });
+        }
+        v
     }
 
     /// Sets a user's perp state from the info API's `clearinghouseState`.
@@ -1503,7 +1849,7 @@ mod tests {
         let mut s = state();
         s.account(BOB).usd = usd(1.0);
         s.account(BOB).positions.insert(0, Pos { szi_x8: -(x8(1.0) as i64), entry_ntl: 100_000_000, leverage: 20, ..Default::default() });
-        s.orders.push(Order { oid: 9, cloid: 0, user: BOB, asset: 0, is_buy: false, px_x8: x8(200.0), sz_x8: 1, tif: 2 });
+        s.orders.push(Order { oid: 9, cloid: 0, user: BOB, asset: 0, is_buy: false, px_x8: x8(200.0), sz_x8: 1, tif: 2, time_ms: 0, orig_sz_x8: 1 });
         let a = s.set_price(0, x8(101.0), 10);
         assert_eq!(a.liquidated, vec![BOB]);
         assert!(s.orders.is_empty());
@@ -1607,6 +1953,139 @@ mod tests {
         s.apply(&[act(11, ALICE, send)], (11, "0xb".into()), 0);
         assert!(s.pending.is_empty());
         assert_eq!(s.accounts[&ALICE].spot[&HYPE_TOKEN].0, 200_000_000);
+    }
+
+    fn meta() -> Meta {
+        let some = |v: &str| Some(v.to_string());
+        Meta {
+            universe: vec![("BTC".into(), 5, 40, false), ("ETH".into(), 4, 25, false), ("OLD".into(), 2, 3, true)],
+            ctxs: vec![
+                vec![some("100.0"), some("100.5"), some("0.0000125"), some("5.0"), some("99.0"), some("1000.0"), some("0.0"), some("100.0"), some("10.0")],
+                vec![some("2000.0"), some("2001.0"), some("0.00001"), some("1.0"), some("1990.0"), some("10.0"), some("0.0"), some("2000.5"), some("1.0")],
+                vec![some("1.0"), some("1.0"), some("0.0"), None, None, None, None, None, None],
+            ],
+        }
+    }
+
+    #[test]
+    fn block_type_rules() {
+        assert_eq!((block_gas_limit(false), block_gas_limit(true)), (3_000_000, 30_000_000));
+        assert_eq!(block_refusal(3_000_000, false), None);
+        assert_eq!(block_refusal(3_000_001, false).unwrap(), "exceeds block gas limit: the transaction asks 3000001 gas and a small block holds 3000000");
+        assert_eq!(block_refusal(29_000_000, true), None);
+        // A big block comes at least a minute after the last one, and the first is free.
+        assert_eq!(big_block_time(1_000, 0), None);
+        assert_eq!(big_block_time(1_030, 1_000), Some(1_060));
+        assert_eq!(big_block_time(1_060, 1_000), None);
+        let mut s = state();
+        assert!(!s.uses_big_blocks(ALICE) && !s.uses_big_blocks(BOB));
+        s.set_big_blocks(BOB, true);
+        assert!(s.uses_big_blocks(BOB));
+        let back = State::from_bytes(&s.to_bytes()).unwrap();
+        assert!(back.uses_big_blocks(BOB));
+        s.set_big_blocks(BOB, false);
+        assert!(!s.uses_big_blocks(BOB));
+        assert_eq!(BIG_BLOCK_GAS_PRICE, 0x5f5e100);
+    }
+
+    #[test]
+    fn info_requests_answer_from_the_state() {
+        let mut s = state();
+        s.now = 1_793_600_000;
+        s.account(BOB).usd = usd(1_000.0);
+        run(&mut s, 11, BOB, limit_order(0, false, x8(100.5), x8(0.2), false, 2, 0x77));
+        s.now = 1_793_600_010;
+        run(&mut s, 12, ALICE, limit_order(0, true, x8(101.0), x8(0.5), false, 3, 0));
+        s.apply(&[act(13, ALICE, limit_order(0, true, x8(90.0), x8(1.0), false, 2, 0))], (13, "0xd".into()), 1_793_600_010);
+        let m = meta();
+        let t = 1_793_600_020_000;
+        let ask = |r: Value| s.info_request(&m, &r, t).unwrap();
+        let alice = ALICE.to_string();
+        // clearinghouseState and spotClearinghouseState are the hypercore_state parts.
+        let ch = ask(json!({ "type": "clearinghouseState", "user": alice }));
+        assert_eq!(ch, s.info(ALICE, t)["clearinghouseState"]);
+        assert_eq!(ch["assetPositions"][0]["position"]["szi"], "0.5");
+        assert_eq!(ask(json!({ "type": "spotClearinghouseState", "user": alice })), s.info(ALICE, t)["spotClearinghouseState"]);
+        // openOrders: the GTC at 90, newest first.
+        let oo = ask(json!({ "type": "openOrders", "user": alice }));
+        assert_eq!(oo, json!([{ "coin": "BTC", "side": "B", "limitPx": "90.0", "sz": "1.0", "oid": 3, "timestamp": 1_793_600_010_000u64, "origSz": "1.0" }]));
+        let bob_orders = ask(json!({ "type": "openOrders", "user": BOB.to_string() }));
+        assert_eq!(bob_orders, json!([]));
+        // userFills: Alice took 0.2 from Bob at 100.5 and 0.3 from the book at 101, newest first.
+        let uf = ask(json!({ "type": "userFills", "user": alice }));
+        assert_eq!(uf.as_array().unwrap().len(), 2);
+        assert_eq!((uf[0]["px"].as_str(), uf[0]["sz"].as_str(), uf[0]["side"].as_str(), uf[0]["dir"].as_str()), (Some("101.0"), Some("0.3"), Some("B"), Some("Open Long")));
+        assert_eq!((uf[1]["px"].as_str(), uf[1]["startPosition"].as_str(), uf[1]["crossed"].clone(), uf[1]["fee"].as_str()), (Some("100.5"), Some("0.0"), json!(true), Some("0.009045")));
+        let bf = ask(json!({ "type": "userFills", "user": BOB.to_string() }));
+        assert_eq!((bf[0]["dir"].as_str(), bf[0]["crossed"].clone(), bf[0]["oid"].clone(), bf[0]["fee"].as_str()), (Some("Open Short"), json!(false), json!(1), Some("0.003015")));
+        // meta and metaAndAssetCtxs: the snapshot universe, with the copy's own BTC mark and mid.
+        assert_eq!(ask(json!({ "type": "meta" }))["universe"][2], json!({ "name": "OLD", "szDecimals": 2, "maxLeverage": 3, "isDelisted": true }));
+        let mac = ask(json!({ "type": "metaAndAssetCtxs" }));
+        assert_eq!(mac[1].as_array().unwrap().len(), 3);
+        assert_eq!((mac[1][0]["markPx"].as_str(), mac[1][0]["oraclePx"].as_str(), mac[1][0]["openInterest"].as_str()), (Some("100.0"), Some("100.0"), Some("5.0")));
+        assert_eq!(mac[1][1]["markPx"], "2000.0");
+        // Best bid 99 (book), best ask 101 (0.7 left there): mid 100.
+        assert_eq!(mac[1][0]["midPx"], "100.0");
+        // l2Book: the copy's book with Alice's bid at 90 merged in.
+        let book = ask(json!({ "type": "l2Book", "coin": "BTC" }));
+        assert_eq!(book["levels"][0][0], json!({ "px": "99.0", "sz": "1.0", "n": 1 }));
+        assert_eq!(book["levels"][0].as_array().unwrap().last().unwrap(), &json!({ "px": "90.0", "sz": "1.0", "n": 1 }));
+        assert_eq!(book["levels"][1][0], json!({ "px": "101.0", "sz": "0.7", "n": 1 }));
+        assert!(s.info_request(&m, &json!({ "type": "l2Book", "coin": "ETH" }), t).unwrap_err().contains("hypercore book ETH --live"));
+        // allMids: the snapshot's mids, and the copy's own for the perps it tracks.
+        let mids = ask(json!({ "type": "allMids" }));
+        assert_eq!((mids["BTC"].as_str(), mids["ETH"].as_str(), mids["OLD"].as_str()), (Some("100.0"), Some("2000.5"), Some("1.0")));
+        // Unknown types and missing fields are refused.
+        assert!(s.info_request(&m, &json!({ "type": "vaultDetails" }), t).unwrap_err().contains("does not serve"));
+        assert!(s.info_request(&m, &json!({ "type": "openOrders" }), t).unwrap_err().contains("needs a user"));
+    }
+
+    #[test]
+    fn a_book_refresh_that_crosses_resting_orders_fills_them() {
+        let mut s = state();
+        run(&mut s, 11, ALICE, limit_order(0, true, x8(97.0), x8(1.0), false, 2, 0));
+        run(&mut s, 12, ALICE, limit_order(0, false, x8(130.0), x8(1.0), false, 2, 0));
+        // A new book with its best ask at 96.5 crosses the bid at 97, not the ask at 130.
+        let book = Book { bids: vec![(x8(96.0), x8(2.0))], asks: vec![(x8(96.5), x8(2.0))], time: 9 };
+        let a = s.set_book(0, book.clone(), 50);
+        assert_eq!(a.fills, 1);
+        assert_eq!(s.books[&0], book);
+        assert_eq!(s.accounts[&ALICE].positions[&0].szi_x8, x8(1.0) as i64);
+        assert_eq!(s.orders.len(), 1);
+        assert!(!s.accounts[&ALICE].fills.last().unwrap().crossed);
+        // A refresh that crosses nothing fills nothing.
+        assert_eq!(s.set_book(0, book, 60).fills, 0);
+    }
+
+    #[test]
+    fn a_price_on_a_perp_not_in_state_adds_it_from_the_meta_snapshot() {
+        let mut s = state();
+        assert!(!s.perps.contains_key(&1));
+        assert!(s.add_perp_from_meta(1, &meta()));
+        assert_eq!((s.perps[&1].name.as_str(), s.perps[&1].sz_decimals, s.perps[&1].mark_x8), ("ETH", 4, x8(2000.0)));
+        s.set_price(1, x8(1800.0), 10);
+        assert_eq!((s.perps[&1].mark_x8, s.perps[&1].oracle_x8), (x8(1800.0), x8(1800.0)));
+        // Raw precompile units convert once the perp is known: 180000 at szDecimals 4 is 1800.
+        assert_eq!(s.px_from_raw(1, 180_000), Some(x8(1800.0)));
+        assert!(!s.add_perp_from_meta(7, &meta()));
+    }
+
+    #[test]
+    fn a_replay_is_capped_at_a_month_of_hourly_candles() {
+        let day = 86_400;
+        assert_eq!(replay_candles(0, day), 25);
+        assert_eq!(replay_candles(0, 30 * day + 23 * 3600), 744);
+        assert!(replay_candles(0, 31 * day) > MAX_REPLAY_CANDLES);
+    }
+
+    #[test]
+    fn meta_reads_the_info_api_shape() {
+        let v = json!([{ "universe": [{ "name": "BTC", "szDecimals": 5, "maxLeverage": 40 }, { "name": "X", "szDecimals": 0, "maxLeverage": 3, "isDelisted": true }] },
+            [{ "markPx": "1.0", "oraclePx": "2.0", "funding": "0.1", "impactPxs": ["1", "2"] }, {}]]);
+        let m = Meta::from_info(&v);
+        assert_eq!(m.universe, vec![("BTC".into(), 5, 40, false), ("X".into(), 0, 3, true)]);
+        assert_eq!(m.ctxs[0][..3], [Some("1.0".to_string()), Some("2.0".to_string()), Some("0.1".to_string())]);
+        assert_eq!(m.ctxs[1], vec![None; 9]);
     }
 
     #[test]
