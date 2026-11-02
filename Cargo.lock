@@ -492,7 +492,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "chainsim"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "chainsim-aptos",
  "chainsim-core",
@@ -506,7 +506,7 @@ dependencies = [
 
 [[package]]
 name = "chainsim-aptos"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "chainsim-core",
@@ -517,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "chainsim-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "bollard",
@@ -531,7 +531,7 @@ dependencies = [
 
 [[package]]
 name = "chainsim-evm"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "alloy-primitives",
  "async-trait",
@@ -543,7 +543,7 @@ dependencies = [
 
 [[package]]
 name = "chainsim-sui"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "chainsim-core",

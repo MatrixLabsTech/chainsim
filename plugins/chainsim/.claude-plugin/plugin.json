@@ -1,7 +1,7 @@
 {
   "name": "chainsim",
   "description": "Local mainnet forks of Ethereum, Arc, Robinhood Chain, HyperEVM, Sui and Aptos in Docker, driven through the chainsim JSON CLI.",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "author": {
     "name": "0xasun"
   },
