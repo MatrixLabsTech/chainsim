@@ -69,6 +69,9 @@ error codes from the binary.
   WebSocket reaches HyperCore at the next HTTP request or chainsim command. `describe
   hyperevm-mainnet` lists the info request types and RPC methods the proxy serves, and in
   `limits` what HyperCore does not model.
+- On Sui, `selftest` has a `funding-health` part that fails when the funder or the USDC holder
+  holds too little for `fund`. Its reason names the amounts and the thresholds, and `limits`
+  says what it does not check.
 - `latest_state_only` (exit 7) means `up --block` was refused because the default upstream
   answers state reads at its latest block only. `error.next` names the variable that takes an
   archive provider URL.

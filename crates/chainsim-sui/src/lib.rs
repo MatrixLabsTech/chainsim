@@ -208,7 +208,8 @@ impl SuiAdapter {
         Grpc { docker: &self.docker, container: handle.control_container.clone(), target: format!("{}:{}", handle.alias, profile.rpc_port()), secret, upstream_env: profile.upstream.env.clone() }
     }
 
-    async fn open(&self, name: &str) -> Result<(ForkHandle, Profile)> {
+    /// The fork's handle and its profile.
+    pub async fn open(&self, name: &str) -> Result<(ForkHandle, Profile)> {
         docker::check_name(name)?;
         let handle = self.docker.find(name).await?.ok_or_else(|| Error::fork_not_found(name))?;
         let profile = profile::get(&handle.chain)?;
@@ -329,6 +330,8 @@ impl SuiAdapter {
 
         let handle = self.docker.find(name).await?.ok_or_else(|| Error::new(ErrorCode::EngineFailed, "the engine container vanished after start"))?;
         let g = self.grpc(&handle, profile);
+        // The first health check that answers finds no descriptor set and
+        // writes it, so later calls skip reflection.
         self.wait_healthy(name, &g, READY_TIMEOUT).await?;
         Ok(handle.fork(profile, None))
     }
@@ -510,21 +513,36 @@ impl SuiAdapter {
         if let Some(holder) = from {
             let holder = parse_address(holder)?;
             let mut coins = self.fork_coins(g, &holder, coin_type).await?;
-            // Coins the holder had before the fork point are not indexed on the fork; find them upstream.
-            let query = format!("{{ address(address: \"{holder}\") {{ objects(first: 50, filter: {{ type: \"0x2::coin::Coin<{coin_type}>\" }}) {{ nodes {{ address }} }} }} }}");
-            let upstream = g.upstream_graphql(&query, Duration::from_secs(30)).await?;
-            for id in upstream["address"]["objects"]["nodes"].as_array().into_iter().flatten().filter_map(|n| n["address"].as_str()) {
-                if coins.iter().any(|(c, _)| c["objectId"].as_str() == Some(id)) {
-                    continue;
+            let mut held: u64 = coins.iter().map(|(_, b)| b).sum();
+            // Coins the holder had before the fork point are not indexed on the fork; find them
+            // upstream, largest first, and load only as many as the amount needs.
+            let mut after = None;
+            for _ in 0..HOLDER_PAGES {
+                if held >= amount {
+                    break;
                 }
-                let body = json!({ "objectId": id, "readMask": { "paths": ["object_id", "version", "digest", "owner", "balance"] } });
-                // A coin created after the fork point does not exist on the fork.
-                let Ok(o) = g.call("sui.rpc.v2.LedgerService/GetObject", &body, CALL_TIMEOUT).await.map(|v| v["object"].clone()) else { continue };
-                if o["owner"]["address"].as_str() == Some(holder.as_str()) {
-                    coins.push((json!({ "kind": "IMMUTABLE_OR_OWNED", "objectId": o["objectId"], "version": o["version"], "digest": o["digest"] }), u64_field(&o["balance"]).unwrap_or(0)));
+                let (page, next) = self.upstream_holder_coins(g, &holder, coin_type, after.as_deref()).await?;
+                for id in largest_first(page) {
+                    if held >= amount {
+                        break;
+                    }
+                    if coins.iter().any(|(c, _)| c["objectId"].as_str() == Some(id.as_str())) {
+                        continue;
+                    }
+                    let body = json!({ "objectId": id, "readMask": { "paths": ["object_id", "version", "digest", "owner", "balance"] } });
+                    // A coin created after the fork point does not exist on the fork.
+                    let Ok(o) = g.call("sui.rpc.v2.LedgerService/GetObject", &body, CALL_TIMEOUT).await.map(|v| v["object"].clone()) else { continue };
+                    if o["owner"]["address"].as_str() == Some(holder.as_str()) {
+                        let balance = u64_field(&o["balance"]).unwrap_or(0);
+                        held = held.saturating_add(balance);
+                        coins.push((json!({ "kind": "IMMUTABLE_OR_OWNED", "objectId": o["objectId"], "version": o["version"], "digest": o["digest"] }), balance));
+                    }
+                }
+                match next {
+                    Some(cursor) => after = Some(cursor),
+                    None => break,
                 }
             }
-            let held: u64 = coins.iter().map(|(_, b)| b).sum();
             if held < amount {
                 return Err(Error::new(ErrorCode::Usage, format!("{holder} holds {held} units of {coin_type} on the fork, less than the {amount} needed")).next("name a larger holder with --from, or leave --from out to mint"));
             }
@@ -661,8 +679,40 @@ impl SuiAdapter {
         Ok((view, json!({ "kind": "set-object", "object": id, "type": ty_text, "changed": changed })))
     }
 
-    /// The selftest checks. Never returns early: every part reports.
-    async fn checks(&self, handle: &ForkHandle, profile: &Profile, g: &Grpc<'_>) -> Vec<Check> {
+    /// One page of `holder`'s `coin_type` coins on the upstream, with balances,
+    /// and the cursor of the next page if there is one.
+    async fn upstream_holder_coins(&self, g: &Grpc<'_>, holder: &str, coin_type: &str, after: Option<&str>) -> Result<(Vec<(String, u64)>, Option<String>)> {
+        let after = after.map(|c| format!(", after: \"{c}\"")).unwrap_or_default();
+        let query = format!("{{ address(address: \"{holder}\") {{ objects(first: 50{after}, filter: {{ type: \"0x2::coin::Coin<{coin_type}>\" }}) {{ pageInfo {{ hasNextPage endCursor }} nodes {{ address contents {{ json }} }} }} }} }}");
+        let data = g.upstream_graphql(&query, Duration::from_secs(30)).await?;
+        Ok((upstream_coins(&data), next_cursor(&data)))
+    }
+
+    /// The funding-health part of selftest for `profile` (normally the fork's
+    /// own): the funder's largest SUI coin on the fork, and the coins on the
+    /// first upstream page of each token holder.
+    pub async fn funding_check(&self, handle: &ForkHandle, profile: &Profile, g: &Grpc<'_>) -> Check {
+        let t = Instant::now();
+        let largest = match profile.funder.as_deref() {
+            Some(f) => self.funder_coin(g, f, handle).await.ok().map(|(_, b)| b),
+            None => None,
+        };
+        let mut results = vec![funder_health(largest)];
+        for token in profile.tokens.iter() {
+            let Some(holder) = token.holder.as_deref() else { continue };
+            let coins = self.upstream_holder_coins(g, holder, &token.address, None).await.ok().map(|(c, _)| c);
+            let balances: Option<Vec<u64>> = coins.map(|c| c.into_iter().map(|(_, b)| b).collect());
+            results.push(holder_health(&token.symbol, balances.as_deref(), token.decimals));
+        }
+        let (ok, reason) = combine_health(results);
+        // Check reasons are static text. This one names measured values, and
+        // a selftest builds it once per run, so leaking it is bounded.
+        Check { part: "funding-health", ok, reason: Box::leak(reason.into_boxed_str()), ms: ms(t) }
+    }
+
+    /// The selftest checks for `profile` (normally the fork's own). Never
+    /// returns early: every part reports.
+    pub async fn checks(&self, handle: &ForkHandle, profile: &Profile, g: &Grpc<'_>) -> Vec<Check> {
         let mut parts = Vec::new();
 
         let t = Instant::now();
@@ -689,6 +739,8 @@ impl SuiAdapter {
         let ok = clock.is_ok_and(|c| c["object"]["objectId"].as_str().is_some_and(|id| id.ends_with("06")));
         parts.push(Check { part: "clock", ok, reason: if ok { "LedgerService/GetObject returns the Clock 0x6" } else { "LedgerService/GetObject did not return the Clock 0x6" }, ms: ms(t) });
 
+        parts.push(self.funding_check(handle, profile, g).await);
+
         // funded-transfer: 1 SUI from the funder by impersonation, within 10 s.
         let t = Instant::now();
         let unit = 10u64.pow(9);
@@ -709,6 +761,69 @@ impl SuiAdapter {
         });
         parts
     }
+}
+
+/// The smallest largest-coin the funder may hold for selftest to pass: fund
+/// and every `send --as` and `set` gas payment spend from that one coin.
+pub const FUNDER_MIN_MIST: u64 = 10_000 * 1_000_000_000;
+/// How many upstream pages of 50 coins fund reads at most for a token holder.
+const HOLDER_PAGES: usize = 20;
+/// The least a token holder's reachable coins may add up to, in whole tokens.
+pub const HOLDER_MIN_TOKENS: u64 = 100_000;
+
+/// Funder health from the funder's largest SUI coin on the fork, if any.
+pub fn funder_health(largest: Option<u64>) -> (bool, String) {
+    let min = format_amount(u128::from(FUNDER_MIN_MIST), 9);
+    match largest {
+        None => (false, format!("the funder holds no SUI coin the fork can list (needs a coin of at least {min} SUI)")),
+        Some(b) => {
+            let ok = b >= FUNDER_MIN_MIST;
+            (ok, format!("the funder's largest SUI coin holds {} SUI ({} the {min} SUI threshold)", format_amount(u128::from(b), 9), if ok { "at or above" } else { "below" }))
+        }
+    }
+}
+
+/// Token holder health from the balances of the holder's coins that fund can
+/// reach (`None` when the upstream could not be read).
+pub fn holder_health(symbol: &str, coins: Option<&[u64]>, decimals: u8) -> (bool, String) {
+    let min = u128::from(HOLDER_MIN_TOKENS) * 10u128.pow(u32::from(decimals));
+    let min_text = format_amount(min, decimals);
+    match coins {
+        None => (false, format!("the {symbol} holder's coins could not be read from the upstream GraphQL service (needs at least {min_text} {symbol})")),
+        Some(c) => {
+            let held: u128 = c.iter().map(|b| u128::from(*b)).sum();
+            let ok = held >= min;
+            (ok, format!("the {symbol} holder's coins that fund reaches hold {} {symbol} ({} the {min_text} {symbol} threshold)", format_amount(held, decimals), if ok { "at or above" } else { "below" }))
+        }
+    }
+}
+
+/// One selftest part from several health results: ok when all are, with every reason.
+pub fn combine_health(results: Vec<(bool, String)>) -> (bool, String) {
+    let ok = results.iter().all(|(ok, _)| *ok);
+    (ok, results.into_iter().map(|(_, r)| r).collect::<Vec<_>>().join(", and "))
+}
+
+/// The coins on one upstream GraphQL page of `address.objects`, as (id, balance).
+pub fn upstream_coins(data: &Value) -> Vec<(String, u64)> {
+    data["address"]["objects"]["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| Some((n["address"].as_str()?.to_string(), u64_field(&n["contents"]["json"]["balance"])?)))
+        .collect()
+}
+
+/// The cursor of the next upstream page of `address.objects`, if there is one.
+pub fn next_cursor(data: &Value) -> Option<String> {
+    let info = &data["address"]["objects"]["pageInfo"];
+    (info["hasNextPage"] == json!(true)).then(|| info["endCursor"].as_str().map(String::from)).flatten()
+}
+
+/// Coin IDs ordered by balance, largest first, so fund loads as few coins as it can.
+pub fn largest_first(mut coins: Vec<(String, u64)>) -> Vec<String> {
+    coins.sort_by(|a, b| b.1.cmp(&a.1));
+    coins.into_iter().map(|(id, _)| id).collect()
 }
 
 /// The funder holds no coins on the fork: its coins were not seeded, because
@@ -1168,6 +1283,61 @@ mod tests {
         assert_eq!(e.code, ErrorCode::Unsupported);
         assert!(e.message.contains("checkpoint 42") && e.message.contains("about an hour"), "{}", e.message);
         assert!(e.next.as_deref().is_some_and(|n| n.starts_with("chainsim down f,") && n.contains("without --block")));
+    }
+
+    #[test]
+    fn funder_health_threshold_boundary() {
+        let (ok, reason) = funder_health(None);
+        assert!(!ok && reason.contains("no SUI coin") && reason.contains("10000 SUI"), "{reason}");
+        assert!(!funder_health(Some(FUNDER_MIN_MIST - 1)).0);
+        assert!(funder_health(Some(FUNDER_MIN_MIST)).0);
+        let (ok, reason) = funder_health(Some(9_350_000_000));
+        assert!(!ok && reason.contains("holds 9.35 SUI") && reason.contains("below the 10000 SUI threshold"), "{reason}");
+    }
+
+    #[test]
+    fn holder_health_threshold_boundary() {
+        let six = 10u64.pow(6);
+        let (ok, reason) = holder_health("USDC", None, 6);
+        assert!(!ok && reason.contains("could not be read") && reason.contains("100000 USDC"), "{reason}");
+        assert!(!holder_health("USDC", Some(&[]), 6).0);
+        let (ok, reason) = holder_health("USDC", Some(&[60_000 * six, 40_000 * six - 1]), 6);
+        assert!(!ok && reason.contains("hold 99999.999999 USDC") && reason.contains("below the 100000 USDC threshold"), "{reason}");
+        assert!(holder_health("USDC", Some(&[60_000 * six, 40_000 * six]), 6).0);
+        assert!(holder_health("USDC", Some(&[u64::MAX, u64::MAX]), 6).0);
+        assert!(!holder_health("X", Some(&[u64::MAX]), 18).0);
+    }
+
+    #[test]
+    fn combined_health_fails_when_any_part_fails() {
+        assert_eq!(combine_health(vec![(true, "a".into()), (true, "b".into())]), (true, "a, and b".to_string()));
+        assert_eq!(combine_health(vec![(true, "a".into()), (false, "b".into())]), (false, "a, and b".to_string()));
+    }
+
+    #[test]
+    fn fund_loads_the_largest_coins_first() {
+        let page = vec![("0xa".to_string(), 5), ("0xb".to_string(), 4_862_282_347_636), ("0xc".to_string(), 157_304_208_400)];
+        assert_eq!(largest_first(page), ["0xb", "0xc", "0xa"]);
+        assert!(largest_first(vec![]).is_empty());
+    }
+
+    #[test]
+    fn next_cursor_only_when_there_is_a_next_page() {
+        let page = |more: bool| json!({ "address": { "objects": { "pageInfo": { "hasNextPage": more, "endCursor": "Y3Vy" }, "nodes": [] } } });
+        assert_eq!(next_cursor(&page(true)).as_deref(), Some("Y3Vy"));
+        assert_eq!(next_cursor(&page(false)), None);
+        assert_eq!(next_cursor(&json!({ "address": null })), None);
+    }
+
+    #[test]
+    fn upstream_coins_reads_ids_and_balances() {
+        let data = json!({ "address": { "objects": { "nodes": [
+            { "address": "0xa", "contents": { "json": { "id": "0xa", "balance": "4862282347636" } } },
+            { "address": "0xb", "contents": null },
+            { "address": "0xc", "contents": { "json": { "balance": 5 } } },
+        ] } } });
+        assert_eq!(upstream_coins(&data), vec![("0xa".to_string(), 4_862_282_347_636), ("0xc".to_string(), 5)]);
+        assert!(upstream_coins(&json!({ "address": null })).is_empty());
     }
 
     #[test]

@@ -123,11 +123,15 @@ chainsim selftest sui-mainnet
 checkpoint, but `fund`, `send` and `set` need the funder's coins, which load only for a recent
 fork point (see Fund below).
 
-`selftest` checks four parts:
+`selftest` checks five parts:
 
 - `grpc-health`: the engine reports `SERVING`.
 - `status`: `ForkingService/GetStatus` reports the labeled fork checkpoint.
 - `clock`: `LedgerService/GetObject` returns the Clock `0x6`.
+- `funding-health`: the funder's largest SUI coin on the copy holds at least 10,000 SUI, and the
+  USDC holder's coins on the first page of its upstream coin listing (50 coins) hold at least
+  100,000 USDC. The reason names both amounts, so a drained funder or holder shows up here
+  before `fund` fails.
 - `funded-transfer`: 1 SUI from the funder to the fixed throwaway address `0x…c5e2` executes
   within 10 s. The transfer stays on the copy.
 
@@ -150,8 +154,9 @@ a transaction with an empty signature list as its sender. Nothing is sent on Sui
   test addresses.
 - `fund --token USDC:<amount>` moves Circle's native USDC on the copy from the profile's USDC
   holder, `0x60dd01bc037e2c1ea2aaf02187701f9f4453ba323338d2f2f521957065b0984d`, labeled Bybit 1 on
-  CoinCarp's Sui rich list, which held 448,681 USDC in address-owned coins when we checked on
-  2026-11-01. USDC is the only profile token. `set token` covers any other coin type.
+  CoinCarp's Sui rich list. `selftest` reports how much of it `fund` can reach. `fund` loads the
+  holder's largest coins first and only as many as the amount needs. USDC is the only profile
+  token. `set token` covers any other coin type.
 
 `fund` works only on a fork point within about an hour of the upstream head. `up` seeds the
 funder's coins into the copy's owned-object index, and the public GraphQL endpoint keeps

@@ -6,7 +6,7 @@
 use std::process::Command;
 use std::time::Instant;
 
-use chainsim_core::fork::{FundRequest, SendRequest, SetKind, SetRequest, UpRequest};
+use chainsim_core::fork::{FundRequest, SendRequest, SetKind, SetRequest, TokenAmount, UpRequest};
 use chainsim_core::profile;
 use chainsim_core::{Adapter, ErrorCode};
 use chainsim_sui::{data_volume, grpc, SuiAdapter, FORKING_PROTO};
@@ -97,11 +97,12 @@ async fn sui_mainnet() {
     // The vendored ForkingService proto matches the live fork's reflection.
     assert_eq!(g.describe_rpcs("sui.forking.v1alpha.ForkingService").await.unwrap(), grpc::rpc_names(FORKING_PROTO));
 
-    // selftest: gRPC health, GetStatus, a funded transfer by impersonation.
+    // selftest: gRPC health, GetStatus, the Clock, funder and holder health, a funded transfer by impersonation.
     let st = a.selftest(name).await.unwrap();
     println!("selftest: {}", serde_json::to_string(&st).unwrap());
     let parts: Vec<_> = st.parts.iter().map(|c| c.part).collect();
-    assert_eq!(parts, ["grpc-health", "status", "clock", "funded-transfer"]);
+    assert_eq!(parts, ["grpc-health", "status", "clock", "funding-health", "funded-transfer"]);
+    assert!(st.ok, "{}", serde_json::to_string(&st).unwrap());
 
     // call reads the Clock 0x6 from the host, with no published port.
     let clock = a.call(name, "LedgerService/GetObject", json!({ "objectId": "0x6" }), None).await.unwrap();
@@ -115,6 +116,13 @@ async fn sui_mainnet() {
     println!("fund in {} ms", t.elapsed().as_millis());
     assert_eq!(funded.balances[0].raw, "25000000000");
     assert_eq!(a.fund(name, &fund).await.unwrap().balances[0].raw, "25000000000");
+    // fund --token USDC moves it from the holder within 15 s and reads it back.
+    let usdc = FundRequest { address: fresh_address(), native: None, tokens: vec![TokenAmount { token: "USDC".into(), amount: "100".into() }] };
+    let t = Instant::now();
+    let funded = a.fund(name, &usdc).await.unwrap();
+    println!("fund USDC in {} ms", t.elapsed().as_millis());
+    assert_eq!(funded.balances[0].raw, "100000000");
+    assert!(t.elapsed().as_secs() < 15, "fund USDC took {} ms", t.elapsed().as_millis());
     // An address that owns objects on mainnet is refused (exit 7).
     let rich = FundRequest { address: p.funder.clone().unwrap(), native: Some("1".into()), tokens: vec![] };
     assert_eq!(a.fund(name, &rich).await.unwrap_err().code, ErrorCode::MainnetAddress);
@@ -306,6 +314,37 @@ async fn sui_set_object() {
     let mods = chainsim_core::mods::list(a.docker(), name).await.unwrap();
     assert_eq!(mods.iter().filter(|m| m["kind"] == "set-object").count(), 3, "{mods:?}");
     assert_eq!(mods.len(), 5, "{mods:?}");
+
+    assert!(a.down(name).await.unwrap().removed);
+    assert_gone(name);
+}
+
+#[tokio::test]
+#[ignore]
+async fn sui_drained_funder_fails_selftest() {
+    let a = SuiAdapter::connect().await.unwrap();
+    let p = profile::get("sui-mainnet").unwrap();
+    let name = "acc-sui-drained";
+    a.down(name).await.unwrap();
+    a.up(&p, &UpRequest { name: name.into(), ..Default::default() }).await.unwrap();
+
+    // A drained funder: a fresh address that holds a single 1 SUI coin on the fork.
+    let drained = fresh_address();
+    a.fund(name, &FundRequest { address: drained.clone(), native: Some("1".into()), tokens: vec![] }).await.unwrap();
+    let (handle, _) = a.open(name).await.unwrap();
+    let mut swapped = p.clone();
+    swapped.funder = Some(drained);
+    let g = a.grpc(&handle, &swapped);
+    let parts = a.checks(&handle, &swapped, &g).await;
+    println!("drained: {}", serde_json::to_string(&parts).unwrap());
+    let health = parts.iter().find(|c| c.part == "funding-health").unwrap();
+    assert!(!health.ok);
+    assert!(health.reason.contains("holds 1 SUI") && health.reason.contains("below the 10000 SUI threshold"), "{}", health.reason);
+    assert!(!parts.iter().all(|c| c.ok));
+
+    // The fork's own funder still passes.
+    let g = a.grpc(&handle, &p);
+    assert!(a.checks(&handle, &p, &g).await.iter().all(|c| c.ok));
 
     assert!(a.down(name).await.unwrap().removed);
     assert_gone(name);
