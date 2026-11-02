@@ -1,0 +1,4 @@
+# The proxy build (engines/hyperevm-proxy/build.Dockerfile) uses the repository as its context.
+target
+.git
+dist

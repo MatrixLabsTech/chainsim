@@ -1,0 +1,19 @@
+[package]
+name = "chainsim-hyperproxy"
+description = "The HyperEVM proxy chainsim runs in front of a HyperEVM fork: HyperCore applied on every block, small and big blocks, and the info API for the copy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+async-trait.workspace = true
+chainsim-core.workspace = true
+chainsim-evm.workspace = true
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "server"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "server", "tokio"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["net", "sync", "io-util"] }

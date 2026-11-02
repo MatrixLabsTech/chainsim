@@ -2,11 +2,10 @@
 //! the catch-up every command runs, and the `set hypercore` and
 //! `call hypercore_state` helpers.
 //!
-//! All Core state is fork state, so snapshot and revert carry it: the state
-//! is the code of [`STATE_ADDRESS`] (a STOP byte, a marker, then the state as
-//! JSON), and the answers it produces are in the precompile mock's storage.
-//! Catch-up runs under a lock in the control sidecar, and the cursor in the
-//! state makes a second pass over the same blocks a no-op.
+//! The driver itself (state on the fork, catch-up, credits) is in
+//! [`crate::coresync`], shared with the HyperEVM proxy. The HyperCore lock
+//! lives in the proxy: every command takes it there before it changes Core
+//! state, so the proxy's own per-block apply never races a command.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -19,25 +18,16 @@ use chainsim_core::{Error, ErrorCode, Result};
 use serde_json::{json, Value};
 
 use crate::core::{self as hc, State};
+use crate::coresync::{self, block_ref, block_time, CoreRpc, STATE_ADDRESS};
 use crate::hypercore::{self, Entry};
 use crate::units::*;
 use crate::{now_secs, Engine, EvmAdapter, CALL_TIMEOUT};
 
-/// Where the Core state lives on the fork. It has no code and no balance on
-/// HyperEVM Mainnet, and `up` checks that before using it.
-pub const STATE_ADDRESS: &str = "0x9999999999999999999999999999999999999999";
-/// The state code starts with STOP, so a call to the address does nothing.
-const MARKER: &[u8] = b"\x00chainsim-core\x00";
-/// The largest state the control path can write in one call.
-const MAX_STATE: usize = 60_000;
 /// The default Hyperliquid info API, replaced by `CHAINSIM_HYPERLIQUID_INFO`.
 pub const INFO_DEFAULT: &str = "https://api.hyperliquid.xyz/info";
 pub const INFO_ENV: &str = "CHAINSIM_HYPERLIQUID_INFO";
 /// Requests per batch, below the control path's argument size limit.
 const BATCH: usize = 150;
-/// The catch-up lock in the control sidecar's tmpfs, and when a lock counts as left behind.
-const LOCK_DIR: &str = "/tmp/chainsim-core.lock";
-const LOCK_STALE_SECS: u64 = 120;
 
 /// A `set hypercore` helper.
 #[derive(Debug, Clone)]
@@ -48,6 +38,7 @@ pub enum CoreOp {
     Book { coin: String },
     Mirror { user: String },
     Funding { perp: u32, rate: String },
+    BigBlocks { user: String, on: bool },
 }
 
 fn info_url() -> String {
@@ -56,6 +47,17 @@ fn info_url() -> String {
 
 fn info_next() -> String {
     format!("retry in a minute, or export {INFO_ENV}=<info API URL>")
+}
+
+#[async_trait::async_trait]
+impl CoreRpc for Engine<'_> {
+    async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        self.rpc(method, params).await
+    }
+
+    async fn batch(&self, calls: &[(&str, Value)]) -> Result<Vec<Value>> {
+        self.rpc_batch(calls).await
+    }
 }
 
 impl Engine<'_> {
@@ -95,81 +97,6 @@ impl Engine<'_> {
         serde_json::from_str(&reply.body).map_err(|_| Error::new(ErrorCode::UpstreamUnavailable, format!("info API {}: the answer is not JSON", body["type"])).next(info_next()))
     }
 
-    /// The Core state on the fork, or None before `up` wrote it.
-    async fn load_state(&self) -> Result<Option<State>> {
-        let code = self.rpc("eth_getCode", json!([STATE_ADDRESS, "latest"])).await?;
-        decode_state(&code)
-    }
-
-    /// Writes the state and the answers it changed, in as few requests as fit.
-    async fn store(&self, state: &State, answers: &[Entry]) -> Result<()> {
-        let mut blob = MARKER.to_vec();
-        blob.extend(state.to_bytes());
-        if blob.len() > MAX_STATE {
-            return Err(Error::new(ErrorCode::Internal, format!("the HyperCore state is {} bytes, over the {MAX_STATE} the fork can hold", blob.len()))
-                .next("mirror an account with fewer positions, or restart the fork with chainsim down and up"));
-        }
-        let mut calls: Vec<(&str, Value)> = Vec::new();
-        for e in answers {
-            let target = hypercore::address(e.precompile);
-            for (slot, value) in hypercore::storage_writes(&e.calldata, &e.result) {
-                calls.push(("anvil_setStorageAt", json!([target, slot, value])));
-            }
-        }
-        calls.push(("anvil_setCode", json!([STATE_ADDRESS, hypercore::to_hex(&blob)])));
-        self.rpc_batch(&calls).await.map(|_| ())
-    }
-
-    /// Lands the credits Core owes the EVM side (native HYPE or a linked
-    /// ERC-20). Each one first records the balance it starts from in the
-    /// state, then sets `base + amount` and leaves the queue. A failed one
-    /// stays queued and is retried at the next catch-up, and a retry sets the
-    /// same target, so a credit is never applied twice.
-    async fn settle_credits(&self, state: &mut State) -> Result<()> {
-        if state.pending.is_empty() {
-            return Ok(());
-        }
-        let unbased: Vec<hc::Credit> = state.pending.iter().filter(|c| c.base.is_none()).cloned().collect();
-        for c in &unbased {
-            let have = match c.token {
-                None => self.balance(&c.to.to_string()).await?,
-                Some(token) => self.token_balance(&token.to_string(), c.to).await?,
-            };
-            state.credit_base(c.id, have);
-        }
-        if !unbased.is_empty() {
-            self.store(state, &[]).await?;
-        }
-        for c in state.pending.clone() {
-            let Some(target) = c.target() else { continue };
-            let landed = match c.token {
-                None => self.set_balance(&c.to.to_string(), target).await,
-                Some(token) => self.deal(&token.to_string(), c.to, target).await,
-            };
-            match landed {
-                Ok(()) => state.credit_landed(c.id),
-                Err(e) => chainsim_core::log(format_args!("HyperCore credit {} to {} kept for a retry: {}", c.id, c.to, e.message)),
-            }
-        }
-        self.store(state, &[]).await
-    }
-}
-
-fn decode_state(code: &Value) -> Result<Option<State>> {
-    let bytes = code.as_str().and_then(|c| alloy_primitives::hex::decode(c).ok()).unwrap_or_default();
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    let body = bytes.strip_prefix(MARKER).ok_or_else(|| Error::new(ErrorCode::Internal, format!("{STATE_ADDRESS} holds code that is not chainsim's HyperCore state")))?;
-    State::from_bytes(body).map(Some).ok_or_else(|| Error::new(ErrorCode::Internal, "the HyperCore state on the fork does not decode").next("chainsim down <name> && chainsim up hyperevm-mainnet"))
-}
-
-fn block_ref(b: &Value) -> Result<(u64, String)> {
-    Ok((parse_qty(&b["number"])?.to::<u64>(), b["hash"].as_str().unwrap_or_default().to_string()))
-}
-
-fn block_time(b: &Value) -> Result<u64> {
-    Ok(parse_qty(&b["timestamp"])?.to::<u64>())
 }
 
 /// Precompile prices are decimal strings with up to 6 - szDecimals decimals.
@@ -179,61 +106,27 @@ fn raw_px(px: &str, sz_decimals: u8) -> Option<u64> {
 }
 
 impl EvmAdapter {
-    async fn core_lock(&self, handle: &ForkHandle) -> Result<()> {
-        let script = format!(
-            "i=0; while ! mkdir {LOCK_DIR} 2>/dev/null; do now=$(date +%s); t=$(cat {LOCK_DIR}/t 2>/dev/null || echo $now); \
-             if [ $((now - t)) -gt {LOCK_STALE_SECS} ]; then rm -rf {LOCK_DIR}; continue; fi; i=$((i+1)); [ $i -gt 1200 ] && exit 9; sleep 0.1; done; date +%s > {LOCK_DIR}/t"
-        );
-        let out = self.docker.exec(&handle.control_container, &["sh".into(), "-c".into(), script]).await?;
-        if out.exit_code != 0 {
-            return Err(Error::new(ErrorCode::EngineFailed, "another chainsim command held the HyperCore lock for over two minutes").next("retry the command"));
-        }
-        Ok(())
+    /// Takes the HyperCore lock in the fork's proxy, waiting while the proxy
+    /// applies a block or another command holds it. Returns the lease token.
+    async fn core_lock(&self, eng: &Engine<'_>) -> Result<String> {
+        let token = eng.rpc_timeout("chainsim_coreLock", json!([]), Duration::from_secs(150)).await?;
+        token.as_str().map(str::to_string).ok_or_else(|| Error::new(ErrorCode::EngineFailed, "the HyperEVM proxy did not grant the HyperCore lock").next("retry the command"))
     }
 
-    async fn core_unlock(&self, handle: &ForkHandle) {
-        let _ = self.docker.exec(&handle.control_container, &["rm".into(), "-rf".into(), LOCK_DIR.into()]).await;
+    async fn core_unlock(&self, eng: &Engine<'_>, token: &str) {
+        let _ = eng.rpc("chainsim_coreUnlock", json!([token])).await;
     }
 
     /// Applies every Core event since the cursor, on a HyperEVM fork. A
     /// no-op elsewhere and on a fork without Core state.
-    pub(crate) async fn core_sync(&self, handle: &ForkHandle, profile: &Profile, eng: &Engine<'_>) -> Result<()> {
+    pub(crate) async fn core_sync(&self, _handle: &ForkHandle, profile: &Profile, eng: &Engine<'_>) -> Result<()> {
         if profile.hypercore.is_none() {
             return Ok(());
         }
-        self.core_lock(handle).await?;
-        let r = self.core_sync_locked(eng).await.map(|_| ());
-        self.core_unlock(handle).await;
+        let lease = self.core_lock(eng).await?;
+        let r = coresync::sync_locked(eng).await.map(|_| ());
+        self.core_unlock(eng, &lease).await;
         r
-    }
-
-    /// The catch-up itself, under the lock. Returns the state after it.
-    async fn core_sync_locked(&self, eng: &Engine<'_>) -> Result<Option<State>> {
-        let got = eng.rpc_batch(&[("eth_getCode", json!([STATE_ADDRESS, "latest"])), ("eth_getBlockByNumber", json!(["latest", false]))]).await?;
-        let Some(mut state) = decode_state(&got[0])? else { return Ok(None) };
-        let head = block_ref(&got[1])?;
-        let time = block_time(&got[1])?;
-        let Some((at, hash)) = state.cursor.clone() else { return Ok(Some(state)) };
-        if head.0 <= at {
-            if head.0 < at || head.1 != hash {
-                // The chain no longer holds the cursor block: take the chain
-                // as it is and apply nothing twice.
-                chainsim_core::log(format_args!("HyperCore cursor {at} moved to {} without applying", head.0));
-                state.cursor = Some(head);
-                eng.store(&state, &[]).await?;
-            }
-            eng.settle_credits(&mut state).await?;
-            return Ok(Some(state));
-        }
-        let events = core_events(eng, &state, at + 1, head.0).await?;
-        let applied = state.apply(&events, head, time);
-        let answers = state.answers_for(&applied);
-        eng.store(&state, &answers).await?;
-        eng.settle_credits(&mut state).await?;
-        if !events.is_empty() {
-            chainsim_core::log(format_args!("HyperCore applied {} events, {} answers", events.len(), answers.len()));
-        }
-        Ok(Some(state))
     }
 
     /// `up`: the Core state from the info API, with the seeded marks, and the
@@ -282,7 +175,8 @@ impl EvmAdapter {
             }
         }
         eng.rpc_batch(&writes).await?;
-        eng.store(&state, &[]).await?;
+        coresync::store_meta(eng, &hc::Meta::from_info(&meta)).await?;
+        coresync::store(eng, &state, &[]).await?;
         chainsim_core::log(format_args!("HyperCore state: {calls} info API calls"));
         let funding: Vec<Value> = state.perps.values().map(|p| json!({ "coin": p.name, "rate": hc::fmt_dec(p.funding_e12 as i128, 12) })).collect();
         Ok(json!({ "books": books, "funding": funding, "infoCalls": calls, "state": STATE_ADDRESS }))
@@ -295,9 +189,9 @@ impl EvmAdapter {
             return Err(Error::unsupported(&format!("set hypercore on {}", profile.key), "only HyperEVM has HyperCore"));
         }
         let eng = self.engine(&handle, &profile);
-        self.core_lock(&handle).await?;
+        let lease = self.core_lock(&eng).await?;
         let r = self.hypercore_locked(&handle, &profile, &eng, op).await;
-        self.core_unlock(&handle).await;
+        self.core_unlock(&eng, &lease).await;
         let (mut out, mut entry) = r?;
         entry["at"] = json!(now_secs());
         chainsim_core::mods::record(&self.docker, name, &entry).await?;
@@ -306,20 +200,24 @@ impl EvmAdapter {
     }
 
     async fn hypercore_locked(&self, handle: &ForkHandle, profile: &Profile, eng: &Engine<'_>, op: CoreOp) -> Result<(Value, Value)> {
-        let mut state = self.core_sync_locked(eng).await?.ok_or_else(|| Error::new(ErrorCode::Internal, "this fork has no HyperCore state").next(format!("chainsim down {0} && chainsim up hyperevm-mainnet --name {0}", handle.name)))?;
+        let mut state = coresync::sync_locked(eng).await?.ok_or_else(|| Error::new(ErrorCode::Internal, "this fork has no HyperCore state").next(format!("chainsim down {0} && chainsim up hyperevm-mainnet --name {0}", handle.name)))?;
         let mut calls = 0u32;
         match op {
             CoreOp::Price { perp, px } => {
                 let entries = hypercore::price(perp, px);
                 let (_, time) = eng.latest_block().await?;
+                // A perp the state does not track yet comes from the meta snapshot, so it gets a mark.
+                if !state.perps.contains_key(&perp) {
+                    state.add_perp_from_meta(perp, &coresync::load_meta(eng).await?);
+                }
                 let applied = match state.px_from_raw(perp, px) {
                     Some(x8) => state.set_price(perp, x8, time),
                     None => hc::Applied::default(),
                 };
                 let mut answers = state.answers_for(&applied);
                 answers.extend(entries.iter().cloned());
-                eng.store(&state, &answers).await?;
-                eng.settle_credits(&mut state).await?;
+                coresync::store(eng, &state, &answers).await?;
+                coresync::settle_credits(eng, &mut state).await?;
                 let sets = sets_json(&entries);
                 let liquidated: Vec<String> = applied.liquidated.iter().map(|a| a.to_string()).collect();
                 Ok((
@@ -333,7 +231,7 @@ impl EvmAdapter {
                     self.add_perps(eng, &mut state, &[perp], &mut calls).await?;
                 }
                 state.perps.get_mut(&perp).expect("perp").funding_e12 = e12;
-                eng.store(&state, &[]).await?;
+                coresync::store(eng, &state, &[]).await?;
                 let coin = state.perps[&perp].name.clone();
                 let rate = hc::fmt_dec(e12 as i128, 12);
                 Ok((
@@ -345,7 +243,7 @@ impl EvmAdapter {
                 let who = parse_address(&user)?;
                 state.accounts.entry(who).or_default().spot.insert(token, hc::Spot(total, hold, entry_ntl));
                 let answers = state.answers(&BTreeSet::from([who]));
-                eng.store(&state, &answers).await?;
+                coresync::store(eng, &state, &answers).await?;
                 let e = hypercore::spot_balance(who, token, total, hold, entry_ntl);
                 Ok((
                     json!({ "kind": "hypercore", "helper": "spot-balance", "user": who.to_string(), "token": token, "total": total, "sets": sets_json(&[e]) }),
@@ -361,7 +259,7 @@ impl EvmAdapter {
                 let szi_x8 = state.sz_from_raw(asset, szi).ok_or_else(|| Error::new(ErrorCode::Usage, format!("szi {szi} is out of range for perp {perp}")))?;
                 state.accounts.entry(who).or_default().positions.insert(asset, hc::Pos { szi_x8, entry_ntl, leverage, isolated, isolated_raw_usd, funding_paid: 0 });
                 let answers = state.answers(&BTreeSet::from([who]));
-                eng.store(&state, &answers).await?;
+                coresync::store(eng, &state, &answers).await?;
                 let e = hypercore::position(who, perp, hypercore::Position { szi, entry_ntl, isolated_raw_usd, leverage, is_isolated: isolated });
                 Ok((
                     json!({ "kind": "hypercore", "helper": "position", "user": who.to_string(), "perp": perp, "szi": szi, "sets": sets_json(&[e]) }),
@@ -388,11 +286,26 @@ impl EvmAdapter {
                 let l2 = eng.info(json!({ "type": "l2Book", "coin": name }), &mut calls).await?;
                 let book = State::book_from_info(&l2).ok_or_else(|| Error::new(ErrorCode::UpstreamUnavailable, format!("the info API l2Book for {name} does not parse")))?;
                 let summary = book_summary(&name, asset, &book);
-                state.books.insert(asset, book);
-                eng.store(&state, &[]).await?;
-                Ok((json!({ "kind": "hypercore", "helper": "book", "book": summary, "infoCalls": calls }), json!({ "kind": "set-hypercore", "helper": "book", "coin": name, "time": summary["time"] })))
+                let (_, time) = eng.latest_block().await?;
+                // Resting orders the new book crosses fill, as on a price move.
+                let applied = state.set_book(asset, book, time);
+                coresync::store(eng, &state, &state.answers_for(&applied)).await?;
+                Ok((
+                    json!({ "kind": "hypercore", "helper": "book", "book": summary, "filled": applied.fills, "infoCalls": calls }),
+                    json!({ "kind": "set-hypercore", "helper": "book", "coin": name, "time": summary["time"] }),
+                ))
             }
             CoreOp::Mirror { user } => self.mirror(eng, profile, &mut state, &user).await,
+            CoreOp::BigBlocks { user, on } => {
+                let who = parse_address(&user)?;
+                state.set_big_blocks(who, on);
+                coresync::store(eng, &state, &[]).await?;
+                let addr = who.to_string();
+                Ok((
+                    json!({ "kind": "hypercore", "helper": "big-blocks", "user": addr, "usingBigBlocks": on, "blockGasLimit": hc::block_gas_limit(on) }),
+                    json!({ "kind": "set-hypercore", "helper": "big-blocks", "user": addr, "usingBigBlocks": on }),
+                ))
+            }
         }
     }
 
@@ -411,7 +324,7 @@ impl EvmAdapter {
                 entries.push(Entry { precompile: hypercore::ORACLE_PX, calldata: hypercore::word_u(a as u128).to_vec(), result: hypercore::word_u(o as u128).to_vec() });
             }
         }
-        eng.store(state, &entries).await
+        coresync::store(eng, state, &entries).await
     }
 
     /// `set hypercore mirror <user>`: the user's Core state from the info API,
@@ -439,7 +352,7 @@ impl EvmAdapter {
                     entries.push(Entry { precompile: hypercore::ORACLE_PX, calldata: hypercore::word_u(a as u128).to_vec(), result: hypercore::word_u(o as u128).to_vec() });
                 }
             }
-            eng.store(state, &entries).await?;
+            coresync::store(eng, state, &entries).await?;
         }
         let unknown: Vec<u64> = sch["balances"].as_array().map_or(vec![], |b| b.iter().filter_map(|x| x["token"].as_u64()).filter(|t| !state.tokens.contains_key(t)).collect());
         if !unknown.is_empty() {
@@ -449,7 +362,7 @@ impl EvmAdapter {
         let mut skipped = state.mirror_perps(who, &ch);
         skipped.extend(state.mirror_spot(who, &sch));
         let answers = state.answers(&BTreeSet::from([who]));
-        eng.store(state, &answers).await?;
+        coresync::store(eng, state, &answers).await?;
 
         // The EVM side: native HYPE and the profile tokens, read from the upstream.
         let addr = who.to_string();
@@ -485,12 +398,12 @@ impl EvmAdapter {
     }
 
     /// `call hypercore_state [<user>]`: one user's Core state in the info API's shapes.
-    pub(crate) async fn hypercore_state(&self, eng: &Engine<'_>, handle: &ForkHandle, params: &Value) -> Result<Value> {
+    pub(crate) async fn hypercore_state(&self, eng: &Engine<'_>, params: &Value) -> Result<Value> {
         let user = params.get(0).and_then(Value::as_str).ok_or_else(|| Error::new(ErrorCode::Usage, "hypercore_state takes a user address: chainsim call <name> hypercore_state <address>"))?;
         let who = parse_address(user)?;
-        self.core_lock(handle).await?;
-        let r = self.core_sync_locked(eng).await;
-        self.core_unlock(handle).await;
+        let lease = self.core_lock(eng).await?;
+        let r = coresync::sync_locked(eng).await;
+        self.core_unlock(eng, &lease).await;
         let state = r?.ok_or_else(|| Error::new(ErrorCode::Internal, "this fork has no HyperCore state"))?;
         let (_, ts) = eng.latest_block().await?;
         Ok(state.info(who, ts * 1000))
@@ -498,7 +411,7 @@ impl EvmAdapter {
 
     /// The applied result of each CoreWriter action, by block and log index.
     pub(crate) async fn action_results(&self, eng: &Engine<'_>, decoded: &mut [Value]) -> Result<()> {
-        let Some(state) = eng.load_state().await? else { return Ok(()) };
+        let Some(state) = coresync::load_state(eng).await? else { return Ok(()) };
         for d in decoded {
             let at = (d["block"].as_u64().unwrap_or(0), d["logIndex"].as_str().and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(0));
             d["result"] = json!(state.result_of(at));
@@ -518,10 +431,14 @@ impl EvmAdapter {
         if to <= from {
             return Err(Error::new(ErrorCode::Usage, "--to must be later than --from"));
         }
+        if hc::replay_candles(from, to) > hc::MAX_REPLAY_CANDLES {
+            return Err(Error::new(ErrorCode::Usage, format!("a replay covers at most {} hourly candles (31 days), and this range has {}", hc::MAX_REPLAY_CANDLES, hc::replay_candles(from, to)))
+                .next("replay a shorter range, or several ranges one after another"));
+        }
         let eng = self.engine(&handle, &profile);
-        self.core_lock(&handle).await?;
+        let lease = self.core_lock(&eng).await?;
         let r = self.replay_locked(&handle, &eng, coin, from, to).await;
-        self.core_unlock(&handle).await;
+        self.core_unlock(&eng, &lease).await;
         let (out, mut entry) = r?;
         entry["at"] = json!(now_secs());
         chainsim_core::mods::record(&self.docker, name, &entry).await?;
@@ -529,7 +446,7 @@ impl EvmAdapter {
     }
 
     async fn replay_locked(&self, handle: &ForkHandle, eng: &Engine<'_>, coin: &str, from: u64, to: u64) -> Result<(Value, Value)> {
-        let mut state = self.core_sync_locked(eng).await?.ok_or_else(|| Error::new(ErrorCode::Internal, "this fork has no HyperCore state").next(format!("chainsim down {0} && chainsim up hyperevm-mainnet --name {0}", handle.name)))?;
+        let mut state = coresync::sync_locked(eng).await?.ok_or_else(|| Error::new(ErrorCode::Internal, "this fork has no HyperCore state").next(format!("chainsim down {0} && chainsim up hyperevm-mainnet --name {0}", handle.name)))?;
         let mut calls = 0u32;
         let asset = match state.perps.iter().find(|(_, p)| p.name.eq_ignore_ascii_case(coin)) {
             Some((a, _)) => *a,
@@ -559,7 +476,7 @@ impl EvmAdapter {
             height = head.0;
             // Blocks another client mined since the cursor are applied too, never skipped.
             let from = state.cursor.as_ref().map_or(head.0, |c| c.0 + 1);
-            let events = core_events(eng, &state, from, head.0).await?;
+            let events = coresync::core_events(eng, &state, from, head.0).await?;
             let applied = state.candle_step(&events, asset, *close, head, time);
             fills += applied.fills;
             liquidated.extend(applied.liquidated.iter().map(|a| a.to_string()));
@@ -567,11 +484,11 @@ impl EvmAdapter {
             if let Some(raw) = state.px_to_raw(asset, *close) {
                 answers.extend(hypercore::price(asset, raw));
             }
-            eng.store(&state, &answers).await?;
+            coresync::store(eng, &state, &answers).await?;
             low = low.min(*close);
             high = high.max(*close);
         }
-        eng.settle_credits(&mut state).await?;
+        coresync::settle_credits(eng, &mut state).await?;
         let px = |v: u64| hc::fmt_dec(v as i128, 8);
         let last = path.last().expect("not empty").1;
         chainsim_core::log(format_args!("replayed {} {name} candles in {} ms, {calls} info API calls", path.len(), started.elapsed().as_millis()));
@@ -588,7 +505,7 @@ impl EvmAdapter {
 
     /// What `status` adds: accounts, open orders and the cursor.
     pub(crate) async fn core_status(&self, eng: &Engine<'_>) -> Result<Value> {
-        Ok(match eng.load_state().await? {
+        Ok(match coresync::load_state(eng).await? {
             Some(s) => json!({
                 "accounts": s.accounts.len(), "openOrders": s.orders.len(), "books": s.books.keys().filter_map(|a| s.perps.get(a).map(|p| p.name.clone())).collect::<Vec<_>>(),
                 "appliedThrough": s.cursor.map(|c| c.0),
@@ -620,19 +537,6 @@ fn add_tokens(state: &mut State, spot: &Value, tokens: impl Iterator<Item = u64>
         let evm = m["evmContract"]["address"].as_str().filter(|_| t != 0).map(|a| (a.to_string(), m["evmContract"]["evm_extra_wei_decimals"].as_i64().unwrap_or(0) as i8));
         state.tokens.insert(t, hc::TokenMeta { name: m["name"].as_str().unwrap_or_default().to_string(), wei_decimals: m["weiDecimals"].as_u64().unwrap_or(8) as u8, evm });
     }
-}
-
-/// The Core events in blocks `from..=to`: RawAction, HYPE to its system
-/// address, and Transfers of linked tokens.
-async fn core_events(eng: &Engine<'_>, state: &State, from: u64, to: u64) -> Result<Vec<hc::Logged>> {
-    let mut addresses = vec![json!(hypercore::CORE_WRITER), json!(hc::HYPE_SYSTEM.to_string())];
-    addresses.extend(state.tokens.values().filter_map(|t| t.evm.as_ref()).map(|(a, _)| json!(a)));
-    let filter = json!({
-        "fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{to:x}"), "address": addresses,
-        "topics": [[hypercore::RAW_ACTION_TOPIC, hc::received_topic(), hc::TRANSFER_TOPIC]],
-    });
-    let logs = eng.rpc("eth_getLogs", json!([filter])).await?;
-    Ok(hc::events_from_logs(logs.as_array().map_or(&[][..], Vec::as_slice)))
 }
 
 /// The candles' open times (ms) and closes (x8), oldest first.
@@ -683,19 +587,6 @@ fn sets_json(entries: &[Entry]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn state_code_round_trips_and_foreign_code_is_refused() {
-        let mut s = State::new();
-        s.cursor = Some((5, "0x05".into()));
-        let mut blob = MARKER.to_vec();
-        blob.extend(s.to_bytes());
-        assert_eq!(decode_state(&json!(hypercore::to_hex(&blob))).unwrap(), Some(s));
-        assert_eq!(decode_state(&json!("0x")).unwrap(), None);
-        assert!(decode_state(&json!("0x6080")).is_err());
-        // A call into the state address stops at once.
-        assert_eq!(MARKER[0], 0x00);
-    }
 
     #[test]
     fn usdc_has_no_evm_side_and_linked_tokens_do() {

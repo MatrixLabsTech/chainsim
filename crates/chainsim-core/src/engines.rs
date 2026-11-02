@@ -37,8 +37,12 @@ pub struct EngineRow {
 }
 
 /// The profiles that use each engine.
+/// The engine of the HyperEVM proxy, run beside every profile with HyperCore.
+pub const PROXY_ENGINE: &str = "hyperevm-proxy";
+
 fn users(profiles: &[Profile], id: &str) -> Vec<String> {
-    profiles.iter().filter(|p| p.engine == id || p.control_engine() == id).map(|p| p.key.clone()).collect()
+    // HyperEVM profiles also run the HyperCore proxy.
+    profiles.iter().filter(|p| p.engine == id || p.control_engine() == id || (p.hypercore.is_some() && id == PROXY_ENGINE)).map(|p| p.key.clone()).collect()
 }
 
 pub fn rows(lock: &EngineLock, profiles: &[Profile], present: impl Fn(&str) -> bool) -> Vec<EngineRow> {

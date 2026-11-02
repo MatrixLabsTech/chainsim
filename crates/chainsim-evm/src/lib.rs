@@ -5,6 +5,7 @@
 pub mod abi;
 pub mod core;
 mod corefork;
+pub mod coresync;
 pub mod hypercore;
 pub mod units;
 
@@ -53,7 +54,11 @@ const MINING_METHODS: &[&str] = &["eth_sendTransaction", "eth_sendRawTransaction
 /// The `call` methods chainsim answers itself on HyperEVM.
 pub const HYPERCORE_CALLS: &[&str] = &["corewriter_actions", "hypercore_state"];
 /// The `set hypercore` helpers.
-pub const HYPERCORE_SETS: &[&str] = &["price", "spot-balance", "position", "book", "mirror", "funding"];
+pub const HYPERCORE_SETS: &[&str] = &["price", "spot-balance", "position", "book", "mirror", "funding", "big-blocks"];
+/// The info API request types the HyperEVM proxy answers at `/info`.
+pub const HYPERCORE_INFO: &[&str] = &["clearinghouseState", "spotClearinghouseState", "openOrders", "userFills", "meta", "metaAndAssetCtxs", "l2Book", "allMids"];
+/// The custom JSON-RPC methods the HyperEVM proxy answers.
+pub const HYPERCORE_RPC: &[&str] = &["eth_usingBigBlocks", "eth_bigBlockGasPrice"];
 /// The `time` options on HyperEVM.
 pub const HYPERCORE_TIME: &[&str] = &["advance", "to", "replay"];
 
@@ -390,9 +395,10 @@ impl EvmAdapter {
             }
         };
         let alias = req.alias.clone().unwrap_or_else(|| name.clone());
+        let proxied = profile.hypercore.is_some();
 
         self.docker.run_control(&self.lock, profile.control_engine(), name, &network, &upstream).await?;
-        let control = Control::new(&self.docker, docker::control_container(name), secret).with_env(&profile.upstream.env);
+        let control = Control::new(&self.docker, docker::control_container(name), secret.clone()).with_env(&profile.upstream.env);
 
         // The fork point: the asked block, or the upstream head now, so the
         // label records the exact block.
@@ -426,22 +432,24 @@ impl EvmAdapter {
             env: vec![format!("{UPSTREAM_ENV}={upstream}")],
             labels,
             network: network.clone(),
-            aliases: vec![alias.clone()],
+            // On HyperEVM the proxy takes the fork's alias and published port.
+            aliases: vec![if proxied { engine_alias(&alias) } else { alias.clone() }],
             tmpfs,
             memory: docker::ENGINE_MEMORY,
-            publish: req.publish.then_some(profile.rpc_port()),
+            publish: (req.publish && !proxied).then_some(profile.rpc_port()),
             mounts: vec![],
         };
         self.docker.run(&spec).await?;
 
         let handle = self.docker.find(name).await?.ok_or_else(|| Error::new(ErrorCode::EngineFailed, "the engine container vanished after start"))?;
         let eng = self.engine(&handle, profile);
+        let direct = Engine { control: Control::new(&self.docker, handle.control_container.clone(), secret.clone()).with_env(&profile.upstream.env), url: Target::Engine(engine_url(&handle, profile)) };
         let started = Instant::now();
         loop {
             if !self.docker.is_running(&handle.engine_container).await {
                 return Err(self.engine_failure(name, &eng.control).await);
             }
-            if eng.rpc_timeout("eth_blockNumber", json!([]), Duration::from_secs(5)).await.is_ok() {
+            if direct.rpc_timeout("eth_blockNumber", json!([]), Duration::from_secs(5)).await.is_ok() {
                 break;
             }
             if started.elapsed() > READY_TIMEOUT {
@@ -449,6 +457,9 @@ impl EvmAdapter {
                 return Err(Error::new(e.code, format!("the engine did not answer within {} s. {}", READY_TIMEOUT.as_secs(), e.message)));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        if proxied {
+            self.start_proxy(&handle, profile, req, &network, &alias, &eng).await?;
         }
 
         for o in &profile.overrides {
@@ -494,6 +505,10 @@ impl EvmAdapter {
 
         let dev = self.dev_accounts(&eng).await;
         let mut fork = handle.fork(profile, dev);
+        if profile.hypercore.is_some() {
+            // WebSocket clients reach anvil directly: the proxy serves HTTP.
+            fork.ws_url = profile.ports.ws.map(|p| format!("ws://{}:{p}", engine_alias(&handle.alias)));
+        }
         fork.hypercore = seeded;
         Ok(fork)
     }
@@ -519,6 +534,10 @@ impl EvmAdapter {
     /// The fork object, with what `up` seeded on a HyperEVM fork.
     async fn fork_of(&self, handle: &ForkHandle, profile: &Profile, dev: Option<Vec<String>>) -> Fork {
         let mut fork = handle.fork(profile, dev);
+        if profile.hypercore.is_some() {
+            // WebSocket clients reach anvil directly: the proxy serves HTTP.
+            fork.ws_url = profile.ports.ws.map(|p| format!("ws://{}:{p}", engine_alias(&handle.alias)));
+        }
         if profile.hypercore.is_some() {
             fork.hypercore = Some(load_hypercore(&self.docker, &handle.name).await);
         }
@@ -560,6 +579,46 @@ impl EvmAdapter {
             json!({ "kind": "precompile", "address": addr, "calldata": cd, "result": res, "source": source }),
             json!({ "kind": "set-precompile", "address": addr, "calldata": cd, "result": res, "source": source }),
         ))
+    }
+
+    /// Starts the HyperEVM proxy on the fork's alias and waits until it answers.
+    async fn start_proxy(&self, handle: &ForkHandle, profile: &Profile, req: &UpRequest, network: &str, alias: &str, eng: &Engine<'_>) -> Result<()> {
+        let engine = self.lock.engine(PROXY_ENGINE)?;
+        let image = self.docker.ensure_engine(PROXY_ENGINE, engine).await?;
+        let labels = HashMap::from([
+            (docker::LABEL_FORK.to_string(), handle.name.clone()),
+            (docker::LABEL_CHAIN.to_string(), profile.key.clone()),
+            (docker::LABEL_ENGINE.to_string(), format!("{PROXY_ENGINE}@{}", engine.version)),
+            (docker::LABEL_ROLE.to_string(), docker::ROLE_PROXY.to_string()),
+            (docker::LABEL_NETWORK.to_string(), network.to_string()),
+        ]);
+        let spec = ContainerSpec {
+            name: docker::proxy_container(&handle.name),
+            image,
+            user: engine.user.clone(),
+            entrypoint: None,
+            cmd: vec![],
+            env: vec![format!("CHAINSIM_PROXY_ENGINE={}", engine_url(handle, profile)), format!("CHAINSIM_PROXY_LISTEN=0.0.0.0:{}", profile.rpc_port())],
+            labels,
+            network: network.to_string(),
+            aliases: vec![alias.to_string()],
+            tmpfs: vec![("/tmp".to_string(), "rw,nosuid,size=16m".to_string())],
+            memory: docker::PROXY_MEMORY,
+            publish: req.publish.then_some(profile.rpc_port()),
+            mounts: vec![],
+        };
+        self.docker.run(&spec).await?;
+        let started = Instant::now();
+        loop {
+            if eng.rpc_timeout("eth_blockNumber", json!([]), Duration::from_secs(5)).await.is_ok() {
+                return Ok(());
+            }
+            if !self.docker.is_running(&docker::proxy_container(&handle.name)).await || started.elapsed() > READY_TIMEOUT {
+                let log = self.docker.logs_tail(&docker::proxy_container(&handle.name), 10).await;
+                return Err(Error::new(ErrorCode::EngineFailed, format!("the HyperEVM proxy did not start: {}", eng.control.scrub(log.trim()))));
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
     }
 
     async fn dev_accounts(&self, eng: &Engine<'_>) -> Option<Vec<String>> {
@@ -813,6 +872,22 @@ impl EvmAdapter {
 
 /// The engine's `sh -c` command line. The upstream URL stays in the
 /// environment, so it is never in the container's arguments.
+/// The engine's alias behind a HyperEVM proxy.
+pub fn engine_alias(alias: &str) -> String {
+    format!("{alias}-engine")
+}
+
+/// The engine's own in-network URL: behind the proxy on HyperEVM, the fork's RPC URL elsewhere.
+pub fn engine_url(handle: &ForkHandle, profile: &Profile) -> String {
+    if profile.hypercore.is_some() {
+        format!("http://{}:{}", engine_alias(&handle.alias), profile.rpc_port())
+    } else {
+        handle.rpc_url(profile)
+    }
+}
+
+pub use chainsim_core::engines::PROXY_ENGINE;
+
 pub fn anvil_command(profile: &Profile, block: u64) -> String {
     let mut script = vec![
         "exec anvil --host 0.0.0.0".to_string(),
@@ -1189,7 +1264,7 @@ impl Adapter for EvmAdapter {
             return Ok(json!(decoded));
         }
         if method == "hypercore_state" && profile.hypercore.is_some() {
-            return self.hypercore_state(&eng, &handle, &params).await;
+            return self.hypercore_state(&eng, &params).await;
         }
         let result = match from {
             None => eng.rpc(method, params).await?,

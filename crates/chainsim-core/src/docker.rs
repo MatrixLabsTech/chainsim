@@ -32,12 +32,16 @@ pub const LABEL_OWNER: &str = "org.chainsim.owner";
 
 pub const ROLE_ENGINE: &str = "engine";
 pub const ROLE_CONTROL: &str = "control";
+/// The HyperEVM proxy in front of the engine.
+pub const ROLE_PROXY: &str = "proxy";
 /// A short-lived container that prepares a fork volume.
 pub const ROLE_INIT: &str = "init";
 
 /// The engine's memory limit.
 pub const ENGINE_MEMORY: i64 = 1 << 30;
 const CONTROL_MEMORY: i64 = 64 << 20;
+/// The HyperEVM proxy's memory limit.
+pub const PROXY_MEMORY: i64 = 256 << 20;
 
 /// A fork name: lowercase letters, digits and `-`, up to 40 characters.
 pub fn check_name(name: &str) -> Result<()> {
@@ -58,6 +62,10 @@ pub fn engine_container(name: &str) -> String {
 
 pub fn control_container(name: &str) -> String {
     format!("chainsim-{name}-control")
+}
+
+pub fn proxy_container(name: &str) -> String {
+    format!("chainsim-{name}-proxy")
 }
 
 pub fn default_network(name: &str) -> String {
@@ -597,11 +605,20 @@ impl Docker {
             .and_then(parse_rfc3339_secs)
             .map(|start| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|now| now.as_secs().saturating_sub(start)).unwrap_or(0))
             .unwrap_or(0);
-        let host_port = c
-            .network_settings
-            .as_ref()
-            .and_then(|n| n.ports.as_ref())
-            .and_then(|ports| ports.values().flatten().flatten().find(|b| b.host_ip.as_deref() == Some("127.0.0.1")).and_then(|b| b.host_port.as_ref()?.parse().ok()));
+        let published = |c: &bollard::models::ContainerInspectResponse| -> Option<u16> {
+            c.network_settings
+                .as_ref()
+                .and_then(|n| n.ports.as_ref())
+                .and_then(|ports| ports.values().flatten().flatten().find(|b| b.host_ip.as_deref() == Some("127.0.0.1")).and_then(|b| b.host_port.as_ref()?.parse().ok()))
+        };
+        // A fork with a proxy (HyperEVM) publishes the proxy's port, not the engine's.
+        let host_port = match published(&c) {
+            Some(p) => Some(p),
+            None => match self.inner.inspect_container(&proxy_container(&get(LABEL_FORK)), None::<bollard::query_parameters::InspectContainerOptions>).await {
+                Ok(p) => published(&p),
+                Err(_) => None,
+            },
+        };
         Ok(Some(ForkHandle {
             control_container: control_container(&name),
             engine_container: engine_container(&name),
@@ -633,6 +650,7 @@ impl Docker {
         let handle = self.find(name).await?;
         let engine = self.remove_container(&engine_container(name)).await?;
         let control = self.remove_container(&control_container(name)).await?;
+        self.remove_container(&proxy_container(name)).await?;
         // Volumes labeled with the fork (Solana and Sui revert state).
         let filters = HashMap::from([("label".to_string(), vec![format!("{LABEL_FORK}={name}")])]);
         let vols = self

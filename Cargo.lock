@@ -542,6 +542,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "chainsim-hyperproxy"
+version = "0.1.7"
+dependencies = [
+ "alloy-primitives",
+ "async-trait",
+ "chainsim-core",
+ "chainsim-evm",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "chainsim-sui"
 version = "0.1.7"
 dependencies = [
