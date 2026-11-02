@@ -19,7 +19,9 @@ error codes from the binary.
   | --live)` stores a HyperCore read precompile's answer, `set hypercore price|spot-balance|position`
   sets prices and an account's Core state, `set hypercore book <coin> --live` refreshes a perp's
   order book, `set hypercore mirror <user>` copies a mainnet account onto the copy, and `set
-  hypercore funding <perp> <rate>` sets a perp's hourly funding rate. `set hypercore price` also
+  hypercore funding <perp> <rate>` sets a perp's hourly funding rate. `set hypercore book` takes a
+  builder-deployed perp as `dex:coin` (xyz:XYZ100), and `price` takes its perp index
+  (dex * 10000 + index). CoreWriter orders on such perps use asset 100000 + perp index. `set hypercore price` also
   fills crossed resting orders and liquidates, and returns `filled` and `liquidated`. `time <name>
   --replay <perp> --from <time> --to <time>` replays hourly mainnet candles as the price path. `call <name>
   corewriter_actions [{"fromBlock": <n>}]` returns every CoreWriter action decoded with its
@@ -62,7 +64,8 @@ error codes from the binary.
 - On HyperEVM, `rpcUrl` and `hostRpcUrl` are chainsim's proxy, which applies CoreWriter actions
   and bridge transfers after every block for any client, mines small and big blocks per sender
   (`set hypercore big-blocks <user> on|off`, `eth_usingBigBlocks`, `eth_bigBlockGasPrice`) and
-  answers `POST /info` from the copy. `wsUrl` is anvil itself: a transaction sent over a
+  answers `POST /info` from the copy, including borrowLendUserState, borrowLendReserveState and
+  allBorrowLendReserveStates, with `"dex"` for builder-deployed dexes. `wsUrl` is anvil itself: a transaction sent over a
   WebSocket reaches HyperCore at the next HTTP request or chainsim command. `describe
   hyperevm-mainnet` lists the info request types and RPC methods the proxy serves, and in
   `limits` what HyperCore does not model.

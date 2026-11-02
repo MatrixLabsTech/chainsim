@@ -150,6 +150,7 @@ The full contract, with every error code, is in [docs/agent-contract.md](docs/ag
 | <img src="assets/chains/sui.svg" height="32" alt="Sui"> &nbsp;**Sui mainnet** `sui-mainnet` | Mysten sui-fork mainnet-v1.82.3-de683df9e4e0, built with chainsim's SetObject patch | [chains/sui](chains/sui/README.md) |
 | <img src="assets/chains/aptos.svg" height="32" alt="Aptos"> &nbsp;**Aptos mainnet** `aptos-mainnet` | Aptos CLI 9.6.0 simulation sessions | [chains/aptos](chains/aptos/README.md) |
 | <img src="assets/chains/hyperliquid.svg" height="32" alt="Hyperliquid"> &nbsp;**HyperEVM mainnet** `hyperevm-mainnet` | Foundry anvil v1.8.5 with HyperCore modeled on the copy | [chains/hyperliquid](chains/hyperliquid/README.md) |
+| <img src="assets/chains/hyperliquid.svg" height="32" alt="Hyperliquid"> &nbsp;**HyperEVM testnet** `hyperevm-testnet` | Foundry anvil v1.8.5 with HyperCore modeled on the copy | [chains/hyperliquid](chains/hyperliquid/README.md#hyperevm-testnet) |
 
 The chain logos are trademarks of their owners and identify the chains only.
 
@@ -208,6 +209,10 @@ the same JSON contract and exit codes as every other chain.
 - An RPC proxy in front of the fork applies HyperCore after every block for any client, such as
   forge, cast or a frontend, mines small and big blocks per sender, and serves the Hyperliquid
   info API for the copy at `/info`.
+- Builder-deployed (HIP-3) perps trade on their own dex balance, with isolated margin where the
+  perp is isolated only, and borrow and lend supplies, borrows against collateral and accrues
+  interest, read back through `0x811` and `0x812`.
+- `hyperevm-testnet` forks HyperEVM Testnet with the same HyperCore features.
 - `snapshot` and `revert` carry Core state with the rest of the fork.
 
 ```sh

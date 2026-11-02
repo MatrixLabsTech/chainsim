@@ -1,13 +1,14 @@
 <p align="center"><img src="../../assets/chains/hyperliquid.svg" height="96" alt="Hyperliquid"></p>
 
-# HyperEVM mainnet
+# HyperEVM mainnet and testnet
 
 chainsim runs a private copy of HyperEVM Mainnet, the EVM side of Hyperliquid, in Docker as the
-chain `hyperevm-mainnet`. The commands and their JSON output are the same as on every chain, and
+chain `hyperevm-mainnet`, and of HyperEVM Testnet as `hyperevm-testnet` (see
+[HyperEVM testnet](#hyperevm-testnet)). The commands and their JSON output are the same as on every chain, and
 the [README](../../README.md) covers the shared workflow. This page covers what is specific to
 HyperEVM. Every output below comes from a live run against HyperEVM Mainnet, on 2026-11-01 for
-the precompile answers and on 2026-11-02 for the local HyperCore, market scripting and the
-proxy.
+the precompile answers and on 2026-11-02 for the local HyperCore, market scripting, the proxy,
+builder-deployed perps, borrow and lend, and testnet.
 
 ## What chainsim gives on HyperEVM
 
@@ -27,6 +28,11 @@ proxy.
   crosses and liquidates accounts below maintenance margin, `time --replay` plays a past stretch
   of mainnet candles as the price path, funding accrues every hour of the fork's clock, and every
   fill pays maker or taker fees.
+- Builder-deployed (HIP-3) perps, such as xyz:XYZ100, with their own dex balance and margin,
+  isolated margin where the perp is isolated only, and their mainnet books.
+- Borrow and lend: supply and withdraw through CoreWriter, implicit borrowing for portfolio margin
+  and unified accounts, hourly interest, health factor and liquidation, read through `0x811` and
+  `0x812`.
 - An RPC proxy in front of the fork, so any client, such as forge, cast, a frontend or an SDK,
   gets HyperCore applied on every block with no chainsim command in between.
 - Small and big blocks as on mainnet, per sender, with `eth_usingBigBlocks` and
@@ -563,6 +569,88 @@ curl -X POST -H 'content-type: application/json' \
 `clearinghouseState` matches `call hypercore_state`, whose output also carries the user's fills
 under `userFills`. `meta` and `metaAndAssetCtxs` cover the whole perp universe from the snapshot
 `up` took, with the copy's own mark, oracle, funding and mid for the perps it tracks.
+
+## Builder-deployed perps (HIP-3)
+
+Builder-deployed dexes list their perps as `dex:coin`, such as `xyz:XYZ100`. Orders and CoreWriter
+use asset `100000 + dex * 10000 + index`, and the read precompiles take the perp index
+`dex * 10000 + index` (measured on the mainnet RPC: `0x806` with 10000 answers xyz:XYZ100). xyz is
+dex 1, so xyz:XYZ100 is perp 10000 and asset 110000.
+
+- `set hypercore book xyz:XYZ100 --live` adds the perp with its mainnet book, mark and oracle
+  price, and the dex's meta for `/info`. `set hypercore price 10000 <px>` and `set hypercore
+  mirror` cover HIP-3 perps the same way. None are seeded at `up`.
+- Each dex has its own USD balance and cross margin. `sendAsset` (CoreWriter action 13) moves USDC
+  between the main dex (0), a builder dex and spot (dex 4294967295). Only dexes with USDC
+  collateral trade on the copy.
+- Perps meta marks `onlyIsolated` hold isolated margin per position: the order's leverage sets
+  the margin at open, liquidation checks the position against its own margin, and a loss past it
+  stays off the dex balance.
+- `0x800` (uint16 perp) and `0x813` (uint32 perp) answer positions, `0x80f` takes the dex, and
+  `/info` takes `"dex": "xyz"` for meta, metaAndAssetCtxs, clearinghouseState, openOrders and
+  allMids. `call hypercore_state` lists builder dexes under `dexes`.
+
+In the 2026-11-02 run, a wallet sent 600 USD to xyz with sendAsset, bought 0.01 xyz:XYZ100 with an
+IOC at 28,610.0 (the book's best ask), read szi 100 back through `0x800` and `0x813`, and opened
+an isolated xyz:HOOD long and a cross BTC long. A 30% HOOD drop liquidated the HOOD position
+alone:
+
+```text
+liquidated: isolated xyz:HOOD equity … USD below maintenance margin … USD, closed … xyz:HOOD at …
+```
+
+XYZ100 on xyz and BTC on the main dex kept their positions.
+
+## Borrow and lend
+
+Borrow and lend follows Hyperliquid's
+[portfolio margin](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/portfolio-margin) and
+[manual borrows](https://hyperliquid.gitbook.io/hyperliquid-docs/support/faq/manual-borrows)
+pages.
+
+- `up` takes every reserve from the info API's `allBorrowLendReserveStates`: LTV (0.65 for HYPE,
+  0.5 for UBTC, 0 for the stablecoins), oracle price, total supplied and borrowed.
+- CoreWriter action 15 supplies (0) or withdraws (1) a token, `wei` 0 meaning all of it. Action
+  16 sets the account abstraction: 2 unified account, 3 portfolio margin.
+- Borrowing is implicit, as on mainnet: for a portfolio margin or unified account, a spot send,
+  USD class transfer or sendAsset beyond the spot balance borrows the stablecoin it lacks against
+  supplied collateral, while the health factor (LTV-weighted collateral over borrowed value)
+  stays at or above 1. A later credit of that token repays first.
+- Stablecoins accrue `0.05 + 4.75 * max(0, utilization - 0.8)` a year, indexed every hour of the
+  fork's clock, and suppliers earn it times utilization, less 10%. Past a 0.95 ratio between the
+  borrowed value and the collateral weighted by `0.5 + 0.5 * LTV`, the backstop takes collateral
+  at the oracle price.
+- `0x811` answers a user's borrow and supply (basis and value, token wei) and `0x812` a reserve
+  (rates and utilization in bps, oracle price, LTV, totals). `/info` answers borrowLendUserState,
+  borrowLendReserveState and allBorrowLendReserveStates, and `set hypercore mirror` copies a
+  user's borrow and lend positions and abstraction.
+
+In the 2026-11-02 run, a wallet supplied 10 HYPE, switched to portfolio margin and sent 100 USDC
+it did not hold. `0x811` read a USDC borrow of 10,000,000,000 wei and 10 HYPE supplied, `0x812`
+showed USDC's total borrowed up by the same amount, and after `time --advance 7200` the borrow read
+10,000,114,154 wei, two hours at 5% a year. A mirror of a mainnet portfolio margin account copied
+its 3 borrow and lend tokens.
+
+## HyperEVM testnet
+
+`hyperevm-testnet` forks HyperEVM Testnet (chain id 998) from
+`https://rpc.hyperliquid-testnet.xyz/evm`, under `CHAINSIM_HYPEREVM_TESTNET_RPC`, with the same
+proxy and HyperCore features. Its info API is `https://api.hyperliquid-testnet.xyz/info`, under
+`CHAINSIM_HYPERLIQUID_TESTNET_INFO`.
+
+- `up` seeds the BTC (3), ETH (4), SOL (0) and HYPE (135) perps, USDC and HYPE, which is token
+  1105 on testnet, and HYPE/USDC spot 1035. HYPE sent to `0x2222…2222` credits token 1105.
+- `fund` covers WHYPE (`0x5555…5555`) and PURR (`0xa9056c15938f9aff34cd497c722ce33db0c2fd57`,
+  linked to Core token 1) by setting balances directly, so no holder is needed. Testnet's USDC
+  entry is not an ERC-20 on HyperEVM.
+- `selftest` checks nine parts as on mainnet, with PURR for the token transfer.
+
+In the 2026-11-02 run, `up` took 18.6 s, `selftest` passed 9 of 9, `fund` gave 5 HYPE and 100 PURR,
+and a CoreWriter IOC on BTC filled against the testnet book:
+
+```text
+filled 0.00001 at 79352.0, fee 0.000357 USD
+```
 
 ## CoreWriter actions
 
