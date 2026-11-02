@@ -57,7 +57,10 @@ pub const HYPERCORE_CALLS: &[&str] = &["corewriter_actions", "hypercore_state"];
 /// The `set hypercore` helpers.
 pub const HYPERCORE_SETS: &[&str] = &["price", "spot-balance", "position", "book", "mirror", "funding", "big-blocks"];
 /// The info API request types the HyperEVM proxy answers at `/info`.
-pub const HYPERCORE_INFO: &[&str] = &["clearinghouseState", "spotClearinghouseState", "openOrders", "userFills", "meta", "metaAndAssetCtxs", "l2Book", "allMids"];
+pub const HYPERCORE_INFO: &[&str] = &[
+    "clearinghouseState", "spotClearinghouseState", "openOrders", "userFills", "meta", "metaAndAssetCtxs", "l2Book", "allMids",
+    "borrowLendUserState", "borrowLendReserveState", "allBorrowLendReserveStates",
+];
 /// The custom JSON-RPC methods the HyperEVM proxy answers.
 pub const HYPERCORE_RPC: &[&str] = &["eth_usingBigBlocks", "eth_bigBlockGasPrice"];
 /// The `time` options on HyperEVM.
