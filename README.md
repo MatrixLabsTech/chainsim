@@ -154,7 +154,7 @@ JSON contract and exit codes as Ethereum, Arc, Robinhood Chain and Sui.
 
 - `send --as` runs an entry function as any account, without its key.
 - `fund` gives a test wallet APT and Circle's native USDC in one command and reads both back.
-- `set resource` replaces any Move resource under an account, for state no transaction can reach.
+- `set resource` replaces a Move resource under an account, for state no transaction can reach.
 - `snapshot` and `revert` reset the fork between scenarios, and `time` and `mine` move its clock.
 - `selftest` checks the fork before a test relies on it.
 

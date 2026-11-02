@@ -13,7 +13,7 @@ shared workflow. This page covers what is specific to Aptos.
   admin or a large token holder.
 - `fund` gives a test wallet APT and Circle's native USDC in one command and reads both balances
   back.
-- `set resource` replaces any Move resource under an account with the bytes you give, for state
+- `set resource` replaces a Move resource under an account with the bytes you give, for state
   no transaction can reach.
 - `snapshot` and `revert` reset the fork between scenarios.
 - `time` and `mine` move the on-chain clock and produce blocks.
@@ -36,7 +36,7 @@ chainsim call aptos-mainnet ledger
 chainsim down aptos-mainnet
 ```
 
-An API key comes free from Aptos Labs' developer portal at https://geomi.dev.
+An API key comes from Aptos Labs' developer portal at https://geomi.dev.
 
 ## Commands
 
