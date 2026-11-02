@@ -40,6 +40,7 @@ pub enum CoreOp {
     Mirror { user: String },
     Funding { perp: u32, rate: String },
     BigBlocks { user: String, on: bool },
+    IsolatedMargin { user: String, perp: u32, usd: String },
 }
 
 /// The info API URL and the variable that replaces it, for a HyperEVM profile.
@@ -283,7 +284,10 @@ impl EvmAdapter {
                 if !state.perps.contains_key(&perp) {
                     self.add_perps(eng, &mut state, &[perp], &mut calls).await?;
                 }
-                state.perps.get_mut(&perp).expect("perp").funding_e12 = e12;
+                // A rate set by hand replaces the HIP-3 premium formula for this perp.
+                let p = state.perps.get_mut(&perp).expect("perp");
+                p.funding_e12 = e12;
+                p.hip3_funding = None;
                 coresync::store(eng, &state, &[]).await?;
                 let coin = state.perps[&perp].name.clone();
                 let rate = hc::fmt_dec(e12 as i128, 12);
@@ -335,6 +339,21 @@ impl EvmAdapter {
                 ))
             }
             CoreOp::Mirror { user } => self.mirror(eng, profile, &mut state, &user).await,
+            CoreOp::IsolatedMargin { user, perp, usd } => {
+                let who = parse_address(&user)?;
+                let ntli = hc::parse_dec(usd.trim().trim_start_matches('+'), 6).and_then(|v| i64::try_from(v).ok()).ok_or_else(|| Error::new(ErrorCode::Usage, format!("{usd:?} is not a USD amount, such as +25 or -10.5")))?;
+                let (_, time) = eng.latest_block().await?;
+                state.set_now(time);
+                let status = state.update_isolated_margin(who, perp, ntli).map_err(|e| Error::new(ErrorCode::Usage, e))?;
+                coresync::store(eng, &state, &state.answers(&BTreeSet::from([who]))).await?;
+                let p = state.accounts[&who].positions[&perp];
+                let margin = state.isolated_health(perp, &p).0;
+                let addr = who.to_string();
+                Ok((
+                    json!({ "kind": "hypercore", "helper": "isolated-margin", "user": addr, "perp": perp, "coin": state.perps.get(&perp).map(|x| x.name.clone()), "ntli": ntli, "margin": hc::fmt_dec(margin as i128, 6), "status": status }),
+                    json!({ "kind": "set-hypercore", "helper": "isolated-margin", "user": addr, "perp": perp, "ntli": ntli }),
+                ))
+            }
             CoreOp::BigBlocks { user, on } => {
                 let who = parse_address(&user)?;
                 state.set_big_blocks(who, on);
@@ -350,8 +369,7 @@ impl EvmAdapter {
 
     /// The builder-deployed perp dexes: (index, name), from perpDexs.
     async fn perp_dexes(&self, eng: &Engine<'_>, calls: &mut u32) -> Result<Vec<(u32, String)>> {
-        let list = eng.info(json!({ "type": "perpDexs" }), calls).await?;
-        Ok(list.as_array().map_or(vec![], |l| l.iter().enumerate().filter_map(|(i, d)| d["name"].as_str().map(|n| (i as u32, n.to_string()))).collect()))
+        Ok(dex_names(&eng.info(json!({ "type": "perpDexs" }), calls).await?))
     }
 
     /// A builder-deployed dex's meta and asset contexts, recorded in the
@@ -403,12 +421,13 @@ impl EvmAdapter {
             None => self.perp_dexes(eng, calls).await?.into_iter().find(|(_, n)| *n == dex_name).map(|(d, _)| d).ok_or_else(|| Error::new(ErrorCode::Usage, format!("no perp dex {dex_name} on Hyperliquid")))?,
         };
         let raw = self.dex_meta(eng, dex, &dex_name, calls).await?;
+        let list = eng.info(json!({ "type": "perpDexs" }), calls).await?;
         let universe = raw[0]["universe"].as_array().cloned().unwrap_or_default();
         let local = match index {
             Some(i) => (i - dex * hc::DEX_SIZE) as usize,
             None => universe.iter().position(|u| u["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(coin))).ok_or_else(|| Error::new(ErrorCode::Usage, format!("no perp {coin} on Hyperliquid")))?,
         };
-        let entries = insert_perp(state, dex * hc::DEX_SIZE + local as u32, &raw, local).ok_or_else(|| Error::new(ErrorCode::Usage, format!("no perp {coin} on Hyperliquid")))?;
+        let entries = insert_perp(state, dex * hc::DEX_SIZE + local as u32, &raw, local, &list[dex as usize]).ok_or_else(|| Error::new(ErrorCode::Usage, format!("no perp {coin} on Hyperliquid")))?;
         coresync::store(eng, state, &entries).await?;
         Ok(dex * hc::DEX_SIZE + local as u32)
     }
@@ -468,7 +487,8 @@ impl EvmAdapter {
 
         // Builder-deployed dexes the user has value on, each with its own balance and positions.
         let mut dexes = Vec::new();
-        for (index, name) in self.perp_dexes(eng, &mut calls).await? {
+        let list = eng.info(json!({ "type": "perpDexs" }), &mut calls).await?;
+        for (index, name) in dex_names(&list) {
             let chd = eng.info(json!({ "type": "clearinghouseState", "user": who.to_string().to_lowercase(), "dex": name }), &mut calls).await?;
             let positions: Vec<String> = chd["assetPositions"].as_array().map_or(vec![], |a| a.iter().filter_map(|p| p["position"]["coin"].as_str().map(str::to_string)).collect());
             let value = chd["marginSummary"]["accountValue"].as_str().and_then(|v| hc::parse_dec(v, 6)).unwrap_or(0);
@@ -482,7 +502,7 @@ impl EvmAdapter {
                 if let Some(local) = universe.iter().position(|u| u["name"] == json!(coin)) {
                     let perp = index * hc::DEX_SIZE + local as u32;
                     if !state.perps.contains_key(&perp) {
-                        entries.extend(insert_perp(state, perp, &raw, local).unwrap_or_default());
+                        entries.extend(insert_perp(state, perp, &raw, local, &list[index as usize]).unwrap_or_default());
                     }
                 }
             }
@@ -654,12 +674,13 @@ impl EvmAdapter {
 /// Inserts the perp at `local` in a metaAndAssetCtxs answer as perp index
 /// `perp`, with its dex's collateral token, and returns its mark and oracle
 /// answers. None when the meta has no such perp.
-fn insert_perp(state: &mut State, perp: u32, raw: &Value, local: usize) -> Option<Vec<Entry>> {
+fn insert_perp(state: &mut State, perp: u32, raw: &Value, local: usize, dex: &Value) -> Option<Vec<Entry>> {
     let u = raw[0]["universe"].as_array()?.get(local)?.clone();
     let ctx = raw[1].as_array()?.get(local)?.clone();
     let d = u["szDecimals"].as_u64().unwrap_or(0) as u8;
     let mut p = perp_from_ctx(&u, &ctx, &raw[0]["marginTables"]);
     p.collateral = raw[0]["collateralToken"].as_u64().unwrap_or(0);
+    p.hip3_funding = Some(hc::Hip3Funding::from_dex(dex, &p.name));
     state.perps.insert(perp, p);
     let mut entries = Vec::new();
     if let (Some(m), Some(o)) = (ctx["markPx"].as_str().and_then(|s| raw_px(s, d)), ctx["oraclePx"].as_str().and_then(|s| raw_px(s, d))) {
@@ -667,6 +688,11 @@ fn insert_perp(state: &mut State, perp: u32, raw: &Value, local: usize) -> Optio
         entries.push(Entry { precompile: hypercore::ORACLE_PX, calldata: hypercore::word_u(perp as u128).to_vec(), result: hypercore::word_u(o as u128).to_vec() });
     }
     Some(entries)
+}
+
+/// The perp dexes in a perpDexs answer: (index, name). Index 0 is the main dex (null).
+fn dex_names(list: &Value) -> Vec<(u32, String)> {
+    list.as_array().map_or(vec![], |l| l.iter().enumerate().filter_map(|(i, d)| d["name"].as_str().map(|n| (i as u32, n.to_string()))).collect())
 }
 
 /// A perp from the info API's meta and asset context: the current mark,

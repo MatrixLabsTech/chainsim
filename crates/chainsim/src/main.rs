@@ -275,6 +275,15 @@ enum HyperCoreWhat {
         #[arg(allow_hyphen_values = true)]
         rate: String,
     },
+    /// Add (+) or remove (-) USD margin on an isolated position, as the exchange's updateIsolatedMargin.
+    IsolatedMargin {
+        user: String,
+        /// The perp (dex x 10000 + index for HIP-3).
+        perp: u32,
+        /// USD, such as +25 or -10.5.
+        #[arg(allow_hyphen_values = true)]
+        usd: String,
+    },
     /// Whether an address's EVM transactions go into big blocks (30M gas) or small ones (3M).
     BigBlocks {
         user: String,
@@ -301,6 +310,7 @@ async fn set_hypercore(name: &str, what: HyperCoreWhat) -> Result<Value> {
         HyperCoreWhat::Mirror { user } => CoreOp::Mirror { user },
         HyperCoreWhat::Funding { perp, rate } => CoreOp::Funding { perp, rate },
         HyperCoreWhat::BigBlocks { user, state } => CoreOp::BigBlocks { user, on: state == "on" },
+        HyperCoreWhat::IsolatedMargin { user, perp, usd } => CoreOp::IsolatedMargin { user, perp, usd },
     };
     EvmAdapter::connect().await?.hypercore(name, op).await
 }

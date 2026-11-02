@@ -142,6 +142,59 @@ pub const FUNDING_CLAMP_E12: i64 = 500_000_000;
 /// Funding is capped at 4% an hour.
 pub const FUNDING_CAP_E12: i64 = 40_000_000_000;
 
+impl Hip3Funding {
+    /// A perp's settings from its dex's perpDexs entry: assetToFundingMultiplier,
+    /// assetToFundingInterestRate and assetToFundingClamp, keyed by the perp's
+    /// name. A perp the lists leave out takes multiplier 1 and the defaults.
+    pub fn from_dex(dex: &Value, name: &str) -> Self {
+        let find = |key: &str| dex[key].as_array().and_then(|l| l.iter().find(|e| e[0].as_str() == Some(name))).and_then(|e| e[1].as_str()).and_then(|v| parse_dec(v, 12)).map(|v| v as i64);
+        Self { multiplier_e12: find("assetToFundingMultiplier").unwrap_or(1_000_000_000_000), rate_e12: find("assetToFundingInterestRate").unwrap_or(FUNDING_RATE_E12), clamp_e12: find("assetToFundingClamp").unwrap_or(FUNDING_CLAMP_E12) }
+    }
+
+    /// The hourly funding rate (12 decimals) from the premium, also 12 decimals:
+    /// multiplier x (premium + clamp(rate - premium, -clamp, clamp)) / 8, capped at 4% an hour.
+    pub fn hourly_e12(&self, premium_e12: i64) -> i64 {
+        let p = premium_e12 as i128;
+        let c = self.clamp_e12 as i128;
+        let eight_hour = p + (self.rate_e12 as i128 - p).clamp(-c, c);
+        (self.multiplier_e12 as i128 * eight_hour / 1_000_000_000_000 / 8).clamp(-(FUNDING_CAP_E12 as i128), FUNDING_CAP_E12 as i128) as i64
+    }
+}
+
+/// The notional of an impact price (20,000 USD for BTC and ETH, 6,000 for others), x6.
+pub fn impact_notional(name: &str) -> u64 {
+    if matches!(name, "BTC" | "ETH") {
+        20_000_000_000
+    } else {
+        6_000_000_000
+    }
+}
+
+/// The average price of taking `ntl` (x6) from one side of a book, x8, or
+/// the last level's price when the book is thinner than that.
+pub fn impact_px(levels: &Levels, ntl: u64) -> Option<u64> {
+    const EXTRA: u128 = 100_000_000;
+    let (mut got, mut size) = (0u128, 0u128);
+    for &(px, sz) in levels {
+        let level = notional(sz, px) as u128;
+        let take = level.min(ntl as u128 - got);
+        // Sizes carry 8 more decimals here, so the average does not drift up.
+        size += if take == level { sz as u128 * EXTRA } else { take * X16_TO_X6 * EXTRA / px as u128 };
+        got += take;
+        if got >= ntl as u128 {
+            break;
+        }
+    }
+    (size > 0).then(|| (got * X16_TO_X6 * EXTRA / size) as u64)
+}
+
+/// The HIP-3 premium, 12 decimals: the impact mid over the oracle price, less 1.
+pub fn hip3_premium_e12(book: &Book, oracle_x8: u64, ntl: u64) -> Option<i64> {
+    let (bid, ask) = (impact_px(&book.bids, ntl)?, impact_px(&book.asks, ntl)?);
+    let mid = (bid as i128 + ask as i128) / 2;
+    (oracle_x8 > 0).then(|| ((mid - oracle_x8 as i128) * 1_000_000_000_000 / oracle_x8 as i128) as i64)
+}
+
 impl Perp {
     fn tier_list(&self) -> Vec<(u64, u32)> {
         if self.tiers.is_empty() {
@@ -1279,6 +1332,42 @@ impl State {
         true
     }
 
+    /// updateIsolatedMargin: moves `ntli` (USD x6, positive to add) between
+    /// the dex's USD balance and an isolated position's margin. Adding needs
+    /// that much withdrawable on the dex. Removing must leave the position at
+    /// least max(its initial margin, 10% of its value).
+    pub fn update_isolated_margin(&mut self, user: Address, perp: u32, ntli: i64) -> std::result::Result<String, String> {
+        let coin = self.coin(perp);
+        let dex = dex_of(perp);
+        let p = self.accounts.get(&user).and_then(|a| a.positions.get(&perp)).filter(|p| p.szi_x8 != 0).copied().ok_or_else(|| format!("{user} has no open {coin} position"))?;
+        if !p.isolated {
+            return Err(format!("the {coin} position uses cross margin, and only an isolated position takes margin"));
+        }
+        if ntli == 0 {
+            return Err("the margin change is zero".into());
+        }
+        if ntli > 0 {
+            let free = self.margin_dex(user, dex).withdrawable;
+            if ntli as u64 > free {
+                return Err(format!("adding {} USD needs that much withdrawable on the dex, which has {} USD", fmt_dec(ntli as i128, 6), fmt_dec(free as i128, 6)));
+            }
+        } else {
+            let value = notional(p.szi_x8.unsigned_abs(), self.mark_of(perp, &p));
+            let required = (value / p.leverage.max(1) as u64).max(value / 10);
+            let (equity, _) = self.isolated_health(perp, &p);
+            if equity + ntli < required as i64 {
+                return Err(format!("removing {} USD would leave {} USD of margin, below the {} USD the position needs (its initial margin or 10% of its value)", fmt_dec(-ntli as i128, 6), fmt_dec((equity + ntli) as i128, 6), fmt_dec(required as i128, 6)));
+            }
+        }
+        let acct = self.account(user);
+        acct.positions.get_mut(&perp).expect("position").isolated_raw_usd += ntli;
+        *acct.usd_mut(dex) -= ntli;
+        let margin = self.isolated_health(perp, &self.accounts[&user].positions[&perp]).0;
+        let text = format!("{} {} USD of isolated margin on {coin}, margin now {} USD", if ntli > 0 { "added" } else { "removed" }, fmt_dec(ntli.unsigned_abs() as i128, 6), fmt_dec(margin as i128, 6));
+        self.note(user, text.clone());
+        Ok(text)
+    }
+
     /// Sets whether an address's EVM transactions go into big blocks.
     pub fn set_big_blocks(&mut self, user: Address, on: bool) {
         self.account(user).big_blocks = on;
@@ -1374,6 +1463,20 @@ impl State {
             // Borrow and lend interest is indexed on the same hour.
             if self.accrue_interest(applied) {
                 paid = true;
+            }
+            // HIP-3 perps set their rate from the book's premium at the hour.
+            let hip3: Vec<(u32, i64)> = self
+                .perps
+                .iter()
+                .filter_map(|(a, p)| {
+                    let f = p.hip3_funding?;
+                    let oracle = if p.oracle_x8 > 0 { p.oracle_x8 } else { p.mark_x8 };
+                    let premium = hip3_premium_e12(self.books.get(a)?, oracle, impact_notional(&p.name))?;
+                    Some((*a, f.hourly_e12(premium)))
+                })
+                .collect();
+            for (a, rate) in hip3 {
+                self.perps.get_mut(&a).expect("perp").funding_e12 = rate;
             }
             let users: Vec<Address> = self.accounts.keys().copied().collect();
             for user in users {
@@ -2808,5 +2911,71 @@ mod tests {
         s.accounts.get_mut(&ALICE).unwrap().usd = 240_000_000_000;
         let applied = s.set_price(159, 40 * ONE_X8 as u64, 0);
         assert_eq!(applied.liquidated, vec![ALICE]);
+    }
+
+    #[test]
+    fn hip3_funding_follows_the_premium_formula() {
+        let xyz = json!({ "name": "xyz", "assetToFundingMultiplier": [["xyz:TSLA", "0.5"], ["xyz:XYZ100", "0.5"]], "assetToFundingInterestRate": [["xyz:EUR", "0.0"]], "assetToFundingClamp": [] });
+        let tsla = Hip3Funding::from_dex(&xyz, "xyz:TSLA");
+        assert_eq!(tsla, Hip3Funding { multiplier_e12: 500_000_000_000, rate_e12: FUNDING_RATE_E12, clamp_e12: FUNDING_CLAMP_E12 });
+        assert_eq!(Hip3Funding::from_dex(&xyz, "xyz:EUR").rate_e12, 0);
+        assert_eq!(Hip3Funding::from_dex(&xyz, "xyz:NEW").multiplier_e12, 1_000_000_000_000);
+        let x8 = |v: f64| (v * 1e8).round() as u64;
+        let book = |bid: f64, ask: f64| Book { bids: vec![(x8(bid), x8(1000.0))], asks: vec![(x8(ask), x8(1000.0))], time: 0 };
+        // Measured on mainnet, xyz:TSLA: impact prices 402.515 and 402.613, oracle 402.64, premium
+        // -0.0001887542 and funding 0.00000625 (the interest rate inside the clamp, times 0.5, over 8).
+        let p = hip3_premium_e12(&book(402.515, 402.613), x8(402.64), impact_notional("xyz:TSLA")).unwrap();
+        assert_eq!(p / 1000, -188_754);
+        assert_eq!(tsla.hourly_e12(p), 6_250_000);
+        // xyz:XYZ100: impact 28570.03 and 28576.0, oracle 28548, premium 0.000876: rate - premium clamps at -0.0005,
+        // so 0.5 x 0.000376 / 8.
+        let p = hip3_premium_e12(&book(28570.03, 28576.0), x8(28548.0), 6_000_000_000).unwrap();
+        assert_eq!(p / 1000, 876_243);
+        assert_eq!(tsla.hourly_e12(p) / 1000, 23_515);
+        // The cap: 4% an hour.
+        let wild = Hip3Funding { multiplier_e12: 1_000_000_000_000_000, ..tsla };
+        assert_eq!(wild.hourly_e12(1_000_000_000_000), FUNDING_CAP_E12);
+        // Impact prices walk the book for the impact notional.
+        let deep = vec![(x8(100.0), x8(30.0)), (x8(99.0), x8(100.0))];
+        // 3,000 at 100 and 3,000 at 99: 6,000 for 60.30303 units, an average of 99.497...
+        assert_eq!(impact_px(&deep, 6_000_000_000).unwrap() / 1000, 9_949_748);
+    }
+
+    #[test]
+    fn hip3_funding_is_paid_from_the_book_at_the_hour() {
+        let mut s = hip3();
+        let book = Book { bids: vec![(100_100_000_000, 10_000_000_000)], asks: vec![(100_300_000_000, 10_000_000_000)], time: 0 };
+        s.books.insert(10_000, book);
+        let p = s.perps.get_mut(&10_000).unwrap();
+        (p.mark_x8, p.oracle_x8, p.hip3_funding) = (100_000_000_000, 100_000_000_000, Some(Hip3Funding { multiplier_e12: 500_000_000_000, rate_e12: FUNDING_RATE_E12, clamp_e12: FUNDING_CLAMP_E12 }));
+        s.accounts.entry(ALICE).or_default().positions.insert(10_000, Pos { szi_x8: 10 * ONE_X8 as i64, entry_ntl: 10_000_000_000, leverage: 10, ..Default::default() });
+        s.accounts.get_mut(&ALICE).unwrap().dex_usd.insert(1, 5_000_000_000);
+        let t0 = 1_793_599_200;
+        s.apply(&[], (20, "0x14".into()), t0);
+        s.apply(&[], (21, "0x15".into()), t0 + 3600);
+        // Premium 0.002 (impact mid 1002 over 1000), clamp -0.0005: 0.5 x 0.0015 / 8 = 0.00009375.
+        assert_eq!(s.perps[&10_000].funding_e12, 93_750_000);
+        assert_eq!(s.accounts[&ALICE].positions[&10_000].funding_paid, 937_500);
+    }
+
+    #[test]
+    fn isolated_margin_is_added_and_removed_within_the_bound() {
+        let mut s = hip3();
+        let x = |v: u64| v * ONE_X8 as u64;
+        // An isolated xyz:TSLA long: 10 at 400 with 10x leverage holds 400 USD of margin.
+        s.accounts.entry(ALICE).or_default().dex_usd.insert(1, 1_000_000_000);
+        s.accounts.get_mut(&ALICE).unwrap().positions.insert(10_001, Pos { szi_x8: x(10) as i64, entry_ntl: 4_000_000_000, leverage: 10, isolated: true, isolated_raw_usd: 400_000_000, funding_paid: 0 });
+        assert_eq!(s.update_isolated_margin(ALICE, 10_001, 100_000_000).unwrap(), "added 100.0 USD of isolated margin on xyz:TSLA, margin now 500.0 USD");
+        assert_eq!((s.accounts[&ALICE].positions[&10_001].isolated_raw_usd, s.accounts[&ALICE].usd_of(1)), (500_000_000, 900_000_000));
+        // More than the dex has withdrawable is refused.
+        assert!(s.update_isolated_margin(ALICE, 10_001, 950_000_000).unwrap_err().contains("withdrawable"));
+        // Removing must leave max(initial margin 400, 10% of 4,000 = 400): 100 can go, 100.000001 more cannot.
+        assert!(s.update_isolated_margin(ALICE, 10_001, -100_000_001).unwrap_err().contains("below the 400.0 USD"));
+        assert!(s.update_isolated_margin(ALICE, 10_001, -100_000_000).unwrap().starts_with("removed 100.0 USD"));
+        assert_eq!(s.accounts[&ALICE].usd_of(1), 1_000_000_000);
+        // A cross position and no position are refused.
+        s.accounts.get_mut(&ALICE).unwrap().positions.insert(10_000, Pos { szi_x8: x(1) as i64, entry_ntl: 1_000_000_000, leverage: 10, ..Default::default() });
+        assert!(s.update_isolated_margin(ALICE, 10_000, 1_000_000).unwrap_err().contains("cross margin"));
+        assert!(s.update_isolated_margin(BOB, 10_001, 1_000_000).unwrap_err().contains("no open"));
     }
 }
