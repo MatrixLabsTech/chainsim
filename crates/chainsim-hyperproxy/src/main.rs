@@ -119,6 +119,22 @@ fn head_of(v: &Value) -> u64 {
 }
 
 impl Proxy {
+    /// Takes `apply` for a request from `peer`, after any lease held by
+    /// someone else ends. Leases are taken under `apply` too, so checking
+    /// again once it is held closes the gap between the wait and the lock.
+    /// Returns the guard and whether `peer` holds the lease.
+    async fn enter(&self, peer: IpAddr) -> (tokio::sync::MutexGuard<'_, ()>, bool) {
+        loop {
+            if !self.leases.holds(peer) {
+                self.leases.wait(peer).await;
+            }
+            let g = self.apply.lock().await;
+            if self.leases.free_for(peer) {
+                return (g, self.leases.holds(peer));
+            }
+        }
+    }
+
     /// Brings Core up to the head when the chain moved since the last apply.
     /// The caller holds `apply`.
     async fn sync_if_behind(&self) -> Result<()> {
@@ -206,11 +222,7 @@ impl Proxy {
             "eth_bigBlockGasPrice" => return reply(&id, Ok(json!(format!("0x{:x}", hc::BIG_BLOCK_GAS_PRICE)))),
             _ => {}
         }
-        let holder = self.leases.holds(peer);
-        if !holder {
-            self.leases.wait(peer).await;
-        }
-        let _g = self.apply.lock().await;
+        let (_g, holder) = self.enter(peer).await;
         let result: Result<Value> = async {
             if method == "eth_usingBigBlocks" {
                 let who: alloy_primitives::Address = params.get(0).and_then(Value::as_str).and_then(|a| a.parse().ok()).ok_or_else(|| Error::new(ErrorCode::Usage, "eth_usingBigBlocks takes an address"))?;
@@ -248,10 +260,7 @@ impl Proxy {
 
     /// `POST /info`: the copy's Core state in the info API's shapes.
     async fn info(&self, body: &Value, peer: IpAddr) -> std::result::Result<Value, (StatusCode, String)> {
-        if !self.leases.holds(peer) {
-            self.leases.wait(peer).await;
-        }
-        let _g = self.apply.lock().await;
+        let _g = self.enter(peer).await.0;
         let internal = |e: Error| (StatusCode::INTERNAL_SERVER_ERROR, e.message);
         self.sync_if_behind().await.map_err(internal)?;
         let state = coresync::load_state(&self.engine).await.map_err(internal)?.ok_or((StatusCode::SERVICE_UNAVAILABLE, "the copy has no HyperCore state yet".to_string()))?;

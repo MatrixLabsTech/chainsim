@@ -55,6 +55,11 @@ impl Leases {
         self.active().is_some_and(|(_, holder)| holder == peer)
     }
 
+    /// Whether `peer` may go on: nobody else holds the lease.
+    pub fn free_for(&self, peer: IpAddr) -> bool {
+        self.active().is_none_or(|(_, holder)| holder == peer)
+    }
+
     /// Waits while someone else holds the lease, at most until it expires.
     pub async fn wait(&self, peer: IpAddr) {
         let until = Instant::now() + TTL;
@@ -81,6 +86,7 @@ mod tests {
         let l = Leases::default();
         let token = l.try_take(cli).unwrap();
         assert!(l.holds(cli) && !l.holds(other));
+        assert!(l.free_for(cli) && !l.free_for(other));
         assert!(l.try_take(other).is_none());
         // The holder does not wait on itself.
         tokio::time::timeout(Duration::from_millis(50), l.wait(cli)).await.unwrap();
