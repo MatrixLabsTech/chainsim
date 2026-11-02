@@ -10,7 +10,9 @@
   "fork": { "default": "latest", "flags": [] },
   "native": { "symbol": "SUI", "decimals": 9 },
   "overrides": [],
-  "tokens": [],
+  "tokens": [
+    { "symbol": "USDC", "address": "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC", "decimals": 6, "holder": "0x60dd01bc037e2c1ea2aaf02187701f9f4453ba323338d2f2f521957065b0984d" }
+  ],
   "warmup": [],
   "selftest": { "token": null, "extras": [] },
   "funder": "0x935029ca5219502a47ac9b69f556ccf6e2198b5e7815cf50f68846f723739cbd",
@@ -26,6 +28,7 @@
     "Funding is a transfer on the copy only, sent by impersonation with no signature from 0x935029ca5219502a47ac9b69f556ccf6e2198b5e7815cf50f68846f723739cbd, labeled Binance 1 at https://www.coincarp.com/currencies/sui/richlist/ and checked on Sui Mainnet on 2026-10-09 to hold 27.59 million SUI in address-owned coins. Nothing is sent on Sui Mainnet.",
     "The copy reads Sui Mainnet from Mysten's public GraphQL endpoint https://graphql.mainnet.sui.io/graphql by default, and CHAINSIM_SUI_MAINNET_GRAPHQL replaces it with a provider GraphQL URL. The public endpoint rate-limits, so heavier runs should use a provider endpoint.",
     "fund works only for a fork point within about an hour of the upstream head. The public endpoint keeps owned objects for about the last hour only (57 minutes measured on 2026-10-10), so on an older --block the funder's coins are not seeded at up and fund exits 3. No public endpoint with a longer window was found, and provider endpoints with longer retention are untested.",
+    "fund --token USDC moves USDC on the copy from 0x60dd01bc037e2c1ea2aaf02187701f9f4453ba323338d2f2f521957065b0984d, labeled Bybit 1 on CoinCarp's Sui rich list and checked on Sui Mainnet on 2026-11-01 to hold 448,681 USDC in address-owned coins. A fund above what that holder holds at the fork point fails.",
     "On Sui, fund only raises a balance: an address that already holds more than the amount asked is refused.",
     "send --as and set run transactions as any address with no signature, on the copy only, with gas paid by the funder.",
     "set balance and set token count only coins the copy has seen: an address that held coins on Sui Mainnet before the fork point shows less than it holds, though it can still spend those coins.",

@@ -87,6 +87,10 @@ pub struct Token {
     /// sets the native balance.
     #[serde(default)]
     pub native_view: bool,
+    /// A mainnet address that holds the token, for chains where funding moves
+    /// it from a holder because no address can mint it (Sui USDC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

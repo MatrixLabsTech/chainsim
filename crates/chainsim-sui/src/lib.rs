@@ -809,36 +809,73 @@ impl Adapter for SuiAdapter {
         let (handle, profile) = self.open(name).await?;
         let g = self.grpc(&handle, &profile);
         let who = parse_address(&req.address)?;
-        if !req.tokens.is_empty() {
-            return Err(Error::new(ErrorCode::Unsupported, format!("{} funds SUI only", profile.key)).next(format!("chainsim set {name} token {who} <coin type> <amount> sets a token balance")));
+        if req.native.is_none() && req.tokens.is_empty() {
+            return Err(Error::new(ErrorCode::Usage, "nothing to fund: pass --native <amount> or --token <symbol>:<amount>"));
         }
-        let Some(native) = &req.native else {
-            return Err(Error::new(ErrorCode::Usage, "nothing to fund: pass --native <amount>"));
-        };
         let decimals = profile.native.as_ref().map_or(9, |n| n.decimals);
-        let target = u64::try_from(parse_amount(native, decimals)?).map_err(|_| Error::new(ErrorCode::Usage, format!("{native} SUI is more than a u64 of MIST")))?;
+        let target = match &req.native {
+            Some(native) => Some(u64::try_from(parse_amount(native, decimals)?).map_err(|_| Error::new(ErrorCode::Usage, format!("{native} SUI is more than a u64 of MIST")))?),
+            None => None,
+        };
+        let mut tokens = Vec::new();
+        for t in &req.tokens {
+            let Some(token) = profile.token(&t.token) else {
+                let known: Vec<_> = profile.tokens.iter().map(|t| t.symbol.as_str()).collect();
+                return Err(Error::new(ErrorCode::UnknownToken, format!("no token {} on {}; known: {}", t.token, profile.key, known.join(", ")))
+                    .next(format!("chainsim set {name} token {who} <coin type> <amount> sets any coin balance")));
+            };
+            let amount = u64::try_from(parse_amount(&t.amount, token.decimals)?).map_err(|_| Error::new(ErrorCode::Usage, format!("{} {} is more than a u64", t.amount, token.symbol)))?;
+            tokens.push((token, amount));
+        }
 
         // An address with any owned object on mainnet may hold real assets.
         if self.owns_mainnet_objects(&g, &who).await? {
             return Err(Error::new(ErrorCode::MainnetAddress, format!("{who} owns objects on Sui Mainnet; fund only addresses of test keys that hold no mainnet assets")).next("use a fresh test address"));
         }
 
-        let current = self.balance(&g, &who).await?;
-        if current > target {
-            return Err(Error::new(ErrorCode::Unsupported, format!("{who} holds {} SUI, more than the {native} SUI asked; on Sui, fund only raises a balance", format_amount(current as u128, decimals)))
-                .next(format!("chainsim revert {name} <snapshot>, or fund a fresh address")));
+        // Fund only raises a balance: check every asset before moving any.
+        let raises = |asset: &str, current: u64, want: u64, d: u8| {
+            if current > want {
+                return Err(Error::new(ErrorCode::Unsupported, format!("{who} holds {} {asset}, more than the {} {asset} asked; on Sui, fund only raises a balance", format_amount(current as u128, d), format_amount(want as u128, d)))
+                    .next(format!("chainsim revert {name} <snapshot>, or fund a fresh address")));
+            }
+            Ok(want - current)
+        };
+        let native_add = match target {
+            Some(t) => Some(raises("SUI", self.balance(&g, &who).await?, t, decimals)?),
+            None => None,
+        };
+        let mut token_adds = Vec::new();
+        for (token, amount) in &tokens {
+            token_adds.push(raises(&token.symbol, self.coin_balance(&g, &who, &token.address).await?, *amount, token.decimals)?);
         }
-        if current < target {
-            self.send_from_funder(&g, &profile, &handle, &who, target - current).await?;
+
+        if let Some(add) = native_add.filter(|a| *a > 0) {
+            self.send_from_funder(&g, &profile, &handle, &who, add).await?;
         }
-        let read = self.balance(&g, &who).await?;
-        if read != target {
-            return Err(Error::new(ErrorCode::ReadbackMismatch, format!("{who} reads back {} SUI after funding {native} SUI", format_amount(read as u128, decimals))));
+        let on = On { g: &g, profile: &profile, fork: &handle };
+        for ((token, _), add) in tokens.iter().zip(&token_adds) {
+            if *add > 0 {
+                self.add_token(&on, &who, &token.address, *add, token.holder.as_deref()).await?;
+            }
         }
-        Ok(Funded {
-            address: who,
-            balances: vec![Balance { asset: "native".into(), address: None, decimals, amount: format_amount(read as u128, decimals), raw: read.to_string() }],
-        })
+
+        let mut balances = Vec::new();
+        if let Some(t) = target {
+            let read = self.balance(&g, &who).await?;
+            if read != t {
+                return Err(Error::new(ErrorCode::ReadbackMismatch, format!("{who} reads back {} SUI after funding {} SUI", format_amount(read as u128, decimals), format_amount(t as u128, decimals))));
+            }
+            balances.push(Balance { asset: "native".into(), address: None, decimals, amount: format_amount(read as u128, decimals), raw: read.to_string() });
+        }
+        for (token, amount) in &tokens {
+            let read = self.coin_balance(&g, &who, &token.address).await?;
+            if read != *amount {
+                return Err(Error::new(ErrorCode::ReadbackMismatch, format!("{who} reads back {} {} after funding {}", format_amount(read as u128, token.decimals), token.symbol, format_amount(*amount as u128, token.decimals))));
+            }
+            balances.push(Balance { asset: token.symbol.clone(), address: Some(token.address.clone()), decimals: token.decimals, amount: format_amount(read as u128, token.decimals), raw: read.to_string() });
+        }
+        Ok(Funded { address: who, balances })
     }
 
     async fn send(&self, name: &str, req: &SendRequest) -> Result<Value> {
