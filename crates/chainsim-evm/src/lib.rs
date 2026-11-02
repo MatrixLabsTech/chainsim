@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use units::*;
 
-pub use corefork::{CoreOp, INFO_ENV};
+pub use corefork::{parse_time, CoreOp, INFO_ENV};
 
 /// How long `up` waits for the engine to answer.
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
@@ -53,7 +53,9 @@ const MINING_METHODS: &[&str] = &["eth_sendTransaction", "eth_sendRawTransaction
 /// The `call` methods chainsim answers itself on HyperEVM.
 pub const HYPERCORE_CALLS: &[&str] = &["corewriter_actions", "hypercore_state"];
 /// The `set hypercore` helpers.
-pub const HYPERCORE_SETS: &[&str] = &["price", "spot-balance", "position", "book", "mirror"];
+pub const HYPERCORE_SETS: &[&str] = &["price", "spot-balance", "position", "book", "mirror", "funding"];
+/// The `time` options on HyperEVM.
+pub const HYPERCORE_TIME: &[&str] = &["advance", "to", "replay"];
 
 pub const OPERATIONS: &[&str] = &["describe", "up", "down", "ls", "status", "fund", "snapshot", "revert", "call", "send", "set", "time", "mine", "selftest"];
 

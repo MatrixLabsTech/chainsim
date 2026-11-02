@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::U256;
 use chainsim_core::control::Target;
 use chainsim_core::docker::ForkHandle;
 use chainsim_core::profile::Profile;
@@ -47,6 +47,7 @@ pub enum CoreOp {
     Position { user: String, perp: u16, szi: i64, entry_ntl: u64, leverage: u32, isolated_raw_usd: i64, isolated: bool },
     Book { coin: String },
     Mirror { user: String },
+    Funding { perp: u32, rate: String },
 }
 
 fn info_url() -> String {
@@ -119,21 +120,38 @@ impl Engine<'_> {
         self.rpc_batch(&calls).await.map(|_| ())
     }
 
-    /// Credits Core owes the EVM side: native HYPE or a linked ERC-20.
-    async fn credit(&self, credits: &[hc::Credit]) -> Result<()> {
-        for c in credits {
-            match c.token {
-                None => {
-                    let have = self.balance(&c.to.to_string()).await?;
-                    self.set_balance(&c.to.to_string(), have + c.amount).await?;
-                }
-                Some(token) => {
-                    let have = self.token_balance(&token.to_string(), c.to).await?;
-                    self.deal(&token.to_string(), c.to, have + c.amount).await?;
-                }
+    /// Lands the credits Core owes the EVM side (native HYPE or a linked
+    /// ERC-20). Each one first records the balance it starts from in the
+    /// state, then sets `base + amount` and leaves the queue. A failed one
+    /// stays queued and is retried at the next catch-up, and a retry sets the
+    /// same target, so a credit is never applied twice.
+    async fn settle_credits(&self, state: &mut State) -> Result<()> {
+        if state.pending.is_empty() {
+            return Ok(());
+        }
+        let unbased: Vec<hc::Credit> = state.pending.iter().filter(|c| c.base.is_none()).cloned().collect();
+        for c in &unbased {
+            let have = match c.token {
+                None => self.balance(&c.to.to_string()).await?,
+                Some(token) => self.token_balance(&token.to_string(), c.to).await?,
+            };
+            state.credit_base(c.id, have);
+        }
+        if !unbased.is_empty() {
+            self.store(state, &[]).await?;
+        }
+        for c in state.pending.clone() {
+            let Some(target) = c.target() else { continue };
+            let landed = match c.token {
+                None => self.set_balance(&c.to.to_string(), target).await,
+                Some(token) => self.deal(&token.to_string(), c.to, target).await,
+            };
+            match landed {
+                Ok(()) => state.credit_landed(c.id),
+                Err(e) => chainsim_core::log(format_args!("HyperCore credit {} to {} kept for a retry: {}", c.id, c.to, e.message)),
             }
         }
-        Ok(())
+        self.store(state, &[]).await
     }
 }
 
@@ -148,6 +166,10 @@ fn decode_state(code: &Value) -> Result<Option<State>> {
 
 fn block_ref(b: &Value) -> Result<(u64, String)> {
     Ok((parse_qty(&b["number"])?.to::<u64>(), b["hash"].as_str().unwrap_or_default().to_string()))
+}
+
+fn block_time(b: &Value) -> Result<u64> {
+    Ok(parse_qty(&b["timestamp"])?.to::<u64>())
 }
 
 /// Precompile prices are decimal strings with up to 6 - szDecimals decimals.
@@ -190,6 +212,7 @@ impl EvmAdapter {
         let got = eng.rpc_batch(&[("eth_getCode", json!([STATE_ADDRESS, "latest"])), ("eth_getBlockByNumber", json!(["latest", false]))]).await?;
         let Some(mut state) = decode_state(&got[0])? else { return Ok(None) };
         let head = block_ref(&got[1])?;
+        let time = block_time(&got[1])?;
         let Some((at, hash)) = state.cursor.clone() else { return Ok(Some(state)) };
         if head.0 <= at {
             if head.0 < at || head.1 != hash {
@@ -199,6 +222,7 @@ impl EvmAdapter {
                 state.cursor = Some(head);
                 eng.store(&state, &[]).await?;
             }
+            eng.settle_credits(&mut state).await?;
             return Ok(Some(state));
         }
         let mut addresses = vec![json!(hypercore::CORE_WRITER), json!(hc::HYPE_SYSTEM.to_string())];
@@ -209,10 +233,10 @@ impl EvmAdapter {
         });
         let logs = eng.rpc("eth_getLogs", json!([filter])).await?;
         let events = hc::events_from_logs(logs.as_array().map_or(&[][..], Vec::as_slice));
-        let applied = state.apply(&events, head);
-        let answers = state.answers(&applied.users);
+        let applied = state.apply(&events, head, time);
+        let answers = state.answers_for(&applied);
         eng.store(&state, &answers).await?;
-        eng.credit(&applied.credits).await?;
+        eng.settle_credits(&mut state).await?;
         if !events.is_empty() {
             chainsim_core::log(format_args!("HyperCore applied {} events, {} answers", events.len(), answers.len()));
         }
@@ -237,7 +261,14 @@ impl EvmAdapter {
             let d = u["szDecimals"].as_u64().unwrap_or(0) as u8;
             let mark_raw = seeded["perps"].as_array().and_then(|ps| ps.iter().find(|x| x["index"] == json!(p))).and_then(|x| x["markPx"].as_str()).and_then(|m| m.parse::<u64>().ok());
             let mark = mark_raw.map(|r| r * 10u64.pow(2 + d as u32)).or_else(|| meta[1][p as usize]["markPx"].as_str().and_then(|s| hc::parse_dec(s, 8)).map(|v| v as u64)).unwrap_or(0);
-            state.perps.insert(p, hc::Perp { name: u["name"].as_str().unwrap_or_default().to_string(), sz_decimals: d, max_leverage: u["maxLeverage"].as_u64().unwrap_or(1) as u32, mark_x8: mark });
+            let oracle_raw = seeded["perps"].as_array().and_then(|ps| ps.iter().find(|x| x["index"] == json!(p))).and_then(|x| x["oraclePx"].as_str()).and_then(|m| m.parse::<u64>().ok());
+            let oracle = oracle_raw.map_or(mark, |r| r * 10u64.pow(2 + d as u32));
+            let name = u["name"].as_str().unwrap_or_default().to_string();
+            // The last settled hourly rate.
+            let start = now_secs().saturating_sub(3 * hc::FUNDING_INTERVAL) * 1000;
+            let history = eng.info(json!({ "type": "fundingHistory", "coin": name, "startTime": start }), &mut calls).await?;
+            let funding = history.as_array().and_then(|h| h.last()).and_then(|f| f["fundingRate"].as_str()).and_then(|r| hc::parse_dec(r, 12)).unwrap_or(0) as i64;
+            state.perps.insert(p, hc::Perp { name, sz_decimals: d, max_leverage: u["maxLeverage"].as_u64().unwrap_or(1) as u32, mark_x8: mark, oracle_x8: oracle, funding_e12: funding });
         }
         add_tokens(&mut state, &spot, settings.tokens.iter().map(|t| *t as u64));
         let mut books = Vec::new();
@@ -248,7 +279,9 @@ impl EvmAdapter {
             books.push(book_summary(&coin, p, &book));
             state.books.insert(p, book);
         }
-        state.cursor = Some(block_ref(&eng.rpc("eth_getBlockByNumber", json!(["latest", false])).await?)?);
+        let latest = eng.rpc("eth_getBlockByNumber", json!(["latest", false])).await?;
+        state.cursor = Some(block_ref(&latest)?);
+        state.funding_time = block_time(&latest)? / hc::FUNDING_INTERVAL * hc::FUNDING_INTERVAL;
         let mut writes: Vec<(&str, Value)> = Vec::new();
         for (p, zeros) in hypercore::zero_defaults() {
             for (slot, value) in hypercore::default_writes(&zeros) {
@@ -258,7 +291,8 @@ impl EvmAdapter {
         eng.rpc_batch(&writes).await?;
         eng.store(&state, &[]).await?;
         chainsim_core::log(format_args!("HyperCore state: {calls} info API calls"));
-        Ok(json!({ "books": books, "infoCalls": calls, "state": STATE_ADDRESS }))
+        let funding: Vec<Value> = state.perps.values().map(|p| json!({ "coin": p.name, "rate": hc::fmt_dec(p.funding_e12 as i128, 12) })).collect();
+        Ok(json!({ "books": books, "funding": funding, "infoCalls": calls, "state": STATE_ADDRESS }))
     }
 
     /// A `set hypercore` helper, applied to the Core state under the lock.
@@ -284,16 +318,35 @@ impl EvmAdapter {
         match op {
             CoreOp::Price { perp, px } => {
                 let entries = hypercore::price(perp, px);
-                if let Some(x8) = state.px_from_raw(perp, px) {
-                    state.perps.get_mut(&perp).expect("perp").mark_x8 = x8;
-                }
-                // Margin figures of every account move with the mark.
-                let users: BTreeSet<Address> = state.accounts.keys().copied().collect();
-                let mut answers = state.answers(&users);
+                let (_, time) = eng.latest_block().await?;
+                let applied = match state.px_from_raw(perp, px) {
+                    Some(x8) => state.set_price(perp, x8, time),
+                    None => hc::Applied::default(),
+                };
+                let mut answers = state.answers_for(&applied);
                 answers.extend(entries.iter().cloned());
                 eng.store(&state, &answers).await?;
+                eng.settle_credits(&mut state).await?;
                 let sets = sets_json(&entries);
-                Ok((json!({ "kind": "hypercore", "helper": "price", "perp": perp, "px": px, "sets": sets }), json!({ "kind": "set-hypercore", "helper": "price", "perp": perp, "px": px })))
+                let liquidated: Vec<String> = applied.liquidated.iter().map(|a| a.to_string()).collect();
+                Ok((
+                    json!({ "kind": "hypercore", "helper": "price", "perp": perp, "px": px, "filled": applied.fills, "liquidated": liquidated, "sets": sets }),
+                    json!({ "kind": "set-hypercore", "helper": "price", "perp": perp, "px": px }),
+                ))
+            }
+            CoreOp::Funding { perp, rate } => {
+                let e12 = hc::parse_dec(&rate, 12).and_then(|v| i64::try_from(v).ok()).ok_or_else(|| Error::new(ErrorCode::Usage, format!("{rate:?} is not a decimal funding rate, such as 0.0000125")))?;
+                if !state.perps.contains_key(&perp) {
+                    self.add_perps(eng, &mut state, &[perp], &mut calls).await?;
+                }
+                state.perps.get_mut(&perp).expect("perp").funding_e12 = e12;
+                eng.store(&state, &[]).await?;
+                let coin = state.perps[&perp].name.clone();
+                let rate = hc::fmt_dec(e12 as i128, 12);
+                Ok((
+                    json!({ "kind": "hypercore", "helper": "funding", "perp": perp, "coin": coin, "rate": rate, "interval": hc::FUNDING_INTERVAL }),
+                    json!({ "kind": "set-hypercore", "helper": "funding", "perp": perp, "rate": rate }),
+                ))
             }
             CoreOp::SpotBalance { user, token, total, hold, entry_ntl } => {
                 let who = parse_address(&user)?;
@@ -313,7 +366,7 @@ impl EvmAdapter {
                     self.add_perps(eng, &mut state, &[asset], &mut calls).await?;
                 }
                 let szi_x8 = state.sz_from_raw(asset, szi).ok_or_else(|| Error::new(ErrorCode::Usage, format!("szi {szi} is out of range for perp {perp}")))?;
-                state.accounts.entry(who).or_default().positions.insert(asset, hc::Pos { szi_x8, entry_ntl, leverage, isolated, isolated_raw_usd });
+                state.accounts.entry(who).or_default().positions.insert(asset, hc::Pos { szi_x8, entry_ntl, leverage, isolated, isolated_raw_usd, funding_paid: 0 });
                 let answers = state.answers(&BTreeSet::from([who]));
                 eng.store(&state, &answers).await?;
                 let e = hypercore::position(who, perp, hypercore::Position { szi, entry_ntl, isolated_raw_usd, leverage, is_isolated: isolated });
@@ -359,8 +412,7 @@ impl EvmAdapter {
             let u = universe.get(a as usize).ok_or_else(|| Error::new(ErrorCode::Usage, format!("no perp {a} on Hyperliquid")))?;
             let ctx = &meta[1][a as usize];
             let d = u["szDecimals"].as_u64().unwrap_or(0) as u8;
-            let mark = ctx["markPx"].as_str().and_then(|s| hc::parse_dec(s, 8)).unwrap_or(0) as u64;
-            state.perps.insert(a, hc::Perp { name: u["name"].as_str().unwrap_or_default().to_string(), sz_decimals: d, max_leverage: u["maxLeverage"].as_u64().unwrap_or(1) as u32, mark_x8: mark });
+            state.perps.insert(a, perp_from_ctx(u, ctx));
             if let (Some(m), Some(o)) = (ctx["markPx"].as_str().and_then(|s| raw_px(s, d)), ctx["oraclePx"].as_str().and_then(|s| raw_px(s, d))) {
                 entries.push(Entry { precompile: hypercore::MARK_PX, calldata: hypercore::word_u(a as u128).to_vec(), result: hypercore::word_u(m as u128).to_vec() });
                 entries.push(Entry { precompile: hypercore::ORACLE_PX, calldata: hypercore::word_u(a as u128).to_vec(), result: hypercore::word_u(o as u128).to_vec() });
@@ -388,7 +440,7 @@ impl EvmAdapter {
             for a in assets {
                 let (u, ctx) = (&universe[a as usize], &meta[1][a as usize]);
                 let d = u["szDecimals"].as_u64().unwrap_or(0) as u8;
-                state.perps.insert(a, hc::Perp { name: u["name"].as_str().unwrap_or_default().to_string(), sz_decimals: d, max_leverage: u["maxLeverage"].as_u64().unwrap_or(1) as u32, mark_x8: ctx["markPx"].as_str().and_then(|s| hc::parse_dec(s, 8)).unwrap_or(0) as u64 });
+                state.perps.insert(a, perp_from_ctx(u, ctx));
                 if let (Some(m), Some(o)) = (ctx["markPx"].as_str().and_then(|s| raw_px(s, d)), ctx["oraclePx"].as_str().and_then(|s| raw_px(s, d))) {
                     entries.push(Entry { precompile: hypercore::MARK_PX, calldata: hypercore::word_u(a as u128).to_vec(), result: hypercore::word_u(m as u128).to_vec() });
                     entries.push(Entry { precompile: hypercore::ORACLE_PX, calldata: hypercore::word_u(a as u128).to_vec(), result: hypercore::word_u(o as u128).to_vec() });
@@ -461,6 +513,83 @@ impl EvmAdapter {
         Ok(())
     }
 
+    /// `time --replay <coin> --from <t> --to <t>`: the coin's hourly mainnet
+    /// candles become its price path. Each candle mines one block an hour
+    /// after the last, pays funding, then moves mark and oracle to the
+    /// candle's close with the same fills and liquidations as `set hypercore price`.
+    pub async fn replay(&self, name: &str, coin: &str, from: u64, to: u64) -> Result<Value> {
+        let (handle, profile) = self.open(name).await?;
+        if profile.hypercore.is_none() {
+            return Err(Error::unsupported(&format!("time --replay on {}", profile.key), "chainsim time <name> --advance <seconds> moves the clock"));
+        }
+        if to <= from {
+            return Err(Error::new(ErrorCode::Usage, "--to must be later than --from"));
+        }
+        let eng = self.engine(&handle, &profile);
+        self.core_lock(&handle).await?;
+        let r = self.replay_locked(&handle, &eng, coin, from, to).await;
+        self.core_unlock(&handle).await;
+        let (out, mut entry) = r?;
+        entry["at"] = json!(now_secs());
+        chainsim_core::mods::record(&self.docker, name, &entry).await?;
+        Ok(out)
+    }
+
+    async fn replay_locked(&self, handle: &ForkHandle, eng: &Engine<'_>, coin: &str, from: u64, to: u64) -> Result<(Value, Value)> {
+        let mut state = self.core_sync_locked(eng).await?.ok_or_else(|| Error::new(ErrorCode::Internal, "this fork has no HyperCore state").next(format!("chainsim down {0} && chainsim up hyperevm-mainnet --name {0}", handle.name)))?;
+        let mut calls = 0u32;
+        let asset = match state.perps.iter().find(|(_, p)| p.name.eq_ignore_ascii_case(coin)) {
+            Some((a, _)) => *a,
+            None => {
+                let meta = eng.info(json!({ "type": "metaAndAssetCtxs" }), &mut calls).await?;
+                let universe = meta[0]["universe"].as_array().cloned().unwrap_or_default();
+                let i = universe.iter().position(|u| u["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(coin))).ok_or_else(|| Error::new(ErrorCode::Usage, format!("no perp {coin} on Hyperliquid")))? as u32;
+                state.perps.insert(i, perp_from_ctx(&universe[i as usize], &meta[1][i as usize]));
+                i
+            }
+        };
+        let name = state.perps[&asset].name.clone();
+        let candles = eng.info(json!({ "type": "candleSnapshot", "req": { "coin": name, "interval": "1h", "startTime": from * 1000, "endTime": to * 1000 } }), &mut calls).await?;
+        let path = candle_path(&candles);
+        if path.is_empty() {
+            return Err(Error::new(ErrorCode::Usage, format!("the info API has no {name} candles between {from} and {to}")).next("pick a range in the past, such as the previous day"));
+        }
+        let started = Instant::now();
+        let (mut fills, mut liquidated, mut height) = (0usize, Vec::new(), 0u64);
+        let (mut low, mut high) = (u64::MAX, 0u64);
+        for (_, close) in &path {
+            let (_, now) = eng.latest_block().await?;
+            eng.rpc("evm_setNextBlockTimestamp", json!([now + hc::FUNDING_INTERVAL])).await?;
+            eng.rpc("evm_mine", json!([])).await?;
+            let b = eng.rpc("eth_getBlockByNumber", json!(["latest", false])).await?;
+            let (head, time) = (block_ref(&b)?, block_time(&b)?);
+            height = head.0;
+            let applied = state.candle_step(asset, *close, head, time);
+            fills += applied.fills;
+            liquidated.extend(applied.liquidated.iter().map(|a| a.to_string()));
+            let mut answers = state.answers_for(&applied);
+            if let Some(raw) = state.px_to_raw(asset, *close) {
+                answers.extend(hypercore::price(asset, raw));
+            }
+            eng.store(&state, &answers).await?;
+            low = low.min(*close);
+            high = high.max(*close);
+        }
+        eng.settle_credits(&mut state).await?;
+        let px = |v: u64| hc::fmt_dec(v as i128, 8);
+        let last = path.last().expect("not empty").1;
+        chainsim_core::log(format_args!("replayed {} {name} candles in {} ms, {calls} info API calls", path.len(), started.elapsed().as_millis()));
+        Ok((
+            json!({
+                "coin": name, "perp": asset, "interval": "1h", "candles": path.len(),
+                "from": path[0].0 / 1000, "to": path.last().expect("not empty").0 / 1000,
+                "firstClose": px(path[0].1), "lastClose": px(last), "lowClose": px(low), "highClose": px(high),
+                "markPx": state.px_to_raw(asset, last), "height": height, "filled": fills, "liquidated": liquidated, "infoCalls": calls,
+            }),
+            json!({ "kind": "time-replay", "coin": name, "candles": path.len(), "from": from, "to": to }),
+        ))
+    }
+
     /// What `status` adds: accounts, open orders and the cursor.
     pub(crate) async fn core_status(&self, eng: &Engine<'_>) -> Result<Value> {
         Ok(match eng.load_state().await? {
@@ -473,6 +602,20 @@ impl EvmAdapter {
     }
 }
 
+/// A perp from the info API's meta and asset context: the current mark,
+/// oracle and funding rate.
+fn perp_from_ctx(u: &Value, ctx: &Value) -> hc::Perp {
+    let px = |k: &str| ctx[k].as_str().and_then(|s| hc::parse_dec(s, 8)).unwrap_or(0) as u64;
+    hc::Perp {
+        name: u["name"].as_str().unwrap_or_default().to_string(),
+        sz_decimals: u["szDecimals"].as_u64().unwrap_or(0) as u8,
+        max_leverage: u["maxLeverage"].as_u64().unwrap_or(1) as u32,
+        mark_x8: px("markPx"),
+        oracle_x8: px("oraclePx"),
+        funding_e12: ctx["funding"].as_str().and_then(|s| hc::parse_dec(s, 12)).unwrap_or(0) as i64,
+    }
+}
+
 fn add_tokens(state: &mut State, spot: &Value, tokens: impl Iterator<Item = u64>) {
     let list = spot["tokens"].as_array().cloned().unwrap_or_default();
     for t in tokens {
@@ -481,6 +624,39 @@ fn add_tokens(state: &mut State, spot: &Value, tokens: impl Iterator<Item = u64>
         let evm = m["evmContract"]["address"].as_str().filter(|_| t != 0).map(|a| (a.to_string(), m["evmContract"]["evm_extra_wei_decimals"].as_i64().unwrap_or(0) as i8));
         state.tokens.insert(t, hc::TokenMeta { name: m["name"].as_str().unwrap_or_default().to_string(), wei_decimals: m["weiDecimals"].as_u64().unwrap_or(8) as u8, evm });
     }
+}
+
+/// The candles' open times (ms) and closes (x8), oldest first.
+fn candle_path(candles: &Value) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = candles.as_array().map_or(vec![], |c| c.iter().filter_map(|k| Some((k["t"].as_u64()?, hc::parse_dec(k["c"].as_str()?, 8)? as u64))).collect());
+    out.sort();
+    out
+}
+
+/// A time for `--from` and `--to`: Unix seconds, a date (UTC midnight), or
+/// a date and time such as 2026-11-01T12:00Z.
+pub fn parse_time(s: &str) -> Result<u64> {
+    let bad = || Error::new(ErrorCode::Usage, format!("{s:?} is not a time: use Unix seconds, YYYY-MM-DD or YYYY-MM-DDTHH:MM[:SS]Z"));
+    let t = s.trim();
+    if let Ok(n) = t.parse::<u64>() {
+        return Ok(n);
+    }
+    let (date, clock) = t.trim_end_matches('Z').split_once('T').unwrap_or((t, "00:00"));
+    let d: Vec<i64> = date.split('-').map(|x| x.parse().map_err(|_| bad())).collect::<Result<_>>()?;
+    let c: Vec<i64> = clock.split(':').map(|x| x.parse().map_err(|_| bad())).collect::<Result<_>>()?;
+    let ([y, m, day], true) = (<[i64; 3]>::try_from(d).map_err(|_| bad())?, (2..=3).contains(&c.len())) else { return Err(bad()) };
+    if !(1..=12).contains(&m) || !(1..=31).contains(&day) || c[0] > 23 || c[1] > 59 || c.get(2).is_some_and(|x| *x > 59) {
+        return Err(bad());
+    }
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + c[0] * 3600 + c[1] * 60 + c.get(2).copied().unwrap_or(0);
+    u64::try_from(secs).map_err(|_| bad())
 }
 
 fn book_summary(coin: &str, asset: u32, b: &hc::Book) -> Value {
@@ -524,6 +700,22 @@ mod tests {
         assert_eq!((s.tokens[&0].evm.clone(), s.tokens[&150].evm.clone()), (None, None));
         assert_eq!(s.tokens[&200].evm, Some(("0x00000000000000000000000000000000000000aa".to_string(), 12)));
         assert!(!s.tokens.contains_key(&9));
+    }
+
+    #[test]
+    fn times_parse_as_seconds_dates_and_date_times() {
+        assert_eq!(parse_time("1793600000").unwrap(), 1_793_600_000);
+        assert_eq!(parse_time("1970-01-01").unwrap(), 0);
+        assert_eq!(parse_time("2026-11-01").unwrap(), 1_793_491_200);
+        assert_eq!(parse_time("2026-11-01T12:30Z").unwrap(), 1_793_491_200 + 45_000);
+        assert_eq!(parse_time("2024-02-29T00:00:01Z").unwrap(), 1_709_164_801);
+        assert!(parse_time("2026-13-01").is_err() && parse_time("yesterday").is_err() && parse_time("2026-11").is_err());
+    }
+
+    #[test]
+    fn candles_become_a_sorted_close_path() {
+        let c = json!([{ "t": 2000, "c": "78230.0" }, { "t": 1000, "c": "77932.5" }, { "t": 3000 }]);
+        assert_eq!(candle_path(&c), [(1000, 7_793_250_000_000), (2000, 7_823_000_000_000)]);
     }
 
     #[test]

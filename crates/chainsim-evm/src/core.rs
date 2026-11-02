@@ -71,7 +71,7 @@ pub fn system_token(a: Address) -> Option<u64> {
 }
 
 /// A perp's metadata and current mark price.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Perp {
     #[serde(rename = "n")]
     pub name: String,
@@ -81,6 +81,16 @@ pub struct Perp {
     pub max_leverage: u32,
     #[serde(rename = "m")]
     pub mark_x8: u64,
+    /// Oracle price x8; zero means the mark.
+    #[serde(rename = "o", default, skip_serializing_if = "is_zero_u")]
+    pub oracle_x8: u64,
+    /// Hourly funding rate, 12 decimals.
+    #[serde(rename = "f", default, skip_serializing_if = "is_zero")]
+    pub funding_e12: i64,
+}
+
+fn is_zero_u(v: &u64) -> bool {
+    *v == 0
 }
 
 /// A spot token's metadata. `evm` is the linked ERC-20 and its extra wei
@@ -129,6 +139,9 @@ pub struct Pos {
     pub isolated: bool,
     #[serde(rename = "r", default, skip_serializing_if = "is_zero")]
     pub isolated_raw_usd: i64,
+    /// Funding paid since the position opened, x6 (negative when received).
+    #[serde(rename = "f", default, skip_serializing_if = "is_zero")]
+    pub funding_paid: i64,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -150,6 +163,9 @@ pub struct Account {
     pub usd: i64,
     #[serde(rename = "q", default)]
     pub positions: BTreeMap<u32, Pos>,
+    /// Recent fills from price moves, liquidations, funding and fees: (time, text).
+    #[serde(rename = "h", default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<(u64, String)>,
 }
 
 /// A resting order.
@@ -204,6 +220,17 @@ pub struct State {
     pub orders: Vec<Order>,
     #[serde(rename = "x", default)]
     pub results: Vec<Outcome>,
+    /// The last funding time applied, in seconds, on the hour.
+    #[serde(rename = "ft", default)]
+    pub funding_time: u64,
+    /// Credits owed to the EVM side that have not landed yet.
+    #[serde(rename = "pc", default, skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<Credit>,
+    #[serde(rename = "nc", default)]
+    pub next_credit: u64,
+    /// The block time of the step being applied, for history lines.
+    #[serde(skip)]
+    now: u64,
 }
 
 /// An event the fork emitted, in the order Core applies it.
@@ -225,20 +252,55 @@ pub struct Logged {
     pub event: Event,
 }
 
-/// A credit Core owes the EVM side: native when `token` is None, else the ERC-20.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A credit Core owes the EVM side: native when `token` is None, else the
+/// ERC-20. `base` is the EVM balance read before the first attempt, so a retry
+/// sets `base + amount` again instead of adding twice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credit {
+    #[serde(rename = "i")]
+    pub id: u64,
+    #[serde(rename = "u")]
     pub to: Address,
+    #[serde(rename = "k", default, skip_serializing_if = "Option::is_none")]
     pub token: Option<Address>,
+    #[serde(rename = "a")]
     pub amount: U256,
+    #[serde(rename = "b", default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<U256>,
+}
+
+impl Credit {
+    /// The EVM balance this credit leaves, once its base is known.
+    pub fn target(&self) -> Option<U256> {
+        self.base.map(|b| b + self.amount)
+    }
+}
+
+/// Base-tier perp fees, in millionths of notional: 0.045% taker, 0.015% maker.
+pub const TAKER_FEE_E6: u64 = 450;
+pub const MAKER_FEE_E6: u64 = 150;
+/// Funding is paid every hour.
+pub const FUNDING_INTERVAL: u64 = 3600;
+/// How many history lines an account keeps.
+const MAX_HISTORY: usize = 16;
+
+/// The fee on a fill's notional (x6).
+pub fn fee(ntl: u64, maker: bool) -> u64 {
+    ntl * if maker { MAKER_FEE_E6 } else { TAKER_FEE_E6 } / 1_000_000
 }
 
 /// What one apply did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Applied {
+    /// Users whose every answer is rewritten.
     pub users: BTreeSet<Address>,
+    /// Users whose margin answers (withdrawable, margin summary) changed.
+    pub margin_users: BTreeSet<Address>,
     pub credits: Vec<Credit>,
     pub outcomes: Vec<Outcome>,
+    /// Resting orders filled by a price move.
+    pub fills: usize,
+    pub liquidated: Vec<Address>,
 }
 
 fn hex_u64(v: &Value) -> Option<u64> {
@@ -503,6 +565,7 @@ impl State {
         }
         if pos.szi_x8 == 0 {
             pos.entry_ntl = 0;
+            pos.funding_paid = 0;
         }
         acct.usd += realized;
     }
@@ -578,6 +641,10 @@ impl State {
                         self.orders.remove(i);
                     }
                     self.fill(maker, asset, !is_buy, q, mpx);
+                    let f = fee(notional(q, mpx), true);
+                    self.charge(maker, f);
+                    let coin = self.coin(asset);
+                    self.note(maker, format!("{} {} {coin} at {} as maker, fee {} USD", if is_buy { "sold" } else { "bought" }, self.fmt_sz(q), fmt_dec(mpx as i128, 8), fmt_dec(f as i128, 6)));
                     applied.users.insert(maker);
                     q
                 }
@@ -589,7 +656,9 @@ impl State {
         }
         let mut parts = Vec::new();
         if filled > 0 {
-            parts.push(format!("filled {} at {}", self.fmt_sz(filled), fmt_dec((cost / filled as u128) as i128, 8)));
+            let f = fee((cost / X16_TO_X6) as u64, false);
+            self.charge(user, f);
+            parts.push(format!("filled {} at {}, fee {} USD", self.fmt_sz(filled), fmt_dec((cost / filled as u128) as i128, 8), fmt_dec(f as i128, 6)));
         }
         if left > 0 {
             if tif == 3 {
@@ -647,7 +716,7 @@ impl State {
         if system_token(destination) == Some(token) {
             let Some((evm, amount)) = self.evm_amount(token, wei) else { return format!("rejected: token {token} has no EVM side") };
             self.account(user).spot.entry(token).or_default().0 -= wei;
-            applied.credits.push(Credit { to: user, token: evm, amount });
+            self.queue_credit(user, evm, amount, applied);
             return format!("sent {wei} wei of token {token} to the EVM");
         }
         self.account(user).spot.entry(token).or_default().0 -= wei;
@@ -678,10 +747,171 @@ impl State {
         format!("moved {} USD to {}", fmt_dec(ntl as i128, 6), if to_perp { "perp" } else { "spot" })
     }
 
-    /// Applies events in order and moves the cursor to `head` (number, hash).
-    /// Events at or below the cursor are skipped, so re-applying a range is a no-op.
-    pub fn apply(&mut self, events: &[Logged], head: (u64, String)) -> Applied {
+    fn coin(&self, asset: u32) -> String {
+        self.perps.get(&asset).map_or_else(|| asset.to_string(), |p| p.name.clone())
+    }
+
+    /// Adds a history line to an account, keeping the newest ones.
+    fn note(&mut self, user: Address, text: String) {
+        let now = self.now;
+        let h = &mut self.account(user).history;
+        h.push((now, text));
+        let drop = h.len().saturating_sub(MAX_HISTORY);
+        h.drain(..drop);
+    }
+
+    fn charge(&mut self, user: Address, usd: u64) {
+        self.account(user).usd -= usd as i64;
+    }
+
+    fn queue_credit(&mut self, to: Address, token: Option<Address>, amount: U256, applied: &mut Applied) {
+        let id = self.next_credit.max(1);
+        self.next_credit = id + 1;
+        let c = Credit { id, to, token, amount, base: None };
+        self.pending.push(c.clone());
+        applied.credits.push(c);
+    }
+
+    /// Records the EVM balance read before a credit's first attempt.
+    pub fn credit_base(&mut self, id: u64, base: U256) {
+        if let Some(c) = self.pending.iter_mut().find(|c| c.id == id && c.base.is_none()) {
+            c.base = Some(base);
+        }
+    }
+
+    /// A credit landed on the EVM side: it leaves the queue, so it is never applied again.
+    pub fn credit_landed(&mut self, id: u64) {
+        self.pending.retain(|c| c.id != id);
+    }
+
+    /// The maintenance margin of a user's positions at the current marks, x6:
+    /// half the initial margin at the perp's maximum leverage.
+    pub fn maintenance(&self, user: Address) -> u64 {
+        let Some(acct) = self.accounts.get(&user) else { return 0 };
+        acct.positions
+            .iter()
+            .filter(|(_, p)| p.szi_x8 != 0)
+            .map(|(a, p)| {
+                let perp = self.perps.get(a);
+                let mark = perp.map_or(0, |x| x.mark_x8);
+                notional(p.szi_x8.unsigned_abs(), mark) / (2 * perp.map_or(1, |x| x.max_leverage.max(1)) as u64)
+            })
+            .sum()
+    }
+
+    /// Moves a perp's mark and oracle to `px` at block time `time`, then
+    /// fills the resting orders the price crosses (as makers, at their own
+    /// price) and liquidates accounts below maintenance margin.
+    pub fn set_price(&mut self, asset: u32, px: u64, time: u64) -> Applied {
+        self.now = time;
         let mut applied = Applied::default();
+        if let Some(p) = self.perps.get_mut(&asset) {
+            p.mark_x8 = px;
+            p.oracle_x8 = px;
+        }
+        let crossed: Vec<Order> = self.orders.iter().filter(|o| o.asset == asset && if o.is_buy { o.px_x8 >= px } else { o.px_x8 <= px }).cloned().collect();
+        for o in crossed {
+            self.orders.retain(|x| x.oid != o.oid);
+            self.fill(o.user, asset, o.is_buy, o.sz_x8, o.px_x8);
+            let f = fee(notional(o.sz_x8, o.px_x8), true);
+            self.charge(o.user, f);
+            let coin = self.coin(asset);
+            self.note(o.user, format!("oid {} {} {} {coin} at {} as the price moved to {}, fee {} USD", o.oid, if o.is_buy { "bought" } else { "sold" }, self.fmt_sz(o.sz_x8), fmt_dec(o.px_x8 as i128, 8), fmt_dec(px as i128, 8), fmt_dec(f as i128, 6)));
+            applied.users.insert(o.user);
+            applied.fills += 1;
+        }
+        self.liquidate(&mut applied);
+        // Everyone holding this perp sees new margin figures.
+        applied.margin_users.extend(self.accounts.iter().filter(|(_, a)| a.positions.get(&asset).is_some_and(|p| p.szi_x8 != 0)).map(|(u, _)| *u));
+        applied
+    }
+
+    /// One replayed candle: the block that carries it (funding up to its
+    /// time, then liquidations), then the move to the candle's close.
+    pub fn candle_step(&mut self, asset: u32, close: u64, head: (u64, String), time: u64) -> Applied {
+        let mut applied = self.apply(&[], head, time);
+        let step = self.set_price(asset, close, time);
+        applied.users.extend(step.users);
+        applied.margin_users.extend(step.margin_users);
+        applied.fills += step.fills;
+        applied.liquidated.extend(step.liquidated);
+        applied
+    }
+
+    /// Liquidates every account whose account value is below its maintenance
+    /// margin: all positions close at the mark price, its open orders are
+    /// canceled, and the remaining collateral stays with the account. A
+    /// negative balance is reset to zero, the loss the backstop liquidator takes.
+    fn liquidate(&mut self, applied: &mut Applied) {
+        let users: Vec<Address> = self.accounts.iter().filter(|(_, a)| a.positions.values().any(|p| p.szi_x8 != 0)).map(|(u, _)| *u).collect();
+        for user in users {
+            let (value, mm) = (self.margin(user).account_value, self.maintenance(user));
+            if value >= mm as i64 {
+                continue;
+            }
+            let open: Vec<(u32, i64)> = self.accounts[&user].positions.iter().filter(|(_, p)| p.szi_x8 != 0).map(|(a, p)| (*a, p.szi_x8)).collect();
+            let mut closed = Vec::new();
+            for (asset, szi) in open {
+                let mark = self.perps.get(&asset).map_or(0, |p| p.mark_x8);
+                self.fill(user, asset, szi < 0, szi.unsigned_abs(), mark);
+                if let Some(p) = self.account(user).positions.get_mut(&asset) {
+                    p.funding_paid = 0;
+                }
+                closed.push(format!("{} {} at {}", fmt_dec(szi as i128, 8), self.coin(asset), fmt_dec(mark as i128, 8)));
+            }
+            self.orders.retain(|o| o.user != user);
+            // A negative balance is the backstop liquidator's loss, not the account's.
+            let acct = self.account(user);
+            let shortfall = (-acct.usd).max(0);
+            acct.usd = acct.usd.max(0);
+            let absorbed = if shortfall > 0 { format!(", shortfall {} USD absorbed", fmt_dec(shortfall as i128, 6)) } else { String::new() };
+            self.note(user, format!("liquidated: account value {} USD below maintenance margin {} USD, closed {}{absorbed}", fmt_dec(value as i128, 6), fmt_dec(mm as i128, 6), closed.join(", ")));
+            applied.users.insert(user);
+            applied.liquidated.push(user);
+        }
+    }
+
+    /// Pays funding for every interval boundary up to `time`: each position
+    /// pays size x oracle price x the perp's hourly rate, longs paying shorts
+    /// when the rate is positive.
+    fn fund_until(&mut self, time: u64, applied: &mut Applied) {
+        if self.funding_time == 0 {
+            self.funding_time = time / FUNDING_INTERVAL * FUNDING_INTERVAL;
+            return;
+        }
+        while self.funding_time + FUNDING_INTERVAL <= time {
+            self.funding_time += FUNDING_INTERVAL;
+            self.now = self.funding_time;
+            let users: Vec<Address> = self.accounts.keys().copied().collect();
+            for user in users {
+                let open: Vec<(u32, i64)> = self.accounts[&user].positions.iter().filter(|(_, p)| p.szi_x8 != 0).map(|(a, p)| (*a, p.szi_x8)).collect();
+                for (asset, szi) in open {
+                    let Some(perp) = self.perps.get(&asset) else { continue };
+                    if perp.funding_e12 == 0 {
+                        continue;
+                    }
+                    let px = if perp.oracle_x8 > 0 { perp.oracle_x8 } else { perp.mark_x8 };
+                    let pay = (szi as i128 * px as i128 / X16_TO_X6 as i128 * perp.funding_e12 as i128 / 1_000_000_000_000) as i64;
+                    let rate = fmt_dec(perp.funding_e12 as i128, 12);
+                    let acct = self.account(user);
+                    acct.usd -= pay;
+                    if let Some(p) = acct.positions.get_mut(&asset) {
+                        p.funding_paid += pay;
+                    }
+                    let coin = self.coin(asset);
+                    self.note(user, format!("funding on {coin} at rate {rate}: {} {} USD", if pay >= 0 { "paid" } else { "received" }, fmt_dec(pay.unsigned_abs() as i128, 6)));
+                    applied.margin_users.insert(user);
+                }
+            }
+        }
+    }
+
+    /// Applies events in order and moves the cursor to `head` (number, hash),
+    /// then pays funding up to the head's block time and liquidates. Events
+    /// at or below the cursor are skipped, so re-applying a range is a no-op.
+    pub fn apply(&mut self, events: &[Logged], head: (u64, String), time: u64) -> Applied {
+        let mut applied = Applied::default();
+        self.now = time;
         let after = self.cursor.as_ref().map(|c| c.0);
         for l in events {
             if after.is_some_and(|c| l.block <= c) || l.block > head.0 {
@@ -726,6 +956,9 @@ impl State {
         let drop = self.results.len().saturating_sub(MAX_RESULTS);
         self.results.drain(..drop);
         self.cursor = Some(head);
+        self.fund_until(time, &mut applied);
+        self.now = time;
+        self.liquidate(&mut applied);
         applied
     }
 
@@ -743,6 +976,22 @@ impl State {
                 let pos = hypercore::Position { szi: self.sz_to_raw(*asset, p.szi_x8), entry_ntl: p.entry_ntl, isolated_raw_usd: p.isolated_raw_usd, leverage: p.leverage, is_isolated: p.isolated };
                 out.push(hypercore::position(*user, perp, pos));
             }
+            let m = self.margin(*user);
+            out.push(Entry { precompile: hypercore::WITHDRAWABLE, calldata: word_addr(*user).to_vec(), result: word_u(m.withdrawable as u128).to_vec() });
+            out.push(Entry {
+                precompile: hypercore::ACCOUNT_MARGIN_SUMMARY,
+                calldata: [word_u(0), word_addr(*user)].concat(),
+                result: [word_i(m.account_value), word_u(m.margin_used as u128), word_u(m.ntl_pos as u128), word_i(m.raw_usd)].concat(),
+            });
+        }
+        out
+    }
+
+    /// The answers an apply or a price step changed: every answer for its
+    /// users, and the margin answers for its margin users.
+    pub fn answers_for(&self, applied: &Applied) -> Vec<Entry> {
+        let mut out = self.answers(&applied.users);
+        for user in applied.margin_users.difference(&applied.users) {
             let m = self.margin(*user);
             out.push(Entry { precompile: hypercore::WITHDRAWABLE, calldata: word_addr(*user).to_vec(), result: word_u(m.withdrawable as u128).to_vec() });
             out.push(Entry {
@@ -793,7 +1042,7 @@ impl State {
                     "liquidationPx": null,
                     "marginUsed": usd(margin),
                     "maxLeverage": perp.map_or(0, |x| x.max_leverage),
-                    "cumFunding": { "allTime": "0.0", "sinceOpen": "0.0", "sinceChange": "0.0" },
+                    "cumFunding": { "allTime": usd(p.funding_paid as i128), "sinceOpen": usd(p.funding_paid as i128), "sinceChange": usd(p.funding_paid as i128) },
                 },
             }));
         }
@@ -830,6 +1079,7 @@ impl State {
             },
             "spotClearinghouseState": { "balances": balances },
             "openOrders": orders,
+            "history": acct.history.iter().map(|(t, e)| json!({ "time": t * 1000, "event": e })).collect::<Vec<_>>(),
         })
     }
 
@@ -853,7 +1103,7 @@ impl State {
             };
             let leverage = p["leverage"]["value"].as_u64().unwrap_or(DEFAULT_LEVERAGE as u64) as u32;
             let isolated = p["leverage"]["type"] == "isolated";
-            positions.insert(asset, Pos { szi_x8: szi as i64, entry_ntl: notional(szi.unsigned_abs() as u64, entry_px as u64), leverage, isolated, isolated_raw_usd: 0 });
+            positions.insert(asset, Pos { szi_x8: szi as i64, entry_ntl: notional(szi.unsigned_abs() as u64, entry_px as u64), leverage, isolated, ..Default::default() });
         }
         let account_value = ch["marginSummary"]["accountValue"].as_str().and_then(|s| parse_dec(s, 6)).unwrap_or(0);
         let acct = self.account(user);
@@ -921,7 +1171,7 @@ mod tests {
     /// BTC (szDecimals 5) at mark 100, asks 101 x 1 and 102 x 2, bids 99 x 1 and 98 x 3.
     fn state() -> State {
         let mut s = State::new();
-        s.perps.insert(0, Perp { name: "BTC".into(), sz_decimals: 5, max_leverage: 40, mark_x8: 100 * ONE_X8 as u64 });
+        s.perps.insert(0, Perp { name: "BTC".into(), sz_decimals: 5, max_leverage: 40, mark_x8: 100 * ONE_X8 as u64, ..Default::default() });
         let x = |v: u64| v * ONE_X8 as u64;
         s.books.insert(0, Book { bids: vec![(x(99), x(1)), (x(98), x(3))], asks: vec![(x(101), x(1)), (x(102), x(2))], time: 1 });
         s.tokens.insert(0, TokenMeta { name: "USDC".into(), wei_decimals: 8, evm: None });
@@ -941,7 +1191,7 @@ mod tests {
     }
 
     fn run(s: &mut State, block: u64, user: Address, payload: Vec<u8>) -> String {
-        let a = s.apply(&[act(block, user, payload)], (block, format!("0x{block:x}")));
+        let a = s.apply(&[act(block, user, payload)], (block, format!("0x{block:x}")), 0);
         a.outcomes.last().map(|o| o.status.clone()).unwrap_or_default()
     }
 
@@ -949,7 +1199,7 @@ mod tests {
     fn a_buy_fills_fully_at_the_best_ask() {
         let mut s = state();
         let r = run(&mut s, 11, ALICE, limit_order(0, true, x8(101.0), x8(0.5), false, 3, 0));
-        assert_eq!(r, "filled 0.5 at 101.0");
+        assert_eq!(r, "filled 0.5 at 101.0, fee 0.022725 USD");
         let p = s.accounts[&ALICE].positions[&0];
         assert_eq!((p.szi_x8, p.entry_ntl, p.leverage), (x8(0.5) as i64, 50_500_000, 20));
         // The level lost the filled depth.
@@ -962,7 +1212,7 @@ mod tests {
         let mut s = state();
         // GTC at 102 for 4: 1 at 101, 2 at 102, 1 rests.
         let r = run(&mut s, 11, ALICE, limit_order(0, true, x8(102.0), x8(4.0), false, 2, 7));
-        assert_eq!(r, "filled 3.0 at 101.66666666, 1.0 resting as oid 1");
+        assert_eq!(r, "filled 3.0 at 101.66666666, fee 0.13725 USD, 1.0 resting as oid 1");
         assert!(s.books[&0].asks.is_empty());
         assert_eq!(s.orders.len(), 1);
         assert_eq!((s.orders[0].px_x8, s.orders[0].sz_x8, s.orders[0].cloid), (x8(102.0), x8(1.0), 7));
@@ -977,7 +1227,7 @@ mod tests {
     fn a_partial_ioc_drops_the_remainder() {
         let mut s = state();
         let r = run(&mut s, 11, ALICE, limit_order(0, true, x8(101.0), x8(1.5), false, 3, 0));
-        assert_eq!(r, "filled 1.0 at 101.0, 0.5 dropped (IOC)");
+        assert_eq!(r, "filled 1.0 at 101.0, fee 0.04545 USD, 0.5 dropped (IOC)");
         assert!(s.orders.is_empty());
     }
 
@@ -1008,8 +1258,8 @@ mod tests {
         let mut s = state();
         s.account(BOB).usd = 1_000_000_000;
         run(&mut s, 11, BOB, limit_order(0, false, x8(100.5), x8(0.2), false, 2, 0));
-        let a = s.apply(&[act(12, ALICE, limit_order(0, true, x8(101.0), x8(0.3), false, 3, 0))], (12, "0xc".into()));
-        assert_eq!(a.outcomes[0].status, "filled 0.3 at 100.66666666");
+        let a = s.apply(&[act(12, ALICE, limit_order(0, true, x8(101.0), x8(0.3), false, 3, 0))], (12, "0xc".into()), 0);
+        assert_eq!(a.outcomes[0].status, "filled 0.3 at 100.66666666, fee 0.01359 USD");
         assert!(a.users.contains(&BOB));
         assert_eq!(s.accounts[&BOB].positions[&0].szi_x8, -(x8(0.2) as i64));
         assert!(s.orders.is_empty());
@@ -1020,8 +1270,8 @@ mod tests {
         let mut s = state();
         run(&mut s, 11, ALICE, limit_order(0, true, x8(101.0), x8(1.0), false, 3, 0));
         // Sell 1 at the best bid 99: 2 USD loss.
-        assert_eq!(run(&mut s, 12, ALICE, limit_order(0, false, x8(99.0), x8(1.0), true, 3, 0)), "filled 1.0 at 99.0");
-        assert_eq!(s.accounts[&ALICE].usd, 9_998_000_000);
+        assert_eq!(run(&mut s, 12, ALICE, limit_order(0, false, x8(99.0), x8(1.0), true, 3, 0)), "filled 1.0 at 99.0, fee 0.04455 USD");
+        assert_eq!(s.accounts[&ALICE].usd, 9_998_000_000 - 45_450 - 44_550);
         assert_eq!(s.accounts[&ALICE].positions[&0], Pos { leverage: 20, ..Default::default() });
         // 3000 BTC at 102 needs 15,300 USD of margin.
         assert!(run(&mut s, 13, ALICE, limit_order(0, true, x8(102.0), x8(3000.0), false, 3, 0)).starts_with("rejected: insufficient margin"));
@@ -1046,15 +1296,16 @@ mod tests {
         let mut s = state();
         s.account(ALICE).spot.insert(HYPE_TOKEN, Spot(5 * 100_000_000, 0, 0));
         s.account(ALICE).spot.insert(200, Spot(7_000_000, 0, 0));
-        let a = s.apply(&[act(11, ALICE, encode_action(6, &[word_addr(BOB), word_u(HYPE_TOKEN as u128), word_u(100_000_000)].concat()))], (11, "0xb".into()));
+        let a = s.apply(&[act(11, ALICE, encode_action(6, &[word_addr(BOB), word_u(HYPE_TOKEN as u128), word_u(100_000_000)].concat()))], (11, "0xb".into()), 0);
         assert!(a.users.contains(&BOB) && a.credits.is_empty());
         assert_eq!((s.accounts[&ALICE].spot[&HYPE_TOKEN].0, s.accounts[&BOB].spot[&HYPE_TOKEN].0), (400_000_000, 100_000_000));
         // To 0x2222…2222: native HYPE on the EVM, 18 decimals.
-        let a = s.apply(&[act(12, ALICE, encode_action(6, &[word_addr(HYPE_SYSTEM), word_u(HYPE_TOKEN as u128), word_u(150_000_000)].concat()))], (12, "0xc".into()));
-        assert_eq!(a.credits, vec![Credit { to: ALICE, token: None, amount: U256::from(15u64) * U256::from(10u64).pow(U256::from(17u64)) }]);
+        let a = s.apply(&[act(12, ALICE, encode_action(6, &[word_addr(HYPE_SYSTEM), word_u(HYPE_TOKEN as u128), word_u(150_000_000)].concat()))], (12, "0xc".into()), 0);
+        assert_eq!(a.credits, vec![Credit { id: 1, to: ALICE, token: None, amount: U256::from(15u64) * U256::from(10u64).pow(U256::from(17u64)), base: None }]);
+        assert_eq!(s.pending, a.credits);
         assert_eq!(s.accounts[&ALICE].spot[&HYPE_TOKEN].0, 250_000_000);
         // A linked ERC-20 with 12 extra decimals.
-        let a = s.apply(&[act(13, ALICE, encode_action(6, &[word_addr(system_address(200)), word_u(200), word_u(2_000_000)].concat()))], (13, "0xd".into()));
+        let a = s.apply(&[act(13, ALICE, encode_action(6, &[word_addr(system_address(200)), word_u(200), word_u(2_000_000)].concat()))], (13, "0xd".into()), 0);
         assert_eq!(a.credits[0].token, Some("0x00000000000000000000000000000000000000aa".parse().unwrap()));
         assert_eq!(a.credits[0].amount, U256::from(2_000_000u64) * U256::from(10u64).pow(U256::from(12u64)));
         assert!(run(&mut s, 14, ALICE, encode_action(6, &[word_addr(BOB), word_u(0), word_u(1)].concat())).starts_with("rejected: insufficient"));
@@ -1075,7 +1326,7 @@ mod tests {
             // A Transfer from a contract that is not the linked one does nothing.
             Logged { block: 11, log_index: 2, event: Event::TokenIn { contract: other, from: BOB, to: system_address(200), value: U256::from(1u64) } },
         ];
-        let a = s.apply(&events, (11, "0xb".into()));
+        let a = s.apply(&events, (11, "0xb".into()), 0);
         assert_eq!(a.outcomes.len(), 2);
         assert_eq!(s.accounts[&BOB].spot[&HYPE_TOKEN].0, 200_000_000);
         assert_eq!(s.accounts[&BOB].spot[&200].0, 3_000_000);
@@ -1087,12 +1338,12 @@ mod tests {
     fn re_applying_a_range_is_a_no_op() {
         let mut s = state();
         let ev = [act(11, ALICE, limit_order(0, true, x8(101.0), x8(0.5), false, 3, 0))];
-        s.apply(&ev, (11, "0xb".into()));
+        s.apply(&ev, (11, "0xb".into()), 0);
         let once = s.clone();
-        let again = s.apply(&ev, (11, "0xb".into()));
+        let again = s.apply(&ev, (11, "0xb".into()), 0);
         assert!(again.outcomes.is_empty());
         assert_eq!(s, once);
-        assert_eq!(s.result_of((11, 0)), Some("filled 0.5 at 101.0"));
+        assert_eq!(s.result_of((11, 0)), Some("filled 0.5 at 101.0, fee 0.022725 USD"));
     }
 
     #[test]
@@ -1121,15 +1372,15 @@ mod tests {
         assert_eq!(pos.calldata, [word_addr(ALICE), word_u(0)].concat());
         assert_eq!(pos.result, [word_i(100_000), word_u(101_000_000), word_i(0), word_u(20), word_u(0)].concat());
         assert_eq!(find(hypercore::SPOT_BALANCE).result, [word_u(42), word_u(0), word_u(0)].concat());
-        // Mark 100: value 100, uPnL -1, margin 5, account value 9999, withdrawable 9994.
-        assert_eq!(find(hypercore::WITHDRAWABLE).result, word_u(9_994_000_000).to_vec());
+        // Mark 100: value 100, uPnL -1, margin 5, fee 0.04545, account value 9998.95455.
+        assert_eq!(find(hypercore::WITHDRAWABLE).result, word_u(9_994_000_000 - 45_450).to_vec());
         let ams = find(hypercore::ACCOUNT_MARGIN_SUMMARY);
         assert_eq!(ams.calldata, [word_u(0), word_addr(ALICE)].concat());
-        assert_eq!(ams.result, [word_i(9_999_000_000), word_u(5_000_000), word_u(100_000_000), word_i(9_899_000_000)].concat());
+        assert_eq!(ams.result, [word_i(9_999_000_000 - 45_450), word_u(5_000_000), word_u(100_000_000), word_i(9_899_000_000 - 45_450)].concat());
         let info = s.info(ALICE, 7);
         let p = &info["clearinghouseState"]["assetPositions"][0]["position"];
         assert_eq!((p["coin"].as_str(), p["szi"].as_str(), p["entryPx"].as_str(), p["unrealizedPnl"].as_str()), (Some("BTC"), Some("1.0"), Some("101.0"), Some("-1.0")));
-        assert_eq!(info["clearinghouseState"]["withdrawable"], "9994.0");
+        assert_eq!(info["clearinghouseState"]["withdrawable"], "9993.95455");
         assert_eq!(info["spotClearinghouseState"]["balances"][0]["total"], "0.00000042");
     }
 
@@ -1153,6 +1404,187 @@ mod tests {
         let l2 = json!({ "time": 5, "levels": [[{ "px": "78352.0", "sz": "3.34071", "n": 9 }], [{ "px": "78353.0", "sz": "0.1", "n": 1 }]] });
         let b = State::book_from_info(&l2).unwrap();
         assert_eq!((b.bids[0], b.asks[0], b.time), ((7_835_200_000_000, 334_071_000), (7_835_300_000_000, 10_000_000), 5));
+    }
+
+    fn usd(v: f64) -> i64 {
+        (v * 1e6).round() as i64
+    }
+
+    #[test]
+    fn a_price_move_reprices_positions_and_margin() {
+        let mut s = state();
+        run(&mut s, 11, ALICE, limit_order(0, true, x8(102.0), x8(2.0), false, 3, 0));
+        // Long 1 at 101 and 1 at 102, fee 0.045% of 203.
+        let fee = usd(0.09135);
+        assert_eq!(s.accounts[&ALICE].usd, usd(10_000.0) - fee);
+        let a = s.set_price(0, x8(110.0), 100);
+        assert!(a.margin_users.contains(&ALICE) && a.liquidated.is_empty());
+        let m = s.margin(ALICE);
+        // Value 220, entry 203: uPnL 17. Margin 220 / 20 = 11.
+        assert_eq!((m.ntl_pos, m.margin_used, m.account_value), (220_000_000, 11_000_000, usd(10_017.0) - fee));
+        assert_eq!(s.perps[&0].oracle_x8, x8(110.0));
+        let info = s.info(ALICE, 0);
+        assert_eq!(info["clearinghouseState"]["assetPositions"][0]["position"]["unrealizedPnl"], "17.0");
+        // The answers carry the new margin figures without a fill.
+        let answers = s.answers_for(&a);
+        assert!(answers.iter().any(|e| e.precompile == hypercore::WITHDRAWABLE && e.result == word_u(m.withdrawable as u128).to_vec()));
+        assert!(!answers.iter().any(|e| e.precompile == hypercore::POSITION));
+    }
+
+    #[test]
+    fn a_price_move_fills_resting_orders_it_crosses_as_maker() {
+        let mut s = state();
+        run(&mut s, 11, ALICE, limit_order(0, true, x8(95.0), x8(1.0), false, 2, 0));
+        run(&mut s, 12, ALICE, limit_order(0, false, x8(130.0), x8(1.0), false, 2, 0));
+        // 96 does not reach the bid at 95.
+        assert_eq!(s.set_price(0, x8(96.0), 100).fills, 0);
+        let a = s.set_price(0, x8(94.0), 200);
+        assert_eq!(a.fills, 1);
+        assert!(a.users.contains(&ALICE));
+        let p = s.accounts[&ALICE].positions[&0];
+        assert_eq!((p.szi_x8, p.entry_ntl), (x8(1.0) as i64, 95_000_000));
+        // The maker fee, 0.015% of 95.
+        assert_eq!(s.accounts[&ALICE].usd, usd(10_000.0) - usd(0.01425));
+        assert_eq!(s.orders.len(), 1);
+        assert!(s.accounts[&ALICE].history.last().unwrap().1.starts_with("oid 1 bought 1.0 BTC at 95.0 as the price moved to 94.0, fee 0.01425 USD"));
+    }
+
+    #[test]
+    fn liquidation_at_the_maintenance_boundary() {
+        // BTC max leverage 40: maintenance is 1/80 of notional.
+        let mut s = state();
+        s.account(BOB).usd = 0;
+        s.account(BOB).positions.insert(0, Pos { szi_x8: x8(1.0) as i64, entry_ntl: 100_000_000, leverage: 20, ..Default::default() });
+        s.account(ALICE).positions.insert(0, Pos { szi_x8: x8(1.0) as i64, entry_ntl: 100_000_000, leverage: 20, ..Default::default() });
+        // At price p Bob's value is 1.25 + p - 100 and his maintenance p / 80.
+        // At 100 both are 1.25: equal is not below, so he survives.
+        s.account(BOB).usd = usd(1.25);
+        let a = s.set_price(0, x8(100.0), 10);
+        assert!(a.liquidated.is_empty(), "equal to maintenance survives");
+        let a = s.set_price(0, x8(99.99), 20);
+        // value 1.24, maintenance 99.99 / 80 = 1.249875: below, liquidated.
+        assert_eq!(a.liquidated, vec![BOB]);
+        let bob = &s.accounts[&BOB];
+        assert_eq!(bob.positions[&0].szi_x8, 0);
+        // Closed at the mark: the loss is realized, the rest stays.
+        assert_eq!(bob.usd, usd(1.24));
+        assert!(bob.history.last().unwrap().1.starts_with("liquidated: account value 1.24 USD below maintenance margin 1.249875 USD"));
+        // Alice has 10,000 USD behind the same position and survives.
+        assert_eq!(s.accounts[&ALICE].positions[&0].szi_x8, x8(1.0) as i64);
+        // The 0x800 answer for Bob reads zero.
+        let pos = s.answers(&BTreeSet::from([BOB])).into_iter().find(|e| e.precompile == hypercore::POSITION).unwrap();
+        assert_eq!(pos.result, [word_i(0), word_u(0), word_i(0), word_u(20), word_u(0)].concat());
+    }
+
+    #[test]
+    fn liquidation_cancels_open_orders() {
+        let mut s = state();
+        s.account(BOB).usd = usd(1.0);
+        s.account(BOB).positions.insert(0, Pos { szi_x8: -(x8(1.0) as i64), entry_ntl: 100_000_000, leverage: 20, ..Default::default() });
+        s.orders.push(Order { oid: 9, cloid: 0, user: BOB, asset: 0, is_buy: false, px_x8: x8(200.0), sz_x8: 1, tif: 2 });
+        let a = s.set_price(0, x8(101.0), 10);
+        assert_eq!(a.liquidated, vec![BOB]);
+        assert!(s.orders.is_empty());
+        assert_eq!(s.accounts[&BOB].usd, 0);
+        // Value 1 - 1 = 0 at 101: no shortfall. A gap through zero leaves none on the account.
+        s.account(BOB).usd = usd(1.0);
+        s.account(BOB).positions.insert(0, Pos { szi_x8: x8(1.0) as i64, entry_ntl: 101_000_000, leverage: 20, ..Default::default() });
+        s.set_price(0, x8(90.0), 20);
+        assert_eq!(s.accounts[&BOB].usd, 0);
+        assert!(s.accounts[&BOB].history.last().unwrap().1.ends_with("shortfall 10.0 USD absorbed"), "{:?}", s.accounts[&BOB].history);
+    }
+
+    #[test]
+    fn funding_over_two_intervals_with_both_signs() {
+        let mut s = state();
+        s.perps.get_mut(&0).unwrap().funding_e12 = 100_000_000; // 0.0001 per hour
+        s.account(BOB).usd = usd(1_000.0);
+        s.account(BOB).positions.insert(0, Pos { szi_x8: x8(2.0) as i64, entry_ntl: 200_000_000, leverage: 20, ..Default::default() });
+        s.account(ALICE).positions.insert(0, Pos { szi_x8: -(x8(1.0) as i64), entry_ntl: 100_000_000, leverage: 20, ..Default::default() });
+        let t0 = 1_793_599_200; // on the hour
+        s.apply(&[], (11, "0xb".into()), t0 + 10);
+        // The first interval: the long pays 2 x 100 x 0.0001 = 0.02, the short receives 0.01.
+        s.apply(&[], (12, "0xc".into()), t0 + 3600);
+        assert_eq!(s.accounts[&BOB].usd, usd(1_000.0) - usd(0.02));
+        assert_eq!(s.accounts[&ALICE].usd, usd(10_000.0) + usd(0.01));
+        // A negative rate: shorts pay, longs receive.
+        s.perps.get_mut(&0).unwrap().funding_e12 = -50_000_000;
+        let a = s.apply(&[], (13, "0xd".into()), t0 + 7200 + 5);
+        assert!(a.margin_users.contains(&BOB) && a.margin_users.contains(&ALICE));
+        assert_eq!(s.accounts[&BOB].usd, usd(1_000.0) - usd(0.02) + usd(0.01));
+        assert_eq!(s.accounts[&BOB].positions[&0].funding_paid, usd(0.01));
+        assert_eq!(s.accounts[&ALICE].positions[&0].funding_paid, -usd(0.01) + usd(0.005));
+        assert_eq!(s.info(BOB, 0)["clearinghouseState"]["assetPositions"][0]["position"]["cumFunding"]["sinceOpen"], "0.01");
+        // No new boundary: nothing more is paid.
+        s.apply(&[], (14, "0xe".into()), t0 + 7200 + 3000);
+        assert_eq!(s.accounts[&BOB].positions[&0].funding_paid, usd(0.01));
+        assert_eq!(s.funding_time, t0 + 7200);
+    }
+
+    #[test]
+    fn fees_on_taker_and_maker_fills() {
+        let mut s = state();
+        s.account(BOB).usd = usd(1_000.0);
+        run(&mut s, 11, BOB, limit_order(0, false, x8(100.5), x8(2.0), false, 2, 0));
+        assert_eq!(run(&mut s, 12, ALICE, limit_order(0, true, x8(100.5), x8(2.0), false, 3, 0)), "filled 2.0 at 100.5, fee 0.09045 USD");
+        // Taker: 0.045% of 201. Maker: 0.015% of 201.
+        assert_eq!(s.accounts[&ALICE].usd, usd(10_000.0) - usd(0.09045));
+        assert_eq!(s.accounts[&BOB].usd, usd(1_000.0) - usd(0.03015));
+        assert_eq!((fee(1_000_000, false), fee(1_000_000, true)), (450, 150));
+    }
+
+    #[test]
+    fn candle_replay_walks_a_fixed_path() {
+        let mut s = state();
+        s.perps.get_mut(&0).unwrap().funding_e12 = 100_000_000;
+        s.account(BOB).usd = usd(3.0);
+        s.account(BOB).positions.insert(0, Pos { szi_x8: x8(1.0) as i64, entry_ntl: 100_000_000, leverage: 20, ..Default::default() });
+        run(&mut s, 11, ALICE, limit_order(0, true, x8(97.0), x8(1.0), false, 2, 0));
+        let t0 = 1_793_599_200;
+        s.apply(&[], (12, "0xc".into()), t0);
+        let path = [100.0, 98.5, 96.0, 99.0];
+        let mut fills = 0;
+        let mut liquidated = Vec::new();
+        for (i, close) in path.iter().enumerate() {
+            let a = s.candle_step(0, x8(*close), (13 + i as u64, format!("0x{i}")), t0 + 3600 * (i as u64 + 1));
+            fills += a.fills;
+            liquidated.extend(a.liquidated);
+        }
+        assert_eq!(s.perps[&0].mark_x8, x8(99.0));
+        // Alice's bid at 97 filled on the way down to 96.
+        assert_eq!(fills, 1);
+        assert_eq!(s.accounts[&ALICE].positions[&0].szi_x8, x8(1.0) as i64);
+        // Bob paid funding each hour and fell below maintenance at 96.
+        assert_eq!(liquidated, vec![BOB]);
+        assert_eq!(s.accounts[&BOB].positions[&0].szi_x8, 0);
+        assert_eq!(s.funding_time, t0 + 4 * 3600);
+        assert_eq!(s.cursor.as_ref().unwrap().0, 16);
+    }
+
+    #[test]
+    fn a_credit_is_retried_after_a_failure_and_applied_once() {
+        let mut s = state();
+        s.account(ALICE).spot.insert(HYPE_TOKEN, Spot(300_000_000, 0, 0));
+        let send = encode_action(6, &[word_addr(HYPE_SYSTEM), word_u(HYPE_TOKEN as u128), word_u(100_000_000)].concat());
+        s.apply(&[act(11, ALICE, send.clone())], (11, "0xb".into()), 0);
+        assert_eq!(s.pending.len(), 1);
+        let one = U256::from(10u64).pow(U256::from(18u64));
+        // First attempt: the base is read and kept, then the write fails.
+        let id = s.pending[0].id;
+        s.credit_base(id, U256::from(5u64));
+        let target = s.pending[0].target().unwrap();
+        assert_eq!(target, U256::from(5u64) + one);
+        // A later base read does not move the target, so the retry sets the same balance.
+        s.credit_base(id, target);
+        assert_eq!(s.pending[0].target(), Some(target));
+        // The state survives a round trip with the credit pending.
+        let mut s = State::from_bytes(&s.to_bytes()).unwrap();
+        s.credit_landed(id);
+        assert!(s.pending.is_empty());
+        // Re-applying the same block queues nothing.
+        s.apply(&[act(11, ALICE, send)], (11, "0xb".into()), 0);
+        assert!(s.pending.is_empty());
+        assert_eq!(s.accounts[&ALICE].spot[&HYPE_TOKEN].0, 200_000_000);
     }
 
     #[test]
