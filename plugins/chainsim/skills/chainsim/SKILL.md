@@ -22,7 +22,8 @@ Work through these steps in order. Each ends on a check you can make.
    variable named by `upstream.env`. On Aptos, check that `CHAINSIM_APTOS_API_KEY` is set: without
    it the public endpoint's per-IP limit stops a run after a few operations, so ask the user for a
    key from https://geomi.dev. Done when `chainsim describe <chain>` exits 0.
-2. **Learn the chain.** Run `chainsim describe <chain>`. Done when the `limits` that touch this
+2. **Learn the chain.** Run `chainsim chains --json` to see which chains exist and which features
+   each supports, then `chainsim describe <chain>`. Done when the `limits` that touch this
    task, and the `upstream` it reads from, are in your working notes or report.
 3. **Start the fork.** Run `chainsim up <chain>`. For a tool in a container, join its network
    with `--network <net> --alias <host>`. For a tool on the host, add `--publish`. An Aptos fork

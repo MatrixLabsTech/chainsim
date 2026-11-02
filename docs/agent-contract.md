@@ -8,7 +8,10 @@ error codes from the binary.
 `chainsim --help` and `chainsim <command> --help` are the full reference.
 
 - Discover: `describe [<chain>]` lists the chains, or one chain's engine, maturity, operations,
-  tokens, limits and error codes.
+  tokens, limits and error codes. `chains` lists every chain with its engine and, for each
+  feature (fund native and tokens, `send --as`, each `set` kind, snapshot and revert, `time`,
+  `mine`, `call`, `selftest`), whether it is supported. It prints a table in a terminal and the
+  JSON envelope when piped or with `--json`.
 - Run: `up <chain>`, `ls`, `status <name>`, `down <name> | --all`.
 - Use: `fund`, `snapshot`, `revert`, `call`, `send`, `set`, `time`, `mine`, `selftest`. `set`
   takes a kind: `balance`, `token`, `storage`, `code`, `owner`, `object`, `resource`,
