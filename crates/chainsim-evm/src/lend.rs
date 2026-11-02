@@ -10,13 +10,23 @@
 //! - Stablecoin borrow APY is 0.05 + 4.75 * max(0, utilization - 0.8),
 //!   indexed hourly. Suppliers earn the borrow rate times utilization, less
 //!   the 10% the protocol keeps.
-//! - Health factor = LTV-weighted collateral / borrowed. The account is
-//!   liquidated past a ratio of 0.95 between borrowed value and collateral
-//!   weighted by 0.5 + 0.5 * LTV, and the backstop takes collateral at the
-//!   oracle price to clear the borrows.
+//! - Health factor = LTV-weighted collateral / borrowed, kept at or above 1
+//!   when borrowing or withdrawing.
+//! - A collateral token's price is the median of its spot price against USDC,
+//!   the mark and the oracle price of the perp on the same asset (UBTC
+//!   follows BTC), with the USDT to USDC conversion taken as 1. Stablecoin
+//!   reserves keep their price from `up`.
+//! - Portfolio margin ratio, per borrowed token: (20 USDC + the cross
+//!   maintenance margin of every dex + the borrowed value) / (the token's
+//!   balance, with the account value of the perp dexes it margins + supplied
+//!   collateral x price x (0.5 + 0.5 * LTV)). Past 0.95 the account is
+//!   liquidated: the backstop takes 20% of each collateral at a time, at its
+//!   price, against the borrows, until the ratio is back at or below 0.95.
 //!
 //! Amounts are in each token's wei, prices x8, rates as yearly fractions
 //! with 12 decimals.
+
+use std::collections::BTreeSet;
 
 use alloy_primitives::Address;
 use serde::{Deserialize, Serialize};
@@ -45,6 +55,34 @@ pub struct Reserve {
     /// are not stablecoins (12 decimals).
     #[serde(rename = "r")]
     pub rate_e12: i64,
+    /// The token's spot pair against USDC, and that pair's price x8.
+    #[serde(rename = "sp", default, skip_serializing_if = "Option::is_none")]
+    pub spot: Option<u32>,
+    #[serde(rename = "sx", default, skip_serializing_if = "is_zero")]
+    pub spot_x8: u64,
+    /// The main-dex perp on the same asset.
+    #[serde(rename = "pp", default, skip_serializing_if = "Option::is_none")]
+    pub perp: Option<u32>,
+}
+
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
+/// The backstop liquidator that takes collateral from liquidated accounts.
+pub const BACKSTOP: Address = Address::repeat_byte(0xbb);
+/// The fixed part of the portfolio maintenance requirement, USD x6.
+pub const MIN_BORROW_OFFSET: i128 = 20_000_000;
+/// The share of each collateral one liquidation step takes, percent.
+pub const LIQUIDATION_STEP_PCT: u64 = 20;
+
+fn median(mut v: Vec<u64>) -> Option<u64> {
+    v.sort_unstable();
+    match v.len() {
+        0 => None,
+        n if n % 2 == 1 => Some(v[n / 2]),
+        n => Some(((v[n / 2 - 1] as u128 + v[n / 2] as u128) / 2) as u64),
+    }
 }
 
 /// One user's borrow and lend position in a token: basis and value, wei.
@@ -107,6 +145,113 @@ impl State {
     pub fn token_usd(&self, token: u64, wei: u64) -> i128 {
         let px = self.reserves.get(&token).map_or(0, |r| r.oracle_x8);
         wei as i128 * px as i128 / 10i128.pow(self.wei_decimals(token) + 2)
+    }
+
+    /// A USD amount (x6) in a token's wei at the reserve's price.
+    fn usd_to_wei(&self, token: u64, usd: i128) -> u64 {
+        let px = self.reserves.get(&token).map_or(0, |r| r.oracle_x8).max(1) as i128;
+        (usd * 10i128.pow(self.wei_decimals(token) + 2) / px).max(0) as u64
+    }
+
+    /// A collateral token's price from its spot pair and its perp: the median
+    /// of the spot price, the perp mark and the perp oracle. Stablecoins, and
+    /// tokens with neither, keep their price.
+    pub fn reserve_px(&self, token: u64) -> Option<u64> {
+        let r = self.reserves.get(&token)?;
+        if r.borrowable() {
+            return Some(r.oracle_x8);
+        }
+        let mut v = Vec::new();
+        if r.spot_x8 > 0 {
+            v.push(r.spot_x8);
+        }
+        if let Some(p) = r.perp.and_then(|p| self.perps.get(&p)) {
+            v.push(p.mark_x8);
+            v.push(if p.oracle_x8 > 0 { p.oracle_x8 } else { p.mark_x8 });
+        }
+        Some(median(v).unwrap_or(r.oracle_x8))
+    }
+
+    /// Moves each reserve's price to [`Self::reserve_px`]. Returns whether any moved.
+    pub fn reprice_reserves(&mut self) -> bool {
+        let moved: Vec<(u64, u64)> = self.reserves.keys().filter_map(|t| self.reserve_px(*t).filter(|px| *px != self.reserves[t].oracle_x8).map(|px| (*t, px))).collect();
+        for (t, px) in &moved {
+            self.reserves.get_mut(t).expect("reserve").oracle_x8 = *px;
+        }
+        if !moved.is_empty() {
+            self.reserves_dirty = true;
+        }
+        !moved.is_empty()
+    }
+
+    /// A spot pair's price moved to `px_x8` (`set hypercore price --spot`):
+    /// the reserves it prices follow, and liquidation runs.
+    pub fn set_spot_price(&mut self, pair: u32, px_x8: u64, time: u64) -> Applied {
+        self.set_now(time);
+        let mut applied = Applied::default();
+        for r in self.reserves.values_mut().filter(|r| r.spot == Some(pair)) {
+            r.spot_x8 = px_x8;
+        }
+        self.lend_liquidate(&mut applied);
+        applied.reserves = self.take_reserves_dirty();
+        applied
+    }
+
+    /// Links each collateral reserve to its spot pair against USDC (from
+    /// `spotMeta`) and to the main-dex perp on the same asset (from `meta`,
+    /// by the token's name, or without a leading U: UBTC is BTC). Returns the
+    /// perp indexes the reserves follow.
+    pub fn link_reserves(&mut self, spot_meta: &Value, meta: &Value) -> Vec<u32> {
+        let pairs = spot_meta["universe"].as_array().cloned().unwrap_or_default();
+        let universe = meta["universe"].as_array().cloned().unwrap_or_default();
+        let mut perps = Vec::new();
+        let tokens: Vec<u64> = self.reserves.iter().filter(|(_, r)| !r.borrowable()).map(|(t, _)| *t).collect();
+        for token in tokens {
+            let name = self.tokens.get(&token).map(|t| t.name.clone()).unwrap_or_default();
+            let spot = pairs.iter().find(|p| p["tokens"][0].as_u64() == Some(token) && p["tokens"][1].as_u64() == Some(0)).and_then(|p| p["index"].as_u64()).map(|i| i as u32);
+            let bare = name.strip_prefix('U').filter(|b| !b.is_empty()).unwrap_or(&name).to_string();
+            let perp = [name.as_str(), bare.as_str()].iter().find_map(|n| universe.iter().position(|u| u["name"].as_str() == Some(n) && u["isDelisted"] != json!(true))).map(|i| i as u32);
+            let r = self.reserves.get_mut(&token).expect("reserve");
+            r.spot = spot;
+            r.spot_x8 = r.oracle_x8;
+            r.perp = perp;
+            perps.extend(perp);
+        }
+        perps
+    }
+
+    /// The portfolio margin ratio's parts for each borrowed token:
+    /// (token, maintenance requirement, liquidation value), USD x6.
+    pub fn portfolio_margin(&self, user: Address) -> Vec<(u64, i128, i128)> {
+        let Some(acct) = self.accounts.get(&user) else { return vec![] };
+        let mut dexes: BTreeSet<u32> = acct.positions.iter().filter(|(_, p)| p.szi_x8 != 0 && !p.isolated).map(|(a, _)| crate::core::dex_of(*a)).collect();
+        dexes.insert(0);
+        dexes.extend(acct.dex_usd.keys().copied());
+        let cross_mm: i128 = dexes.iter().map(|d| self.maintenance_dex(user, *d) as i128).sum();
+        let collateral: i128 = acct
+            .lend
+            .iter()
+            .filter_map(|(t, l)| {
+                let ltv = self.reserves.get(t).map_or(0, |r| r.ltv_bps) as i128;
+                (ltv > 0).then(|| self.token_usd(*t, l.supply_value) * (5_000 + ltv / 2) / 10_000)
+            })
+            .sum();
+        let dex_collateral = |d: u32| if d == 0 { 0 } else { self.perps.iter().find(|(a, _)| crate::core::dex_of(**a) == d).map_or(0, |(_, p)| p.collateral) };
+        acct.lend
+            .iter()
+            .filter(|(_, l)| l.borrow_value > 0)
+            .map(|(t, l)| {
+                let spot = acct.spot.get(t).map_or(0, |s| s.0) as i128;
+                let perp_value: i128 = dexes.iter().filter(|d| dex_collateral(**d) == *t).map(|d| self.margin_dex(user, *d).account_value as i128).sum();
+                let balance = self.token_usd(*t, spot as u64) + perp_value;
+                (*t, MIN_BORROW_OFFSET + cross_mm + self.token_usd(*t, l.borrow_value), balance + collateral)
+            })
+            .collect()
+    }
+
+    /// Whether the account's portfolio margin ratio is past 0.95 for any borrowed token.
+    pub fn lend_liquidatable(&self, user: Address) -> bool {
+        self.portfolio_margin(user).iter().any(|(_, mm, value)| *value <= 0 || mm * 100 > value * 95)
     }
 
     /// (LTV-weighted collateral, borrowed, liquidation value), USD x6.
@@ -285,47 +430,89 @@ impl State {
         changed
     }
 
-    /// Accounts past the liquidation ratio: the backstop takes collateral at
-    /// the oracle price to clear every borrow.
+    /// Accounts past the portfolio margin ratio of 0.95: the backstop takes
+    /// 20% of each collateral at a time, at its price, and its value repays
+    /// the borrows, until the account is back at or below 0.95. A borrow left
+    /// with no collateral is the backstop's loss.
     pub fn lend_liquidate(&mut self, applied: &mut Applied) {
+        self.reprice_reserves();
         let users: Vec<Address> = self.accounts.iter().filter(|(_, a)| a.lend.values().any(|l| l.borrow_value > 0)).map(|(u, _)| *u).collect();
         for user in users {
-            let (_, borrowed, liq) = self.lend_health(user);
-            if borrowed * 100 <= liq * 95 {
+            if !self.lend_liquidatable(user) {
                 continue;
             }
-            let mut need = borrowed;
-            let collateral: Vec<(u64, u64)> = self.accounts[&user].lend.iter().filter(|(t, l)| l.supply_value > 0 && self.reserves.get(t).is_some_and(|r| r.ltv_bps > 0)).map(|(t, l)| (*t, l.supply_value)).collect();
-            for (token, supply) in collateral {
-                if need <= 0 {
+            let start: Vec<(u64, u64)> = self.accounts[&user].lend.iter().filter(|(t, l)| l.supply_value > 0 && self.reserves.get(t).is_some_and(|r| r.ltv_bps > 0)).map(|(t, l)| (*t, l.supply_value)).collect();
+            let (mut steps, mut taken_usd) = (0, 0i128);
+            while self.lend_liquidatable(user) {
+                let mut took = false;
+                for (token, at_start) in &start {
+                    let have = self.accounts[&user].lend.get(token).map_or(0, |l| l.supply_value);
+                    let take = (at_start * LIQUIDATION_STEP_PCT / 100).max(1).min(have);
+                    if take == 0 {
+                        continue;
+                    }
+                    took = true;
+                    let l = self.accounts.get_mut(&user).expect("user").lend.get_mut(token).expect("lend");
+                    let before = l.supply_value;
+                    l.supply_value -= take;
+                    l.supply_basis = rescale(l.supply_basis, before, l.supply_value);
+                    if let Some(r) = self.reserves.get_mut(token) {
+                        r.supplied = r.supplied.saturating_sub(take);
+                    }
+                    self.accounts.entry(BACKSTOP).or_default().spot.entry(*token).or_default().0 += take;
+                    let value = self.token_usd(*token, take);
+                    taken_usd += value;
+                    self.repay_with_usd(user, value);
+                }
+                if !took {
                     break;
                 }
-                let value = self.token_usd(token, supply);
-                let take = if value <= need { supply } else { (supply as i128 * need / value.max(1)) as u64 };
-                need -= self.token_usd(token, take);
-                let l = self.accounts.get_mut(&user).expect("user").lend.get_mut(&token).expect("lend");
-                let before = l.supply_value;
-                l.supply_value -= take;
-                l.supply_basis = rescale(l.supply_basis, before, l.supply_value);
-                if let Some(r) = self.reserves.get_mut(&token) {
-                    r.supplied = r.supplied.saturating_sub(take);
-                }
+                steps += 1;
             }
-            let borrows: Vec<(u64, u64)> = self.accounts[&user].lend.iter().filter(|(_, l)| l.borrow_value > 0).map(|(t, l)| (*t, l.borrow_value)).collect();
-            for (token, value) in borrows {
-                let l = self.accounts.get_mut(&user).expect("user").lend.get_mut(&token).expect("lend");
+            // Borrows left once the collateral is gone are the backstop's loss.
+            let left: Vec<(u64, u64)> = if start.iter().all(|(t, _)| self.accounts[&user].lend.get(t).map_or(0, |l| l.supply_value) == 0) {
+                self.accounts[&user].lend.iter().filter(|(_, l)| l.borrow_value > 0).map(|(t, l)| (*t, l.borrow_value)).collect()
+            } else {
+                vec![]
+            };
+            for (token, value) in &left {
+                let l = self.accounts.get_mut(&user).expect("user").lend.get_mut(token).expect("lend");
                 l.borrow_value = 0;
                 l.borrow_basis = 0;
-                if let Some(r) = self.reserves.get_mut(&token) {
-                    r.borrowed = r.borrowed.saturating_sub(value);
+                if let Some(r) = self.reserves.get_mut(token) {
+                    r.borrowed = r.borrowed.saturating_sub(*value);
                 }
             }
             self.reserves_dirty = true;
-            self.lend_note(user, format!("liquidated: borrowed {} USD past 0.95 of the collateral's liquidation value {} USD, collateral taken by the backstop", fmt_dec(borrowed, 6), fmt_dec(liq, 6)));
+            let absorbed = if left.is_empty() { String::new() } else { ", the remaining borrow absorbed by the backstop".into() };
+            self.lend_note(user, format!("liquidated: portfolio margin ratio past 0.95, the backstop took collateral worth {} USD in {steps} steps of {LIQUIDATION_STEP_PCT}%{absorbed}", fmt_dec(taken_usd, 6)));
             applied.users.insert(user);
+            applied.users.insert(BACKSTOP);
             if !applied.liquidated.contains(&user) {
                 applied.liquidated.push(user);
             }
+        }
+    }
+
+    /// Repays a user's borrows with a USD value (x6), the largest borrow
+    /// first. What is left after every borrow is repaid goes to the user's
+    /// spot balance of USDC.
+    fn repay_with_usd(&mut self, user: Address, mut usd: i128) {
+        while usd > 0 {
+            let Some((token, value)) = self.accounts[&user].lend.iter().filter(|(_, l)| l.borrow_value > 0).map(|(t, l)| (*t, l.borrow_value)).max_by_key(|(t, v)| self.token_usd(*t, *v)) else { break };
+            let owed = self.token_usd(token, value);
+            let repay = if usd >= owed { value } else { self.usd_to_wei(token, usd).min(value) };
+            let l = self.accounts.get_mut(&user).expect("user").lend.get_mut(&token).expect("lend");
+            l.borrow_value -= repay;
+            l.borrow_basis = rescale(l.borrow_basis, value, l.borrow_value);
+            if let Some(r) = self.reserves.get_mut(&token) {
+                r.borrowed = r.borrowed.saturating_sub(repay);
+            }
+            usd -= if usd >= owed { owed } else { usd };
+        }
+        if usd > 0 {
+            let wei = self.usd_to_wei(0, usd);
+            self.accounts.entry(user).or_default().spot.entry(0).or_default().0 += wei;
         }
     }
 
@@ -427,6 +614,7 @@ impl State {
                     supplied: dec("totalSupplied", w) as u64,
                     borrowed: dec("totalBorrowed", w) as u64,
                     rate_e12: dec("borrowYearlyRate", 12) as i64,
+                    ..Default::default()
                 },
             );
         }

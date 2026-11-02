@@ -115,6 +115,80 @@ pub struct Perp {
     /// The collateral token of the perp's dex (0 is USDC).
     #[serde(rename = "co", default, skip_serializing_if = "is_zero_u")]
     pub collateral: u64,
+    /// Margin tiers: (lower bound of the position notional x6, max leverage),
+    /// lowest first. Empty means one tier at `max_leverage`.
+    #[serde(rename = "mt", default, skip_serializing_if = "Vec::is_empty")]
+    pub tiers: Vec<(u64, u32)>,
+    /// HIP-3 funding settings from perpDexs, when the perp's dex sets them.
+    #[serde(rename = "hf", default, skip_serializing_if = "Option::is_none")]
+    pub hip3_funding: Option<Hip3Funding>,
+}
+
+/// A HIP-3 perp's funding settings, 12 decimals: the deployer's multiplier,
+/// the 8-hour interest rate and the clamp on rate minus premium.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hip3Funding {
+    #[serde(rename = "m")]
+    pub multiplier_e12: i64,
+    #[serde(rename = "r")]
+    pub rate_e12: i64,
+    #[serde(rename = "c")]
+    pub clamp_e12: i64,
+}
+
+/// The default 8-hour interest rate (0.01%) and clamp (0.05%) of the funding formula.
+pub const FUNDING_RATE_E12: i64 = 100_000_000;
+pub const FUNDING_CLAMP_E12: i64 = 500_000_000;
+/// Funding is capped at 4% an hour.
+pub const FUNDING_CAP_E12: i64 = 40_000_000_000;
+
+impl Perp {
+    fn tier_list(&self) -> Vec<(u64, u32)> {
+        if self.tiers.is_empty() {
+            vec![(0, self.max_leverage.max(1))]
+        } else {
+            self.tiers.clone()
+        }
+    }
+
+    /// The tier a position of this notional (x6) falls in: the highest lower bound at or below it.
+    fn tier_at(&self, ntl: u64) -> usize {
+        self.tier_list().iter().rposition(|(lb, _)| *lb <= ntl).unwrap_or(0)
+    }
+
+    /// The max leverage at a position notional, x6.
+    pub fn max_leverage_at(&self, ntl: u64) -> u32 {
+        self.tier_list()[self.tier_at(ntl)].1.max(1)
+    }
+
+    /// The maintenance margin of a position notional, x6:
+    /// notional / (2 x tier max leverage) - the tier's maintenance deduction,
+    /// where each tier adds lower bound x the step in maintenance rate.
+    pub fn maintenance_at(&self, ntl: u64) -> u64 {
+        let tiers = self.tier_list();
+        let at = self.tier_at(ntl);
+        let mut deduction = 0i128;
+        for n in 1..=at {
+            let (lb, lev) = (tiers[n].0 as i128, tiers[n].1.max(1) as i128);
+            let prev = tiers[n - 1].1.max(1) as i128;
+            deduction += lb * (prev - lev) / (2 * lev * prev);
+        }
+        (ntl as i128 / (2 * tiers[at].1.max(1) as i128) - deduction).max(0) as u64
+    }
+}
+
+/// A perp's margin tiers from the info API meta (`marginTableId` and the
+/// meta's `marginTables`). A table id below 50 is not listed and means one
+/// tier at the perp's max leverage, which is also what an empty result means.
+pub fn tiers_from_meta(u: &Value, tables: &Value) -> Vec<(u64, u32)> {
+    let Some(id) = u["marginTableId"].as_u64().filter(|id| *id >= 50) else { return vec![] };
+    let tiers = tables.as_array().and_then(|t| t.iter().find(|e| e[0].as_u64() == Some(id))).and_then(|e| e[1]["marginTiers"].as_array()).cloned().unwrap_or_default();
+    let list: Vec<(u64, u32)> = tiers.iter().filter_map(|t| Some((parse_dec(t["lowerBound"].as_str()?, 6)? as u64, t["maxLeverage"].as_u64()? as u32))).collect();
+    if list.len() > 1 {
+        list
+    } else {
+        vec![]
+    }
 }
 
 fn is_zero_u(v: &u64) -> bool {
@@ -443,6 +517,9 @@ pub struct Meta {
     /// Builder-deployed dexes the copy has fetched, by name.
     #[serde(rename = "d", default, skip_serializing_if = "BTreeMap::is_empty")]
     pub dexes: BTreeMap<String, DexMeta>,
+    /// Margin tiers of the universe entries with more than one tier, by index.
+    #[serde(rename = "t", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tiers: BTreeMap<u32, Vec<(u64, u32)>>,
 }
 
 /// A builder-deployed dex's meta: its index, collateral token and universe.
@@ -468,7 +545,10 @@ impl Meta {
                 .collect()
         });
         let ctxs = v[1].as_array().map_or(vec![], |c| c.iter().map(|x| META_CTX_FIELDS.iter().map(|k| x[*k].as_str().map(str::to_string)).collect()).collect());
-        Self { universe, ctxs, dexes: BTreeMap::new() }
+        let tiers = v[0]["universe"].as_array().map_or(BTreeMap::new(), |u| {
+            u.iter().enumerate().map(|(i, x)| (i as u32, tiers_from_meta(x, &v[0]["marginTables"]))).filter(|(_, t)| !t.is_empty()).collect()
+        });
+        Self { universe, ctxs, dexes: BTreeMap::new(), tiers }
     }
 }
 
@@ -754,7 +834,8 @@ impl State {
             let value = notional(p.szi_x8.unsigned_abs(), self.mark_of(*perp, p));
             let sign: i128 = if p.szi_x8 > 0 { 1 } else { -1 };
             m.ntl_pos += value;
-            m.margin_used += value / p.leverage.max(1) as u64;
+            let tier_max = self.perps.get(perp).map_or(u32::MAX, |x| x.max_leverage_at(value));
+            m.margin_used += value / p.leverage.clamp(1, tier_max.max(1)) as u64;
             upnl += sign * (value as i128 - p.entry_ntl as i128);
             signed_entry += sign * p.entry_ntl as i128;
         }
@@ -772,8 +853,8 @@ impl State {
         let value = notional(p.szi_x8.unsigned_abs(), self.mark_of(perp, p));
         let sign: i128 = if p.szi_x8 > 0 { 1 } else { -1 };
         let upnl = sign * (value as i128 - p.entry_ntl as i128);
-        let max_lev = self.perps.get(&perp).map_or(1, |x| x.max_leverage.max(1)) as u64;
-        ((p.isolated_raw_usd as i128 + upnl) as i64, value / (2 * max_lev))
+        let mm = self.perps.get(&perp).map_or(value / 2, |x| x.maintenance_at(value));
+        ((p.isolated_raw_usd as i128 + upnl) as i64, mm)
     }
 
     fn leverage_of(&self, user: Address, asset: u32) -> u32 {
@@ -1106,7 +1187,8 @@ impl State {
     }
 
     /// The maintenance margin of a user's positions at the current marks, x6:
-    /// half the initial margin at the perp's maximum leverage.
+    /// half the initial margin at the max leverage of the position's margin
+    /// tier, less the tier's maintenance deduction.
     pub fn maintenance(&self, user: Address) -> u64 {
         self.maintenance_dex(user, 0)
     }
@@ -1118,8 +1200,8 @@ impl State {
             .iter()
             .filter(|(a, p)| p.szi_x8 != 0 && !p.isolated && dex_of(**a) == dex)
             .map(|(a, p)| {
-                let perp = self.perps.get(a);
-                notional(p.szi_x8.unsigned_abs(), self.mark_of(*a, p)) / (2 * perp.map_or(1, |x| x.max_leverage.max(1)) as u64)
+                let value = notional(p.szi_x8.unsigned_abs(), self.mark_of(*a, p));
+                self.perps.get(a).map_or(value / 2, |x| x.maintenance_at(value))
             })
             .sum()
     }
@@ -1192,7 +1274,8 @@ impl State {
         let ctx = meta.ctxs.get(asset as usize);
         let px = |i: usize| ctx.and_then(|c| c.get(i)).and_then(|v| v.as_deref()).and_then(|s| parse_dec(s, 8)).unwrap_or(0) as u64;
         let funding = ctx.and_then(|c| c.get(2)).and_then(|v| v.as_deref()).and_then(|s| parse_dec(s, 12)).unwrap_or(0) as i64;
-        self.perps.insert(asset, Perp { name: u.0.clone(), sz_decimals: u.1, max_leverage: u.2, mark_x8: px(0), oracle_x8: px(1), funding_e12: funding, ..Default::default() });
+        let tiers = meta.tiers.get(&asset).cloned().unwrap_or_default();
+        self.perps.insert(asset, Perp { name: u.0.clone(), sz_decimals: u.1, max_leverage: u.2, mark_x8: px(0), oracle_x8: px(1), funding_e12: funding, tiers, ..Default::default() });
         true
     }
 
@@ -1450,6 +1533,11 @@ impl State {
     }
 
     /// Whether reserves changed since the last call, for [`Applied::reserves`].
+    /// Sets the block time of the step being applied.
+    pub fn set_now(&mut self, time: u64) {
+        self.now = time;
+    }
+
     pub fn take_reserves_dirty(&mut self) -> bool {
         std::mem::take(&mut self.reserves_dirty)
     }
@@ -2299,6 +2387,7 @@ mod tests {
                 vec![some("1.0"), some("1.0"), some("0.0"), None, None, None, None, None, None],
             ],
             dexes: BTreeMap::new(),
+            tiers: BTreeMap::new(),
         }
     }
 
@@ -2504,8 +2593,8 @@ mod tests {
     /// USDC (borrowable) and HYPE (LTV 0.65) reserves, HYPE at 50.
     fn lend() -> State {
         let mut s = state();
-        s.reserves.insert(0, crate::lend::Reserve { ltv_bps: 0, oracle_x8: ONE_X8 as u64, supplied: 1_000_000 * 100_000_000, borrowed: 500_000 * 100_000_000, rate_e12: 50_000_000_000 });
-        s.reserves.insert(HYPE_TOKEN, crate::lend::Reserve { ltv_bps: 6_500, oracle_x8: 50 * ONE_X8 as u64, supplied: 0, borrowed: 0, rate_e12: 50_000_000_000 });
+        s.reserves.insert(0, crate::lend::Reserve { ltv_bps: 0, oracle_x8: ONE_X8 as u64, supplied: 1_000_000 * 100_000_000, borrowed: 500_000 * 100_000_000, rate_e12: 50_000_000_000, ..Default::default() });
+        s.reserves.insert(HYPE_TOKEN, crate::lend::Reserve { ltv_bps: 6_500, oracle_x8: 50 * ONE_X8 as u64, supplied: 0, borrowed: 0, rate_e12: 50_000_000_000, ..Default::default() });
         s.account(BOB).spot.insert(HYPE_TOKEN, Spot(10 * 100_000_000, 0, 0));
         s
     }
@@ -2571,27 +2660,68 @@ mod tests {
         assert!(run(&mut s, 13, BOB, send(32_500_000_100)).contains("below 1"));
         assert!(run(&mut s, 14, BOB, send(32_500_000_000)).starts_with("sent"));
         assert_eq!(s.health_factor_e12(BOB), Some(1_000_000_000_000));
-        // Liquidation value 500 x (0.5 + 0.325) = 412.5: 325 borrowed is 0.79 of it. HYPE to 40:
-        // 400 x 0.825 = 330, 325 / 330 = 0.985 > 0.95: liquidated on the next margin step.
+        // HYPE to 40: maintenance 20 + 325 = 345 against 400 x 0.825 = 330 of liquidation value.
         s.reserves.get_mut(&HYPE_TOKEN).unwrap().oracle_x8 = 40 * ONE_X8 as u64;
         let mut a = Applied::default();
         s.lend_liquidate(&mut a);
         assert_eq!(a.liquidated, vec![BOB]);
+        // Each step takes 2 HYPE (80 USD) to the backstop: after two steps 165 is borrowed,
+        // and 185 / (240 x 0.825 = 198) = 0.934 is healthy again.
         let l = s.accounts[&BOB].lend.clone();
-        assert_eq!(l[&0].borrow_value, 0);
-        // 325 USD of HYPE at 40 is 8.125 HYPE taken, 1.875 left.
-        assert_eq!(l[&HYPE_TOKEN].supply_value, 187_500_000);
-        // At 41 the ratio is 325 / 338.25 = 0.96, at 42 it is 0.938: 42 survives.
-        let mut s2 = lend();
-        run(&mut s2, 11, BOB, borrow_lend(0, HYPE_TOKEN, 0));
-        run(&mut s2, 12, BOB, encode_action(16, &[word_addr(BOB), word_u(3)].concat()));
-        run(&mut s2, 13, BOB, send(32_500_000_000));
-        s2.reserves.get_mut(&HYPE_TOKEN).unwrap().oracle_x8 = 42 * ONE_X8 as u64;
-        let mut a = Applied::default();
-        s2.lend_liquidate(&mut a);
-        assert!(a.liquidated.is_empty());
-        let info = s2.lend_info(&json!({ "type": "borrowLendUserState", "user": BOB.to_string() })).unwrap().unwrap();
-        assert_eq!(info["health"], "atRisk");
+        assert_eq!((l[&0].borrow_value, l[&HYPE_TOKEN].supply_value), (16_500_000_000, 600_000_000));
+        assert_eq!(s.accounts[&crate::lend::BACKSTOP].spot[&HYPE_TOKEN].0, 400_000_000);
+        assert!(s.accounts[&BOB].history.last().unwrap().1.contains("in 2 steps of 20%"));
+        assert!(!s.lend_liquidatable(BOB));
+    }
+
+    /// BOB supplies 10 HYPE and borrows 325 USDC as portfolio margin, with
+    /// HYPE's reserve price following spot pair 107 and perp 159.
+    fn lend_on_prices(perp: bool) -> State {
+        let mut s = lend();
+        s.perps.insert(159, Perp { name: "HYPE".into(), sz_decimals: 2, max_leverage: 10, mark_x8: 50 * ONE_X8 as u64, oracle_x8: 50 * ONE_X8 as u64, ..Default::default() });
+        let r = s.reserves.get_mut(&HYPE_TOKEN).unwrap();
+        (r.spot, r.spot_x8, r.perp) = (Some(107), 50 * ONE_X8 as u64, perp.then_some(159));
+        run(&mut s, 11, BOB, borrow_lend(0, HYPE_TOKEN, 0));
+        run(&mut s, 12, BOB, encode_action(16, &[word_addr(BOB), word_u(3)].concat()));
+        run(&mut s, 13, BOB, encode_action(6, &[word_addr(ALICE), word_u(0), word_u(32_500_000_000)].concat()));
+        s
+    }
+
+    #[test]
+    fn lend_health_at_the_threshold_after_a_price_move() {
+        // Maintenance 345 against 10 x px x 0.825: the ratio crosses 0.95 between 44.02 and 44.01.
+        let px = |v: u64| v * ONE_X8 as u64 / 100;
+        // The perp moves: the median of spot 50, mark and oracle is the perp's price.
+        let mut s = lend_on_prices(true);
+        let a = s.set_price(159, px(4402), 0);
+        assert!(a.liquidated.is_empty() && a.reserves);
+        assert_eq!(s.reserves[&HYPE_TOKEN].oracle_x8, px(4402));
+        let a = s.set_price(159, px(4401), 0);
+        assert_eq!(a.liquidated, vec![BOB]);
+        assert!(s.accounts[&BOB].lend[&HYPE_TOKEN].supply_value < 1_000_000_000);
+        // The spot pair moves a reserve with no perp the same way.
+        let mut s = lend_on_prices(false);
+        assert!(s.set_spot_price(107, px(4402), 0).liquidated.is_empty());
+        assert_eq!(s.set_spot_price(107, px(4401), 0).liquidated, vec![BOB]);
+        // The median of spot 60 and the perp's 50 and 50 is 50.
+        let mut s = lend_on_prices(true);
+        s.set_spot_price(107, px(6000), 0);
+        assert_eq!(s.reserves[&HYPE_TOKEN].oracle_x8, px(5000));
+    }
+
+    #[test]
+    fn linking_reserves_finds_the_spot_pair_and_the_perp() {
+        let mut s = lend();
+        s.tokens.insert(197, TokenMeta { name: "UBTC".into(), wei_decimals: 10, evm: None, sz_decimals: 5 });
+        s.reserves.insert(197, crate::lend::Reserve { ltv_bps: 5_000, oracle_x8: 77_000 * ONE_X8 as u64, ..Default::default() });
+        let spot = json!({ "universe": [{ "tokens": [150, 0], "index": 107 }, { "tokens": [197, 0], "index": 142 }, { "tokens": [197, 268], "index": 300 }] });
+        let meta = json!({ "universe": [{ "name": "BTC" }, { "name": "ETH" }, { "name": "HYPE" }] });
+        assert_eq!(s.link_reserves(&spot, &meta), vec![2, 0]);
+        let (h, b) = (&s.reserves[&HYPE_TOKEN], &s.reserves[&197]);
+        assert_eq!((h.spot, h.perp, b.spot, b.perp), (Some(107), Some(2), Some(142), Some(0)));
+        assert_eq!(b.spot_x8, 77_000 * ONE_X8 as u64);
+        // USDC is not collateral and keeps no links.
+        assert_eq!((s.reserves[&0].spot, s.reserves[&0].perp), (None, None));
     }
 
     #[test]
@@ -2640,5 +2770,43 @@ mod tests {
         let mut s = state();
         run(&mut s, 11, ALICE, limit_order(0, true, x8(90.0), x8(1.0), false, 2, u128::MAX));
         assert_eq!(State::from_bytes(&s.to_bytes()), Some(s));
+    }
+
+    #[test]
+    fn margin_tiers_pick_by_notional_and_keep_maintenance_continuous() {
+        let tables = json!([[50, { "marginTiers": [{ "lowerBound": "0.0", "maxLeverage": 50 }] }], [51, { "description": "tiered 10x", "marginTiers": [{ "lowerBound": "0.0", "maxLeverage": 10 }, { "lowerBound": "3000000.0", "maxLeverage": 5 }] }]]);
+        // A main-dex table: 10x up to 3M notional, 5x from there.
+        let tiers = tiers_from_meta(&json!({ "name": "HYPE", "maxLeverage": 10, "marginTableId": 51 }), &tables);
+        assert_eq!(tiers, vec![(0, 10), (3_000_000_000_000, 5)]);
+        let hype = Perp { name: "HYPE".into(), max_leverage: 10, tiers, ..Default::default() };
+        let m = |usd: u64| usd * 1_000_000;
+        assert_eq!((hype.max_leverage_at(m(2_999_999)), hype.max_leverage_at(m(3_000_000))), (10, 5));
+        // Just below the bound: notional / 20. At and above it: notional / 10 less a 150,000 deduction.
+        assert_eq!(hype.maintenance_at(m(2_000_000)), m(100_000));
+        assert_eq!(hype.maintenance_at(m(3_000_000)), m(150_000));
+        assert_eq!(hype.maintenance_at(m(4_000_000)), m(400_000 - 150_000));
+        // A HIP-3 id below 50 (and a one-tier table) is one tier at the perp's max leverage.
+        assert!(tiers_from_meta(&json!({ "name": "xyz:TSLA", "maxLeverage": 20, "marginTableId": 20 }), &tables).is_empty());
+        assert!(tiers_from_meta(&json!({ "name": "xyz:SP", "maxLeverage": 50, "marginTableId": 50 }), &tables).is_empty());
+        let tsla = Perp { name: "xyz:TSLA".into(), max_leverage: 20, ..Default::default() };
+        assert_eq!((tsla.max_leverage_at(m(50_000_000)), tsla.maintenance_at(m(40_000))), (20, m(1_000)));
+        // The meta snapshot keeps only the tiered entries.
+        let meta = Meta::from_info(&json!([{ "universe": [{ "name": "A", "maxLeverage": 3, "marginTableId": 3 }, { "name": "HYPE", "maxLeverage": 10, "marginTableId": 51 }], "marginTables": tables }, []]));
+        assert_eq!(meta.tiers.keys().copied().collect::<Vec<_>>(), vec![1]);
+    }
+
+    #[test]
+    fn a_big_position_liquidates_on_its_tier_maintenance() {
+        // 4M of HYPE on table 51 at 10x: maintenance is 250,000, not the one-tier 200,000.
+        let mut s = State::new();
+        s.perps.insert(159, Perp { name: "HYPE".into(), sz_decimals: 2, max_leverage: 10, mark_x8: 40 * ONE_X8 as u64, tiers: vec![(0, 10), (3_000_000_000_000, 5)], ..Default::default() });
+        let sz = 100_000 * ONE_X8 as i64;
+        let entry = 4_000_000_000_000u64;
+        s.accounts.entry(ALICE).or_default().positions.insert(159, Pos { szi_x8: sz, entry_ntl: entry, leverage: 5, ..Default::default() });
+        assert_eq!(s.maintenance(ALICE), 250_000_000_000);
+        // Account value 240,000: below the tier's maintenance, above the one-tier figure.
+        s.accounts.get_mut(&ALICE).unwrap().usd = 240_000_000_000;
+        let applied = s.set_price(159, 40 * ONE_X8 as u64, 0);
+        assert_eq!(applied.liquidated, vec![ALICE]);
     }
 }

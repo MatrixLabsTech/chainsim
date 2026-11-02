@@ -227,7 +227,14 @@ enum SetWhat {
 #[derive(Subcommand)]
 enum HyperCoreWhat {
     /// A perp's mark price (0x806) and oracle price (0x807), in the precompile's raw units.
-    Price { perp: u32, px: u64 },
+    /// With --spot, a spot pair's price (0x808), which also moves the collateral it prices.
+    Price {
+        /// The perp (dex x 10000 + index for HIP-3), or the spot pair with --spot.
+        perp: u32,
+        px: u64,
+        #[arg(long)]
+        spot: bool,
+    },
     /// A user's spot balance on HyperCore (0x801), in the token's raw units.
     SpotBalance {
         user: String,
@@ -286,7 +293,8 @@ async fn set_hypercore(name: &str, what: HyperCoreWhat) -> Result<Value> {
         return Err(Error::unsupported(&format!("set hypercore on {}", profile.key), "only HyperEVM has HyperCore"));
     }
     let op = match what {
-        HyperCoreWhat::Price { perp, px } => CoreOp::Price { perp, px },
+        HyperCoreWhat::Price { perp, px, spot: false } => CoreOp::Price { perp, px },
+        HyperCoreWhat::Price { perp, px, spot: true } => CoreOp::SpotPrice { pair: perp, px },
         HyperCoreWhat::SpotBalance { user, token, total, hold, entry_ntl } => CoreOp::SpotBalance { user, token, total, hold, entry_ntl },
         HyperCoreWhat::Position { user, perp, szi, entry_ntl, leverage, isolated_raw_usd, isolated } => CoreOp::Position { user, perp, szi, entry_ntl, leverage, isolated_raw_usd, isolated },
         HyperCoreWhat::Book { coin, live: _ } => CoreOp::Book { coin },

@@ -33,6 +33,7 @@ const BATCH: usize = 150;
 #[derive(Debug, Clone)]
 pub enum CoreOp {
     Price { perp: u32, px: u64 },
+    SpotPrice { pair: u32, px: u64 },
     SpotBalance { user: String, token: u64, total: u64, hold: u64, entry_ntl: u64 },
     Position { user: String, perp: u16, szi: i64, entry_ntl: u64, leverage: u32, isolated_raw_usd: i64, isolated: bool },
     Book { coin: String },
@@ -160,13 +161,21 @@ impl EvmAdapter {
             let start = now_secs().saturating_sub(3 * hc::FUNDING_INTERVAL) * 1000;
             let history = eng.info(json!({ "type": "fundingHistory", "coin": name, "startTime": start }), &mut calls).await?;
             let funding = history.as_array().and_then(|h| h.last()).and_then(|f| f["fundingRate"].as_str()).and_then(|r| hc::parse_dec(r, 12)).unwrap_or(0) as i64;
-            state.perps.insert(p, hc::Perp { name, sz_decimals: d, max_leverage: u["maxLeverage"].as_u64().unwrap_or(1) as u32, mark_x8: mark, oracle_x8: oracle, funding_e12: funding, ..Default::default() });
+            let tiers = hc::tiers_from_meta(u, &meta[0]["marginTables"]);
+            state.perps.insert(p, hc::Perp { name, sz_decimals: d, max_leverage: u["maxLeverage"].as_u64().unwrap_or(1) as u32, mark_x8: mark, oracle_x8: oracle, funding_e12: funding, tiers, ..Default::default() });
         }
         // Borrow and lend reserves, with their tokens' decimals.
         let reserves = eng.info(json!({ "type": "allBorrowLendReserveStates" }), &mut calls).await?;
         let reserve_tokens: Vec<u64> = reserves.as_array().map_or(vec![], |r| r.iter().filter_map(|p| p[0].as_u64()).collect());
         add_tokens(&mut state, &spot, settings.tokens.iter().map(|t| *t as u64).chain(reserve_tokens));
         state.reserves_from_info(&reserves);
+        // Collateral prices follow their spot pair and the perp on the same asset.
+        for p in state.link_reserves(&spot, &meta[0]) {
+            if let (false, Some(u)) = (state.perps.contains_key(&p), universe.get(p as usize)) {
+                state.perps.insert(p, perp_from_ctx(u, &meta[1][p as usize], &meta[0]["marginTables"]));
+            }
+        }
+        state.reprice_reserves();
         let mut books = Vec::new();
         for &p in &settings.perps {
             let coin = state.perps[&p].name.clone();
@@ -248,6 +257,25 @@ impl EvmAdapter {
                 Ok((
                     json!({ "kind": "hypercore", "helper": "price", "perp": perp, "px": px, "filled": applied.fills, "liquidated": liquidated, "sets": sets }),
                     json!({ "kind": "set-hypercore", "helper": "price", "perp": perp, "px": px }),
+                ))
+            }
+            CoreOp::SpotPrice { pair, px } => {
+                let entry = hypercore::spot_price(pair, px);
+                let (_, time) = eng.latest_block().await?;
+                // Spot raw prices carry 8 minus the base token's szDecimals decimals.
+                let base = state.reserves.iter().find(|(_, r)| r.spot == Some(pair)).map(|(t, _)| *t);
+                let applied = match base.and_then(|t| state.tokens.get(&t)) {
+                    Some(t) => state.set_spot_price(pair, px.saturating_mul(10u64.pow(t.sz_decimals.min(8) as u32)), time),
+                    None => hc::Applied::default(),
+                };
+                let mut answers = state.answers_for(&applied);
+                answers.push(entry.clone());
+                coresync::store(eng, &state, &answers).await?;
+                let liquidated: Vec<String> = applied.liquidated.iter().map(|a| a.to_string()).collect();
+                let collateral: Vec<Value> = state.reserves.iter().filter(|(_, r)| r.spot == Some(pair)).map(|(t, r)| json!({ "token": t, "oraclePx": hc::fmt_dec(r.oracle_x8 as i128, 8) })).collect();
+                Ok((
+                    json!({ "kind": "hypercore", "helper": "price", "spot": pair, "px": px, "collateral": collateral, "liquidated": liquidated, "sets": sets_json(&[entry]) }),
+                    json!({ "kind": "set-hypercore", "helper": "price", "spot": pair, "px": px }),
                 ))
             }
             CoreOp::Funding { perp, rate } => {
@@ -394,7 +422,7 @@ impl EvmAdapter {
             let u = universe.get(a as usize).ok_or_else(|| Error::new(ErrorCode::Usage, format!("no perp {a} on Hyperliquid")))?;
             let ctx = &meta[1][a as usize];
             let d = u["szDecimals"].as_u64().unwrap_or(0) as u8;
-            state.perps.insert(a, perp_from_ctx(u, ctx));
+            state.perps.insert(a, perp_from_ctx(u, ctx, &meta[0]["marginTables"]));
             if let (Some(m), Some(o)) = (ctx["markPx"].as_str().and_then(|s| raw_px(s, d)), ctx["oraclePx"].as_str().and_then(|s| raw_px(s, d))) {
                 entries.push(Entry { precompile: hypercore::MARK_PX, calldata: hypercore::word_u(a as u128).to_vec(), result: hypercore::word_u(m as u128).to_vec() });
                 entries.push(Entry { precompile: hypercore::ORACLE_PX, calldata: hypercore::word_u(a as u128).to_vec(), result: hypercore::word_u(o as u128).to_vec() });
@@ -422,7 +450,7 @@ impl EvmAdapter {
             for a in assets {
                 let (u, ctx) = (&universe[a as usize], &meta[1][a as usize]);
                 let d = u["szDecimals"].as_u64().unwrap_or(0) as u8;
-                state.perps.insert(a, perp_from_ctx(u, ctx));
+                state.perps.insert(a, perp_from_ctx(u, ctx, &meta[0]["marginTables"]));
                 if let (Some(m), Some(o)) = (ctx["markPx"].as_str().and_then(|s| raw_px(s, d)), ctx["oraclePx"].as_str().and_then(|s| raw_px(s, d))) {
                     entries.push(Entry { precompile: hypercore::MARK_PX, calldata: hypercore::word_u(a as u128).to_vec(), result: hypercore::word_u(m as u128).to_vec() });
                     entries.push(Entry { precompile: hypercore::ORACLE_PX, calldata: hypercore::word_u(a as u128).to_vec(), result: hypercore::word_u(o as u128).to_vec() });
@@ -562,7 +590,7 @@ impl EvmAdapter {
                 let meta = eng.info(json!({ "type": "metaAndAssetCtxs" }), &mut calls).await?;
                 let universe = meta[0]["universe"].as_array().cloned().unwrap_or_default();
                 let i = universe.iter().position(|u| u["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(coin))).ok_or_else(|| Error::new(ErrorCode::Usage, format!("no perp {coin} on Hyperliquid")))? as u32;
-                state.perps.insert(i, perp_from_ctx(&universe[i as usize], &meta[1][i as usize]));
+                state.perps.insert(i, perp_from_ctx(&universe[i as usize], &meta[1][i as usize], &meta[0]["marginTables"]));
                 i
             }
         };
@@ -630,7 +658,7 @@ fn insert_perp(state: &mut State, perp: u32, raw: &Value, local: usize) -> Optio
     let u = raw[0]["universe"].as_array()?.get(local)?.clone();
     let ctx = raw[1].as_array()?.get(local)?.clone();
     let d = u["szDecimals"].as_u64().unwrap_or(0) as u8;
-    let mut p = perp_from_ctx(&u, &ctx);
+    let mut p = perp_from_ctx(&u, &ctx, &raw[0]["marginTables"]);
     p.collateral = raw[0]["collateralToken"].as_u64().unwrap_or(0);
     state.perps.insert(perp, p);
     let mut entries = Vec::new();
@@ -643,7 +671,7 @@ fn insert_perp(state: &mut State, perp: u32, raw: &Value, local: usize) -> Optio
 
 /// A perp from the info API's meta and asset context: the current mark,
 /// oracle and funding rate.
-fn perp_from_ctx(u: &Value, ctx: &Value) -> hc::Perp {
+fn perp_from_ctx(u: &Value, ctx: &Value, tables: &Value) -> hc::Perp {
     let px = |k: &str| ctx[k].as_str().and_then(|s| hc::parse_dec(s, 8)).unwrap_or(0) as u64;
     hc::Perp {
         name: u["name"].as_str().unwrap_or_default().to_string(),
@@ -655,6 +683,8 @@ fn perp_from_ctx(u: &Value, ctx: &Value) -> hc::Perp {
         // HIP-3 perps marked onlyIsolated or strictIsolated hold isolated margin.
         isolated_only: u["onlyIsolated"] == json!(true) || u["marginMode"].as_str().is_some_and(|m| m.contains("solated")),
         collateral: 0,
+        tiers: hc::tiers_from_meta(u, tables),
+        hip3_funding: None,
     }
 }
 

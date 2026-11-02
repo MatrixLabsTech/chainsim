@@ -225,6 +225,12 @@ pub fn price(perp: u32, px: u64) -> Vec<Entry> {
     [MARK_PX, ORACLE_PX].into_iter().map(|precompile| Entry { precompile, calldata: calldata.clone(), result: result.clone() }).collect()
 }
 
+/// `set hypercore price <pair> <px> --spot`: a spot pair's price (0x808), in
+/// the precompile's raw units.
+pub fn spot_price(pair: u32, px: u64) -> Entry {
+    Entry { precompile: SPOT_PX, calldata: word_u(pair as u128).to_vec(), result: word_u(px as u128).to_vec() }
+}
+
 /// `set hypercore spot-balance <user> <token> <total>`: SpotBalance(total,
 /// hold, entryNtl) at 0x801, in the token's raw units on HyperCore.
 pub fn spot_balance(user: Address, token: u64, total: u64, hold: u64, entry_ntl: u64) -> Entry {
