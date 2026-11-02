@@ -48,8 +48,9 @@ on every supported chain.
 
 ## Features
 
-- One command set for Ethereum, Arc, Robinhood Chain, HyperEVM, Sui and Aptos mainnet forks,
-  each running in Docker, with the same JSON envelope and exit codes on every chain.
+- One command set for Ethereum, Arc, Robinhood Chain, HyperEVM, Sui and Aptos mainnet forks
+  and HyperEVM testnet, each running in Docker, with the same JSON envelope and exit codes on
+  every chain.
 - `send --as` sends as any account without its key on every chain, including a protocol's
   admin. On Sui and Aptos, chainsim handles the Move authentication for you.
 - `fund` gives a test wallet native and token balances by symbol and reads them back, with no
@@ -66,7 +67,8 @@ on every supported chain.
   chainsim's patch that lets `set object` change any Move object's fields.
 - HyperEVM runs with a local HyperCore: limit orders fill against the mainnet order book,
   balances bridge both ways, any mainnet account can be mirrored onto the copy, and a test can move
-  prices, replay a past day and watch fills, funding and liquidations follow.
+  prices, replay a past day and watch fills, funding and liquidations follow. HIP-3 perps and
+  borrow and lend run on it too, and an RPC proxy applies it for any client and serves `/info`.
 - JSON output, fixed exit codes and `error.next`, so an agent can branch on every result.
 - One-line install from GitHub releases for Linux and macOS, and `chainsim doctor` to check the
   setup: Docker, engines, plugin and upstreams.
