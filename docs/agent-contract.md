@@ -11,7 +11,11 @@ error codes from the binary.
   tokens, limits and error codes.
 - Run: `up <chain>`, `ls`, `status <name>`, `down <name> | --all`.
 - Use: `fund`, `snapshot`, `revert`, `call`, `send`, `set`, `time`, `mine`, `selftest`. `set`
-  takes a kind: `balance`, `token`, `storage`, `code`, `owner`, `object` or `resource`.
+  takes a kind: `balance`, `token`, `storage`, `code`, `owner`, `object`, `resource`,
+  `precompile` or `hypercore`. On HyperEVM, `set precompile <address> <calldata> (--result <hex>
+  | --live)` stores a HyperCore read precompile's answer, `set hypercore price|spot-balance|position`
+  encodes the common ones, and `call <name> corewriter_actions [{"fromBlock": <n>}]` returns every
+  CoreWriter action decoded.
   `chainsim describe <chain>` and the chain pages say which kinds and commands each chain
   supports, and the rest exit 3.
 - Engines: `pull [<engine>]`, `engines`, `prune`.
@@ -33,7 +37,7 @@ error codes from the binary.
   - 4 not found (`fork_not_found`, `unknown_chain`, `unknown_token`, `snapshot_not_found`)
   - 5 upstream failure (`upstream_unavailable`, `rate_limited`)
   - 6 selftest failed
-  - 7 refused for safety (`mainnet_address`)
+  - 7 refused for safety (`mainnet_address`, `latest_state_only`)
   - 8 conflict (`name_conflict`)
 - Repeating a command is safe: `up` returns a running fork of the same name and chain as is,
   `down` on a missing fork exits 0, and `fund` sets balances to the asked amounts and reads
@@ -42,3 +46,9 @@ error codes from the binary.
   differs from the real chain, to copy into a report word for word.
 - The `fork` object's `rpcUrl` is the engine's in-network RPC URL, or `null` when the engine
   serves no RPC (Aptos). `forkPoint.kind` is `block`, `checkpoint` (Sui) or `version` (Aptos).
+- On HyperEVM, the `fork` object carries a `hypercore` field: the HyperCore answers `up` seeded,
+  and in `status`, `coreWriterActions`, the count of captured CoreWriter actions. Other chains'
+  fork objects have no such field.
+- `latest_state_only` (exit 7) means `up --block` was refused because the default upstream
+  answers state reads at its latest block only. `error.next` names the variable that takes an
+  archive provider URL.

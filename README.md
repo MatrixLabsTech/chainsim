@@ -22,15 +22,17 @@ on every supported chain.
   <a href="chains/sui/README.md"><img src="assets/chains/sui.svg" height="48" alt="Sui"></a>
   &nbsp;&nbsp;&nbsp;
   <a href="chains/aptos/README.md"><img src="assets/chains/aptos.svg" height="48" alt="Aptos"></a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="chains/hyperliquid/README.md"><img src="assets/chains/hyperliquid.svg" height="48" alt="Hyperliquid"></a>
 </p>
 
 ## What it solves
 
-- Every chain family forks with a different engine: anvil for Ethereum and Arbitrum chains,
-  Circle's arc-foundry tarballs for Arc, Mysten's gRPC-only `sui-fork` for Sui, the Aptos CLI's
-  simulation sessions for Aptos. Each has its own
-  flags, readiness signal and funding method. chainsim pins each engine, pulls or builds it on
-  first use, and puts all of them behind the same commands.
+- Every chain family forks with a different engine: anvil for Ethereum, Arbitrum chains and
+  HyperEVM, Circle's arc-foundry tarballs for Arc, Mysten's gRPC-only `sui-fork` for Sui, the
+  Aptos CLI's simulation sessions for Aptos. Each has its own flags, readiness signal and funding
+  method. chainsim pins each engine, pulls or builds it on first use, and puts all of them
+  behind the same commands.
 - Testing admin-only paths of a deployed protocol normally needs keys nobody on the test team
   holds. `send --as` sends as the admin on the fork, and `set` changes state directly.
 - Funding a test wallet with real tokens on a fork means finding each token's balance slot or
@@ -46,18 +48,20 @@ on every supported chain.
 
 ## Features
 
-- One command set for Ethereum, Arc, Robinhood Chain, Sui and Aptos mainnet forks, each running
-  in Docker, with the same JSON envelope and exit codes on every chain.
+- One command set for Ethereum, Arc, Robinhood Chain, HyperEVM, Sui and Aptos mainnet forks,
+  each running in Docker, with the same JSON envelope and exit codes on every chain.
 - `send --as` sends as any account without its key on every chain, including a protocol's
   admin. On Sui and Aptos, chainsim handles the Move authentication for you.
 - `fund` gives a test wallet native and token balances by symbol and reads them back, with no
   balance slots, coin objects or fungible stores to look up.
 - `snapshot` and `revert` reset a fork between scenarios on every chain, Sui and Aptos included.
 - `set` overrides state directly: balance, token, storage, code and owner, a Sui object's
-  fields, or an Aptos resource.
+  fields, an Aptos resource, or a HyperCore precompile answer.
 - `selftest` proves a fork is fit before a test spends anything on it.
 - Arc runs on Circle's own engine, so native USDC behaves as on Arc.
 - Robinhood Chain answers Arbitrum's ArbSys and ArbGasInfo precompiles.
+- HyperEVM contracts that read HyperCore run, on answers seeded from mainnet, and every
+  CoreWriter action is captured and decoded.
 - JSON output, fixed exit codes and `error.next`, so an agent can branch on every result.
 - One-line install from GitHub releases for Linux and macOS, and `chainsim doctor` to check the
   setup: Docker, engines, plugin and upstreams.
@@ -140,6 +144,7 @@ The full contract, with every error code, is in [docs/agent-contract.md](docs/ag
 | <img src="assets/chains/robinhood-chain.png" height="32" alt="Robinhood Chain"> &nbsp;**Robinhood Chain mainnet** | Foundry anvil v1.8.5 with an ArbGasInfo mock | [chains/robinhood](chains/robinhood/README.md) |
 | <img src="assets/chains/sui.svg" height="32" alt="Sui"> &nbsp;**Sui mainnet** | Mysten sui-fork mainnet-v1.81.1, built with chainsim's SetObject patch | [chains/sui](chains/sui/README.md) |
 | <img src="assets/chains/aptos.svg" height="32" alt="Aptos"> &nbsp;**Aptos mainnet** | Aptos CLI 9.6.0 simulation sessions | [chains/aptos](chains/aptos/README.md) |
+| <img src="assets/chains/hyperliquid.svg" height="32" alt="Hyperliquid"> &nbsp;**HyperEVM mainnet** | Foundry anvil v1.8.5 with HyperCore precompile mocks | [chains/hyperliquid](chains/hyperliquid/README.md) |
 
 The chain logos are trademarks of their owners and identify the chains only.
 
@@ -168,6 +173,33 @@ chainsim send aptos-mainnet --as <any address> \
 ```
 
 [chains/aptos](chains/aptos/README.md) covers every command on Aptos.
+
+## Hyperliquid
+
+chainsim forks HyperEVM Mainnet, the EVM side of Hyperliquid, in one command, and makes
+contracts that read HyperCore run on it. HyperCore's prices, balances and positions reach
+HyperEVM contracts through read precompiles at `0x800` to `0x813`, which a plain fork leaves
+empty. chainsim answers them from a mock seeded with mainnet values, with the same JSON contract
+and exit codes as every other chain.
+
+- `up` seeds the L1 block number, mark and oracle prices and asset info for the BTC, ETH, SOL
+  and HYPE perps, token info for USDC and HYPE, and the HYPE/USDC spot price from mainnet.
+- `set hypercore price`, `spot-balance` and `position` change what a contract reads, and `set
+  precompile` stores any other answer or copies it from mainnet with `--live`.
+- `call corewriter_actions` decodes every action a contract sends through CoreWriter, such as a
+  limit order or a spot send.
+- `fund` gives a test wallet HYPE, USDC, USD₮0, WHYPE, UBTC and UETH, and `send --as` sends as
+  any account.
+- `snapshot` and `revert` reset the fork, HyperCore answers included.
+
+```sh
+chainsim up hyperevm-mainnet
+chainsim fund hyperevm-mainnet <test address> --native 10 --token USDC:1000
+chainsim set hyperevm-mainnet hypercore price 0 650000
+chainsim call hyperevm-mainnet corewriter_actions
+```
+
+[chains/hyperliquid](chains/hyperliquid/README.md) covers every command on HyperEVM.
 
 ## Claude Code and Codex plugin
 

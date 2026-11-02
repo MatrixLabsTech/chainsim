@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn the_embedded_plugin_is_one_skill_named_chainsim() {
         let skill = FILES.iter().find(|(p, _)| p.ends_with("SKILL.md")).unwrap().1;
-        assert!(skill.starts_with("---\nname: chainsim\ndescription: Local mainnet forks of Ethereum, Arc, Robinhood Chain, Sui and Aptos."));
+        assert!(skill.starts_with("---\nname: chainsim\ndescription: Local mainnet forks of Ethereum, Arc, Robinhood Chain, HyperEVM, Sui and Aptos."));
         for word in ["chainsim doctor", "install.sh | sh", "docker_unavailable", "upstream.env", "chainsim describe", "chainsim up", "chainsim selftest", "chainsim fund", "chainsim snapshot", "chainsim revert", "chainsim down", "chainsim send", "--as", "chainsim set", "modifications", "error.next", "`fork`"] {
             assert!(skill.contains(word), "{word}");
         }

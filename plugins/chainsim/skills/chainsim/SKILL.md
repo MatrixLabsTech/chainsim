@@ -1,6 +1,6 @@
 ---
 name: chainsim
-description: Local mainnet forks of Ethereum, Arc, Robinhood Chain, Sui and Aptos. Use when work needs a chain fork, a funded test wallet on mainnet state, or time and state control on a local chain.
+description: Local mainnet forks of Ethereum, Arc, Robinhood Chain, HyperEVM, Sui and Aptos. Use when work needs a chain fork, a funded test wallet on mainnet state, or time and state control on a local chain.
 ---
 
 # chainsim
@@ -38,7 +38,10 @@ Work through these steps in order. Each ends on a check you can make.
    --to <target> [<arg>...]` with the role holder's address: no key is needed. The target is a
    contract with `--sig "<fn(types)>"` on EVM, `package::module::function<T...>` on Sui, or
    `address::module::function<T...>` with `<type>:<value>` arguments on Aptos. To change state
-   directly, run `chainsim set <name> balance|token|owner|object|resource|storage|code ...`.
+   directly, run `chainsim set <name> balance|token|owner|object|resource|storage|code ...`. On
+   HyperEVM, `set <name> hypercore price|spot-balance|position ...` and `set <name> precompile`
+   set what contracts read from HyperCore, and `call <name> corewriter_actions` lists the
+   CoreWriter actions they sent, decoded.
    `chainsim describe <chain>` lists what each chain supports. Done when the receipt `status` is
    1 (`success` on Aptos) or the read-back matches what you set.
 7. **Do the work.** Before each scenario run `chainsim snapshot <name>`, and after it
@@ -54,7 +57,8 @@ Work through these steps in order. Each ends on a check you can make.
 `fork` is what `up` returns and every later step reads. Its `rpcUrl` is in-network: containers on
 `fork.network` reach it, the host does not. From the host, use `chainsim call <name> <method>
 [<params-json>]`, or start the fork with `--publish` and use `fork.hostRpcUrl`. On Aptos,
-`rpcUrl` is `null`: read the fork with `chainsim call <name> view|resource|ledger`.
+`rpcUrl` is `null`: read the fork with `chainsim call <name> view|resource|ledger`. On HyperEVM,
+`fork.hypercore` lists the HyperCore answers seeded at `up`.
 
 Copy `fork.limits` into the report word for word: they are how the fork differs from the real
 chain. `fork.upstream` shows where it reads mainnet state and which variable takes a provider URL.
