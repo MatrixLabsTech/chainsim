@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use tokio::sync::Notify;
+
 /// How long a lease lasts when its holder never gives it back.
 pub const TTL: Duration = Duration::from_secs(120);
 
@@ -19,6 +21,10 @@ struct Lease {
 pub struct Leases {
     inner: Mutex<Option<Lease>>,
     counter: AtomicU64,
+    /// Wakes waiters the moment a lease is given back, so a command that
+    /// takes the lease again right away (a replay, candle by candle) does
+    /// not keep them out.
+    released: Notify,
 }
 
 impl Leases {
@@ -45,6 +51,7 @@ impl Leases {
         let mut l = self.inner.lock().expect("lease lock");
         if l.as_ref().is_some_and(|l| l.token == token) {
             *l = None;
+            self.released.notify_waiters();
             return true;
         }
         false
@@ -63,8 +70,14 @@ impl Leases {
     /// Waits while someone else holds the lease, at most until it expires.
     pub async fn wait(&self, peer: IpAddr) {
         let until = Instant::now() + TTL;
-        while self.active().is_some_and(|(_, holder)| holder != peer) && Instant::now() < until {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        loop {
+            // Registered before the check, so a give_back in between still wakes it.
+            let released = self.released.notified();
+            if self.active().is_none_or(|(_, holder)| holder == peer) || Instant::now() >= until {
+                return;
+            }
+            // The poll covers a lease that expires instead of being given back.
+            let _ = tokio::time::timeout(Duration::from_millis(20), released).await;
         }
     }
 
@@ -101,5 +114,25 @@ mod tests {
         l.expire_now();
         assert!(!l.holds(other));
         assert!(l.try_take(cli).is_some());
+    }
+
+    /// With the clock paused, a waiter that only polled would wake 20 ms
+    /// later. One woken by the give_back wakes at the same instant.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_wakes_the_moment_the_lease_is_given_back() {
+        let (cli, other): (IpAddr, IpAddr) = ("10.0.0.2".parse().unwrap(), "10.0.0.3".parse().unwrap());
+        let l = std::sync::Arc::new(Leases::default());
+        let token = l.try_take(cli).unwrap();
+        let waiter = tokio::spawn({
+            let l = l.clone();
+            async move {
+                l.wait(other).await;
+                tokio::time::Instant::now()
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let given = tokio::time::Instant::now();
+        assert!(l.give_back(&token));
+        assert_eq!(waiter.await.unwrap(), given);
     }
 }
