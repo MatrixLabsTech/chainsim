@@ -102,8 +102,7 @@ chainsim down ethereum-mainnet
 
 `up` prints the `fork` object with the in-network `rpcUrl` and the chain's `limits`. A fork is
 reachable from containers on its Docker network. From the host, use `chainsim call`, or start
-the fork with `--publish`. An Aptos fork serves no RPC, so its `rpcUrl` is `null` and it is
-used through `chainsim call`, `send`, `fund` and `set`.
+the fork with `--publish`.
 
 ## Built for agents
 
@@ -140,12 +139,35 @@ The full contract, with every error code, is in [docs/agent-contract.md](docs/ag
 | <img src="assets/chains/arc.svg" height="32" alt="Arc"> &nbsp;**Arc mainnet** | stable | Circle arc-foundry v0.8.0-2 | [chains/arc](chains/arc/README.md) |
 | <img src="assets/chains/robinhood-chain.png" height="32" alt="Robinhood Chain"> &nbsp;**Robinhood Chain mainnet** | stable | Foundry anvil v1.8.5 with an ArbGasInfo mock | [chains/robinhood](chains/robinhood/README.md) |
 | <img src="assets/chains/sui.svg" height="32" alt="Sui"> &nbsp;**Sui mainnet** | experimental | Mysten sui-fork mainnet-v1.81.1, built with chainsim's SetObject patch | [chains/sui](chains/sui/README.md) |
-| **Aptos mainnet** | experimental | Aptos CLI 9.6.0 simulation sessions, no RPC | [chains/aptos](chains/aptos/README.md) |
+| **Aptos mainnet** | experimental | Aptos CLI 9.6.0 simulation sessions | [chains/aptos](chains/aptos/README.md) |
 
 The chain logos are trademarks of their owners and identify the chains only.
 
 Each chain page says what is specific to it: engine, tokens, funding, `send` and `set` support,
 selftest checks and limits. `chainsim describe` prints the same list from the binary.
+
+## Aptos
+
+chainsim forks Aptos Mainnet in one command. The Aptos CLI runs transactions on forked mainnet
+state in simulation sessions, and chainsim adds the fork lifecycle around them, with the same
+JSON contract and exit codes as Ethereum, Arc, Robinhood Chain and Sui.
+
+- `send --as` runs an entry function as any account, without its key.
+- `fund` gives a test wallet APT and Circle's native USDC in one command and reads both back.
+- `set resource` replaces any Move resource under an account, for state no transaction can reach.
+- `snapshot` and `revert` reset the fork between scenarios, and `time` and `mine` move its clock.
+- `selftest` checks the fork before a test relies on it.
+
+```sh
+export CHAINSIM_APTOS_API_KEY=<your Aptos Labs API key>
+chainsim up aptos-mainnet
+chainsim fund aptos-mainnet <test address> --native 10 --token USDC:1000
+chainsim send aptos-mainnet --as <any address> \
+  --to '0x1::primary_fungible_store::transfer<0x1::fungible_asset::Metadata>' \
+  address:0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b address:<receiver> u64:1000000
+```
+
+[chains/aptos](chains/aptos/README.md) covers every command on Aptos.
 
 ## Claude Code and Codex plugin
 
