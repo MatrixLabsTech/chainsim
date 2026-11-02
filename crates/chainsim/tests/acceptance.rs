@@ -838,6 +838,8 @@ fn hyperevm_hip3_and_borrow_lend() {
     let fork = ok(&["up", "hyperevm-mainnet", "--name", name]);
     println!("up: {:.1} s, {} info calls, {} reserves", t.elapsed().as_secs_f64(), fork["hypercore"]["core"]["infoCalls"], fork["hypercore"]["core"]["reserves"]);
     let (network, rpc) = (fork["network"].as_str().unwrap().to_string(), fork["rpcUrl"].as_str().unwrap().to_string());
+    // /info before any builder dex is added, so the proxy has cached the snapshot without xyz.
+    assert!(info(&network, &rpc, json!({ "type": "meta" }))["universe"].as_array().unwrap().len() > 100);
 
     // HIP-3: 1000 USD on perp, 600 of it sent to the xyz dex (1) with sendAsset.
     ok(&["set", name, "balance", ADDR_A, "10"]);
