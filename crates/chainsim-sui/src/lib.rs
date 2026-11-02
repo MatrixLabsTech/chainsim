@@ -1072,7 +1072,7 @@ impl Adapter for SuiAdapter {
     }
 }
 
-/// The vendored ForkingService proto (mainnet-v1.81.1), for the drift test.
+/// The vendored ForkingService proto (mainnet-v1.82.3), for the drift test.
 pub const FORKING_PROTO: &str = include_str!("../proto/sui/forking/v1alpha/forking_service.proto");
 
 #[cfg(test)]
@@ -1102,7 +1102,7 @@ mod tests {
     #[test]
     fn vendored_proto_lists_four_rpcs() {
         assert_eq!(grpc::rpc_names(FORKING_PROTO), vec!["AdvanceCheckpoint", "AdvanceClock", "GetStatus", "SetObject"]);
-        assert!(FORKING_PROTO.contains("SPDX-License-Identifier: Apache-2.0") && FORKING_PROTO.contains("tag mainnet-v1.81.1"));
+        assert!(FORKING_PROTO.contains("SPDX-License-Identifier: Apache-2.0") && FORKING_PROTO.contains("tag mainnet-v1.82.3"));
     }
 
     #[test]

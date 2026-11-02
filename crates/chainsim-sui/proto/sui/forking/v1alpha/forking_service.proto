@@ -1,8 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Vendored by chainsim from github.com/MatrixLabsTech/sui, branch chainsim/mainnet-v1.81.1
-// (commit 485d5ec0a773, Mysten's tag mainnet-v1.81.1 plus SetObject), path
+// Vendored by chainsim from github.com/MatrixLabsTech/sui, branch chainsim/mainnet-v1.82.3
+// (commit de683df9e4e0, Mysten's tag mainnet-v1.82.3 plus SetObject), path
 // crates/sui-fork/proto/sui/forking/v1alpha/forking_service.proto, unchanged
 // below this comment. The acceptance run checks its RPCs against the live fork.
 
