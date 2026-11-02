@@ -64,11 +64,13 @@ on every supported chain.
 - Arc runs on Circle's own engine, so native USDC behaves as on Arc.
 - Robinhood Chain answers Arbitrum's ArbSys and ArbGasInfo precompiles.
 - Sui runs on Mysten's sui-fork mainnet-v1.82.3, which serves Sui Mainnet's protocol 139, with
-  chainsim's patch that lets `set object` change any Move object's fields.
+  chainsim's patch that lets `set object` change any Move object's fields. `fund` gives SUI or USDC
+  in a few seconds, and `selftest` checks that the funder and the USDC holder can still pay.
 - HyperEVM runs with a local HyperCore: limit orders fill against the mainnet order book,
   balances bridge both ways, any mainnet account can be mirrored onto the copy, and a test can move
-  prices, replay a past day and watch fills, funding and liquidations follow. HIP-3 perps and
-  borrow and lend run on it too, and an RPC proxy applies it for any client and serves `/info`.
+  prices, replay a past day and watch fills, funding and liquidations follow, with mainnet's margin
+  tiers. HIP-3 perps with isolated margin and borrow and lend run on it too, and an RPC proxy
+  applies it for any HTTP or WebSocket client and serves `/info`.
 - JSON output, fixed exit codes and `error.next`, so an agent can branch on every result.
 - One-line install from GitHub releases for Linux and macOS, and `chainsim doctor` to check the
   setup: Docker, engines, plugin and upstreams.
