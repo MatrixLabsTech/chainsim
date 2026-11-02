@@ -36,6 +36,14 @@ pub trait CoreRpc: Send + Sync {
     async fn batch(&self, calls: &[(&str, Value)]) -> Result<Vec<Value>>;
 }
 
+/// The HyperCore lock in the fork's proxy, held while a command changes Core state.
+#[async_trait]
+pub trait CoreLease: Send + Sync {
+    /// Waits for the lock and returns its token.
+    async fn lock(&self) -> Result<String>;
+    async fn unlock(&self, token: &str);
+}
+
 fn blob(body: Vec<u8>, what: &str) -> Result<String> {
     let mut b = MARKER.to_vec();
     b.extend(body);
@@ -146,6 +154,47 @@ pub async fn sync_locked(rpc: &dyn CoreRpc) -> Result<Option<State>> {
     Ok(Some(state))
 }
 
+/// What one replayed candle did.
+#[derive(Debug, Clone, Default)]
+pub struct Candle {
+    /// The block that carries the candle.
+    pub height: u64,
+    pub fills: usize,
+    pub liquidated: Vec<Address>,
+}
+
+/// One candle of `time --replay`, under a lease of its own, so other
+/// clients wait at most one candle. Core first catches up with every block
+/// since the last step, transactions other clients sent between candles
+/// included. Then one block is mined an hour after the latest, its events
+/// applied, funding paid and the mark moved to `close` (x8).
+pub async fn replay_candle(rpc: &dyn CoreRpc, lease: &dyn CoreLease, asset: u32, close: u64) -> Result<Candle> {
+    let token = lease.lock().await?;
+    let r = candle_locked(rpc, asset, close).await;
+    lease.unlock(&token).await;
+    r
+}
+
+async fn candle_locked(rpc: &dyn CoreRpc, asset: u32, close: u64) -> Result<Candle> {
+    let mut state = sync_locked(rpc).await?.ok_or_else(|| Error::new(ErrorCode::Internal, "this fork has no HyperCore state"))?;
+    let latest = rpc.call("eth_getBlockByNumber", json!(["latest", false])).await?;
+    rpc.call("evm_setNextBlockTimestamp", json!([block_time(&latest)? + hc::FUNDING_INTERVAL])).await?;
+    rpc.call("evm_mine", json!([])).await?;
+    let b = rpc.call("eth_getBlockByNumber", json!(["latest", false])).await?;
+    let (head, time) = (block_ref(&b)?, block_time(&b)?);
+    let height = head.0;
+    let from = state.cursor.as_ref().map_or(head.0, |c| c.0 + 1);
+    let events = core_events(rpc, &state, from, head.0).await?;
+    let applied = state.candle_step(&events, asset, close, head, time);
+    let mut answers = state.answers_for(&applied);
+    if let Some(raw) = state.px_to_raw(asset, close) {
+        answers.extend(hypercore::price(asset, raw));
+    }
+    store(rpc, &state, &answers).await?;
+    settle_credits(rpc, &mut state).await?;
+    Ok(Candle { height, fills: applied.fills, liquidated: applied.liquidated })
+}
+
 async fn native_balance(rpc: &dyn CoreRpc, who: Address) -> Result<U256> {
     parse_qty(&rpc.call("eth_getBalance", json!([who.to_string(), "latest"])).await?)
 }
@@ -213,6 +262,144 @@ pub async fn settle_credits(rpc: &dyn CoreRpc, state: &mut State) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{Perp, Spot, TokenMeta};
+    use crate::hypercore::{encode_action, word_addr, word_u};
+    use std::sync::Mutex;
+
+    const ALICE: Address = Address::repeat_byte(0xa1);
+    const BOB: Address = Address::repeat_byte(0xb0);
+
+    /// anvil and the proxy's lock, in memory. At the first unlock another
+    /// client's transaction lands in a block of its own, and with `proxy_applies`
+    /// the proxy brings Core up to it at once, as it does for a client's send.
+    #[derive(Default)]
+    struct Chain {
+        state: Mutex<Option<String>>,
+        /// (number, timestamp) of each block, oldest first.
+        blocks: Mutex<Vec<(u64, u64)>>,
+        logs: Mutex<Vec<Value>>,
+        next_time: Mutex<Option<u64>>,
+        trace: Mutex<Vec<&'static str>>,
+        pending: Mutex<Option<Value>>,
+        proxy_applies: bool,
+    }
+
+    impl Chain {
+        fn mine(&self) -> u64 {
+            let mut blocks = self.blocks.lock().unwrap();
+            let (n, t) = *blocks.last().unwrap();
+            let time = self.next_time.lock().unwrap().take().unwrap_or(t + 1);
+            blocks.push((n + 1, time));
+            n + 1
+        }
+    }
+
+    fn qty(v: u64) -> Value {
+        json!(format!("0x{v:x}"))
+    }
+
+    #[async_trait]
+    impl CoreRpc for Chain {
+        async fn call(&self, method: &str, params: Value) -> Result<Value> {
+            Ok(match method {
+                "eth_getCode" => json!(self.state.lock().unwrap().clone().unwrap_or("0x".into())),
+                "anvil_setCode" => {
+                    *self.state.lock().unwrap() = params[1].as_str().map(str::to_string);
+                    Value::Null
+                }
+                "eth_getBlockByNumber" => {
+                    let (n, t) = *self.blocks.lock().unwrap().last().unwrap();
+                    json!({ "number": qty(n), "hash": format!("0x{n:x}"), "timestamp": qty(t) })
+                }
+                "evm_setNextBlockTimestamp" => {
+                    *self.next_time.lock().unwrap() = params[0].as_u64();
+                    Value::Null
+                }
+                "evm_mine" => {
+                    self.trace.lock().unwrap().push("mine");
+                    self.mine();
+                    Value::Null
+                }
+                "eth_getLogs" => {
+                    let range = |k: &str| u64::from_str_radix(params[0][k].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+                    let (from, to) = (range("fromBlock"), range("toBlock"));
+                    let n = |l: &Value| u64::from_str_radix(l["blockNumber"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+                    json!(self.logs.lock().unwrap().iter().filter(|l| (from..=to).contains(&n(l))).cloned().collect::<Vec<_>>())
+                }
+                "anvil_setStorageAt" => Value::Null,
+                m => panic!("unexpected {m}"),
+            })
+        }
+
+        async fn batch(&self, calls: &[(&str, Value)]) -> Result<Vec<Value>> {
+            let mut out = Vec::new();
+            for (m, p) in calls {
+                out.push(self.call(m, p.clone()).await?);
+            }
+            Ok(out)
+        }
+    }
+
+    #[async_trait]
+    impl CoreLease for Chain {
+        async fn lock(&self) -> Result<String> {
+            self.trace.lock().unwrap().push("lock");
+            Ok("t".into())
+        }
+
+        async fn unlock(&self, _token: &str) {
+            self.trace.lock().unwrap().push("unlock");
+            let Some(mut log) = self.pending.lock().unwrap().take() else { return };
+            let block = self.mine();
+            log["blockNumber"] = qty(block);
+            self.logs.lock().unwrap().push(log);
+            if self.proxy_applies {
+                sync_locked(self).await.unwrap();
+            }
+        }
+    }
+
+    /// A RawAction log of `payload` sent by `user`.
+    fn raw_action(user: Address, payload: &[u8]) -> Value {
+        let mut data = word_u(32).to_vec();
+        data.extend(word_u(payload.len() as u128));
+        data.extend(payload);
+        data.resize(data.len().div_ceil(32) * 32, 0);
+        json!({ "address": hypercore::CORE_WRITER, "topics": [hypercore::RAW_ACTION_TOPIC, hypercore::to_hex(&word_addr(user))], "data": hypercore::to_hex(&data), "logIndex": "0x0" })
+    }
+
+    #[tokio::test]
+    async fn a_replay_gives_back_the_lock_between_candles_and_applies_a_send_between_them_once() {
+        for proxy_applies in [false, true] {
+            let chain = Chain { proxy_applies, ..Default::default() };
+            let t0 = 1_793_599_200;
+            chain.blocks.lock().unwrap().push((10, t0));
+            let mut s = State::new();
+            s.perps.insert(0, Perp { name: "BTC".into(), sz_decimals: 5, max_leverage: 40, mark_x8: 100 * 100_000_000, ..Default::default() });
+            s.tokens.insert(0, TokenMeta { name: "USDC".into(), wei_decimals: 8, evm: None, sz_decimals: 8 });
+            s.accounts.entry(ALICE).or_default().spot.insert(0, Spot(50 * 100_000_000, 0, 0));
+            s.cursor = Some((10, "0xa".into()));
+            store(&chain, &s, &[]).await.unwrap();
+            // Alice sends Bob 7 USDC while the replay is between its first two candles.
+            *chain.pending.lock().unwrap() = Some(raw_action(ALICE, &encode_action(6, &[word_addr(BOB), word_u(0), word_u(7 * 100_000_000)].concat())));
+
+            let path = [99.0, 97.5, 98.25];
+            let mut height = 0;
+            for close in path {
+                height = replay_candle(&chain, &chain, 0, (close * 1e8) as u64).await.unwrap().height;
+            }
+            // Each candle is mined under a lock of its own, given back before the next.
+            assert_eq!(*chain.trace.lock().unwrap(), ["lock", "mine", "unlock"].repeat(path.len()), "proxy_applies {proxy_applies}");
+            let s = load_state(&chain).await.unwrap().unwrap();
+            // The send between candles is applied once, whoever applied it.
+            assert_eq!(s.accounts[&BOB].spot[&0].0, 7 * 100_000_000, "proxy_applies {proxy_applies}");
+            assert_eq!(s.accounts[&ALICE].spot[&0].0, 43 * 100_000_000);
+            // Candles, plus the block the send landed in, and the mark ends at the last close.
+            assert_eq!(height, 14);
+            assert_eq!(s.cursor.as_ref().unwrap().0, 14);
+            assert_eq!(s.perps[&0].mark_x8, 9_825_000_000);
+        }
+    }
 
     #[test]
     fn state_code_round_trips_and_foreign_code_is_refused() {

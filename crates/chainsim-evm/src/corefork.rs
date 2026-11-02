@@ -18,7 +18,7 @@ use chainsim_core::{Error, ErrorCode, Result};
 use serde_json::{json, Value};
 
 use crate::core::{self as hc, State};
-use crate::coresync::{self, block_ref, block_time, CoreRpc, STATE_ADDRESS};
+use crate::coresync::{self, block_ref, block_time, CoreLease, CoreRpc, STATE_ADDRESS};
 use crate::hypercore::{self, Entry};
 use crate::units::*;
 use crate::{now_secs, Engine, EvmAdapter, CALL_TIMEOUT};
@@ -62,6 +62,20 @@ impl CoreRpc for Engine<'_> {
 
     async fn batch(&self, calls: &[(&str, Value)]) -> Result<Vec<Value>> {
         self.rpc_batch(calls).await
+    }
+}
+
+#[async_trait::async_trait]
+impl CoreLease for Engine<'_> {
+    /// Takes the HyperCore lock in the fork's proxy, waiting while the proxy
+    /// applies a block or another command holds it.
+    async fn lock(&self) -> Result<String> {
+        let token = self.rpc_timeout("chainsim_coreLock", json!([]), Duration::from_secs(150)).await?;
+        token.as_str().map(str::to_string).ok_or_else(|| Error::new(ErrorCode::EngineFailed, "the HyperEVM proxy did not grant the HyperCore lock").next("retry the command"))
+    }
+
+    async fn unlock(&self, token: &str) {
+        let _ = self.rpc("chainsim_coreUnlock", json!([token])).await;
     }
 }
 
@@ -113,15 +127,13 @@ fn raw_px(px: &str, sz_decimals: u8) -> Option<u64> {
 }
 
 impl EvmAdapter {
-    /// Takes the HyperCore lock in the fork's proxy, waiting while the proxy
-    /// applies a block or another command holds it. Returns the lease token.
+    /// Takes the HyperCore lock in the fork's proxy. Returns the lease token.
     async fn core_lock(&self, eng: &Engine<'_>) -> Result<String> {
-        let token = eng.rpc_timeout("chainsim_coreLock", json!([]), Duration::from_secs(150)).await?;
-        token.as_str().map(str::to_string).ok_or_else(|| Error::new(ErrorCode::EngineFailed, "the HyperEVM proxy did not grant the HyperCore lock").next("retry the command"))
+        eng.lock().await
     }
 
     async fn core_unlock(&self, eng: &Engine<'_>, token: &str) {
-        let _ = eng.rpc("chainsim_coreUnlock", json!([token])).await;
+        eng.unlock(token).await
     }
 
     /// Applies every Core event since the cursor, on a HyperEVM fork. A
@@ -579,6 +591,8 @@ impl EvmAdapter {
     /// candles become its price path. Each candle mines one block an hour
     /// after the last, pays funding, then moves mark and oracle to the
     /// candle's close with the same fills and liquidations as `set hypercore price`.
+    /// Each candle takes and gives back the HyperCore lock on its own, so other
+    /// clients wait at most one candle.
     pub async fn replay(&self, name: &str, coin: &str, from: u64, to: u64) -> Result<Value> {
         let (handle, profile) = self.open(name).await?;
         if profile.hypercore.is_none() {
@@ -592,71 +606,61 @@ impl EvmAdapter {
                 .next("replay a shorter range, or several ranges one after another"));
         }
         let eng = self.engine(&handle, &profile);
-        let lease = self.core_lock(&eng).await?;
-        let r = self.replay_locked(&handle, &eng, coin, from, to).await;
-        self.core_unlock(&eng, &lease).await;
-        let (out, mut entry) = r?;
-        entry["at"] = json!(now_secs());
-        chainsim_core::mods::record(&self.docker, name, &entry).await?;
-        Ok(out)
-    }
-
-    async fn replay_locked(&self, handle: &ForkHandle, eng: &Engine<'_>, coin: &str, from: u64, to: u64) -> Result<(Value, Value)> {
-        let mut state = coresync::sync_locked(eng).await?.ok_or_else(|| Error::new(ErrorCode::Internal, "this fork has no HyperCore state").next(format!("chainsim down {0} && chainsim up {1} --name {0}", handle.name, handle.chain)))?;
         let mut calls = 0u32;
-        let asset = match state.perps.iter().find(|(_, p)| p.name.eq_ignore_ascii_case(coin)) {
-            Some((a, _)) => *a,
-            None => {
-                let meta = eng.info(json!({ "type": "metaAndAssetCtxs" }), &mut calls).await?;
-                let universe = meta[0]["universe"].as_array().cloned().unwrap_or_default();
-                let i = universe.iter().position(|u| u["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(coin))).ok_or_else(|| Error::new(ErrorCode::Usage, format!("no perp {coin} on Hyperliquid")))? as u32;
-                state.perps.insert(i, perp_from_ctx(&universe[i as usize], &meta[1][i as usize], &meta[0]["marginTables"]));
-                i
-            }
-        };
-        let name = state.perps[&asset].name.clone();
-        let candles = eng.info(json!({ "type": "candleSnapshot", "req": { "coin": name, "interval": "1h", "startTime": from * 1000, "endTime": to * 1000 } }), &mut calls).await?;
+        let lease = self.core_lock(&eng).await?;
+        let r = self.replay_perp(&handle, &eng, coin, &mut calls).await;
+        self.core_unlock(&eng, &lease).await;
+        let (asset, perp_name, sz_decimals) = r?;
+        // The candles come from the info API, with no lock held.
+        let candles = eng.info(json!({ "type": "candleSnapshot", "req": { "coin": perp_name, "interval": "1h", "startTime": from * 1000, "endTime": to * 1000 } }), &mut calls).await?;
         let path = candle_path(&candles);
         if path.is_empty() {
-            return Err(Error::new(ErrorCode::Usage, format!("the info API has no {name} candles between {from} and {to}")).next("pick a range in the past, such as the previous day"));
+            return Err(Error::new(ErrorCode::Usage, format!("the info API has no {perp_name} candles between {from} and {to}")).next("pick a range in the past, such as the previous day"));
         }
         let started = Instant::now();
         let (mut fills, mut liquidated, mut height) = (0usize, Vec::new(), 0u64);
         let (mut low, mut high) = (u64::MAX, 0u64);
         for (_, close) in &path {
-            let (_, now) = eng.latest_block().await?;
-            eng.rpc("evm_setNextBlockTimestamp", json!([now + hc::FUNDING_INTERVAL])).await?;
-            eng.rpc("evm_mine", json!([])).await?;
-            let b = eng.rpc("eth_getBlockByNumber", json!(["latest", false])).await?;
-            let (head, time) = (block_ref(&b)?, block_time(&b)?);
-            height = head.0;
-            // Blocks another client mined since the cursor are applied too, never skipped.
-            let from = state.cursor.as_ref().map_or(head.0, |c| c.0 + 1);
-            let events = coresync::core_events(eng, &state, from, head.0).await?;
-            let applied = state.candle_step(&events, asset, *close, head, time);
-            fills += applied.fills;
-            liquidated.extend(applied.liquidated.iter().map(|a| a.to_string()));
-            let mut answers = state.answers_for(&applied);
-            if let Some(raw) = state.px_to_raw(asset, *close) {
-                answers.extend(hypercore::price(asset, raw));
-            }
-            coresync::store(eng, &state, &answers).await?;
+            let step = coresync::replay_candle(&eng, &eng, asset, *close).await?;
+            fills += step.fills;
+            liquidated.extend(step.liquidated.iter().map(|a| a.to_string()));
+            height = step.height;
             low = low.min(*close);
             high = high.max(*close);
         }
-        coresync::settle_credits(eng, &mut state).await?;
         let px = |v: u64| hc::fmt_dec(v as i128, 8);
         let last = path.last().expect("not empty").1;
-        chainsim_core::log(format_args!("replayed {} {name} candles in {} ms, {calls} info API calls", path.len(), started.elapsed().as_millis()));
-        Ok((
-            json!({
-                "coin": name, "perp": asset, "interval": "1h", "candles": path.len(),
-                "from": path[0].0 / 1000, "to": path.last().expect("not empty").0 / 1000,
-                "firstClose": px(path[0].1), "lastClose": px(last), "lowClose": px(low), "highClose": px(high),
-                "markPx": state.px_to_raw(asset, last), "height": height, "filled": fills, "liquidated": liquidated, "infoCalls": calls,
-            }),
-            json!({ "kind": "time-replay", "coin": name, "candles": path.len(), "from": from, "to": to }),
-        ))
+        chainsim_core::log(format_args!("replayed {} {perp_name} candles in {} ms, {calls} info API calls", path.len(), started.elapsed().as_millis()));
+        let out = json!({
+            "coin": perp_name, "perp": asset, "interval": "1h", "candles": path.len(),
+            "from": path[0].0 / 1000, "to": path.last().expect("not empty").0 / 1000,
+            "firstClose": px(path[0].1), "lastClose": px(last), "lowClose": px(low), "highClose": px(high),
+            "markPx": last / 10u64.pow(2 + sz_decimals as u32), "height": height, "filled": fills, "liquidated": liquidated, "infoCalls": calls,
+        });
+        let mut entry = json!({ "kind": "time-replay", "coin": perp_name, "candles": path.len(), "from": from, "to": to });
+        entry["at"] = json!(now_secs());
+        chainsim_core::mods::record(&self.docker, name, &entry).await?;
+        Ok(out)
+    }
+
+    /// The replayed perp, under the lock: one Core tracks already, or one
+    /// added from the info API meta and stored before the lock is given back.
+    /// Returns its index, name and size decimals.
+    async fn replay_perp(&self, handle: &ForkHandle, eng: &Engine<'_>, coin: &str, calls: &mut u32) -> Result<(u32, String, u8)> {
+        let mut state = coresync::sync_locked(eng).await?.ok_or_else(|| Error::new(ErrorCode::Internal, "this fork has no HyperCore state").next(format!("chainsim down {0} && chainsim up {1} --name {0}", handle.name, handle.chain)))?;
+        let asset = match state.perps.iter().find(|(_, p)| p.name.eq_ignore_ascii_case(coin)) {
+            Some((a, _)) => *a,
+            None => {
+                let meta = eng.info(json!({ "type": "metaAndAssetCtxs" }), calls).await?;
+                let universe = meta[0]["universe"].as_array().cloned().unwrap_or_default();
+                let i = universe.iter().position(|u| u["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(coin))).ok_or_else(|| Error::new(ErrorCode::Usage, format!("no perp {coin} on Hyperliquid")))? as u32;
+                state.perps.insert(i, perp_from_ctx(&universe[i as usize], &meta[1][i as usize], &meta[0]["marginTables"]));
+                coresync::store(eng, &state, &[]).await?;
+                i
+            }
+        };
+        let p = &state.perps[&asset];
+        Ok((asset, p.name.clone(), p.sz_decimals))
     }
 
     /// What `status` adds: accounts, open orders and the cursor.
