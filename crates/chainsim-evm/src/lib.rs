@@ -3,6 +3,8 @@
 //! sections 3 and 5). Every engine call goes through the fork's control path.
 
 pub mod abi;
+pub mod core;
+mod corefork;
 pub mod hypercore;
 pub mod units;
 
@@ -23,6 +25,8 @@ use serde_json::{json, Value};
 
 use units::*;
 
+pub use corefork::{CoreOp, INFO_ENV};
+
 /// How long `up` waits for the engine to answer.
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
 /// The default time a single engine call may take (cold upstream reads included).
@@ -42,6 +46,14 @@ const ARB_GAS_INFO: &str = "0x000000000000000000000000000000000000006C";
 /// What the ArbGasInfo mock returns for getL1BaseFeeEstimate()
 /// (profiles/assets/src/ArbGasInfoMock.sol).
 const MOCK_L1_BASE_FEE: u64 = 255074;
+
+/// Engine methods that mine or move the chain, after which Core catches up.
+const MINING_METHODS: &[&str] = &["eth_sendTransaction", "eth_sendRawTransaction", "evm_mine", "anvil_mine", "evm_revert", "anvil_revert"];
+
+/// The `call` methods chainsim answers itself on HyperEVM.
+pub const HYPERCORE_CALLS: &[&str] = &["corewriter_actions", "hypercore_state"];
+/// The `set hypercore` helpers.
+pub const HYPERCORE_SETS: &[&str] = &["price", "spot-balance", "position", "book", "mirror"];
 
 pub const OPERATIONS: &[&str] = &["describe", "up", "down", "ls", "status", "fund", "snapshot", "revert", "call", "send", "set", "time", "mine", "selftest"];
 
@@ -320,6 +332,14 @@ impl EvmAdapter {
         &self.docker
     }
 
+    /// Core catch-up after a command that mined. The command already took
+    /// effect, so a failure here is logged and the next command catches up.
+    async fn core_sync_after(&self, handle: &ForkHandle, profile: &Profile, eng: &Engine<'_>) {
+        if let Err(e) = self.core_sync(handle, profile, eng).await {
+            chainsim_core::log(format_args!("HyperCore catch-up deferred to the next command: {}", e.message));
+        }
+    }
+
     fn engine<'a>(&'a self, handle: &ForkHandle, profile: &Profile) -> Engine<'a> {
         let secret = profile.upstream_is_secret().then(|| profile.upstream_url());
         Engine { control: Control::new(&self.docker, handle.control_container.clone(), secret).with_env(&profile.upstream.env), url: Target::Engine(handle.rpc_url(profile)) }
@@ -440,11 +460,7 @@ impl EvmAdapter {
         }
 
         let seeded = match &profile.hypercore {
-            Some(settings) => {
-                let summary = self.seed_hypercore(&eng, settings, block).await?;
-                save_hypercore(&self.docker, name, &summary).await?;
-                Some(summary)
-            }
+            Some(settings) => Some(self.seed_hypercore(&eng, settings, block).await?),
             None => None,
         };
 
@@ -463,6 +479,16 @@ impl EvmAdapter {
             }
         }
         chainsim_core::log(format_args!("{name} warmed up in {} ms", warm.elapsed().as_millis()));
+
+        // The local HyperCore starts after the warm-up block, so it applies nothing from it.
+        let seeded = match seeded {
+            Some(mut summary) => {
+                summary["core"] = self.core_init(&eng, profile, &summary).await?;
+                save_hypercore(&self.docker, name, &summary).await?;
+                Some(summary)
+            }
+            None => None,
+        };
 
         let dev = self.dev_accounts(&eng).await;
         let mut fork = handle.fork(profile, dev);
@@ -857,11 +883,13 @@ impl Adapter for EvmAdapter {
     async fn status(&self, name: &str) -> Result<Status> {
         let (handle, profile) = self.open(name).await?;
         let eng = self.engine(&handle, &profile);
+        self.core_sync(&handle, &profile, &eng).await?;
         let head = eng.head().await?;
         let dev = self.dev_accounts(&eng).await;
         let mut fork = self.fork_of(&handle, &profile, dev).await;
         if let Some(h) = fork.hypercore.as_mut().filter(|h| h.is_object()) {
             h["coreWriterActions"] = json!(eng.raw_actions(handle.fork_point.number + 1).await?.len());
+            h["coreState"] = self.core_status(&eng).await?;
         }
         Ok(Status { fork, head, uptime_secs: handle.uptime_secs })
     }
@@ -895,6 +923,7 @@ impl Adapter for EvmAdapter {
             eng.set_balance(&from, balance + add).await?;
         }
         let receipt = eng.send_as(&from, tx).await?;
+        self.core_sync_after(&handle, &profile, &eng).await;
         let ok = receipt["status"] == json!("0x1");
         let hash = receipt["transactionHash"].clone();
         let top = added.map(|a| json!({ "amount": format_amount(a, decimals), "symbol": symbol }));
@@ -919,6 +948,7 @@ impl Adapter for EvmAdapter {
     async fn set(&self, name: &str, req: &SetRequest) -> Result<Value> {
         let (handle, profile) = self.open(name).await?;
         let eng = self.engine(&handle, &profile);
+        self.core_sync(&handle, &profile, &eng).await?;
         if let SetKind::Precompile { calldata, result } = &req.kind {
             let (mut out, mut entry) = self.set_precompile(name, &handle, &profile, &req.address, calldata, result.as_deref()).await?;
             entry["at"] = json!(now_secs());
@@ -1024,6 +1054,7 @@ impl Adapter for EvmAdapter {
     async fn fund(&self, name: &str, req: &FundRequest) -> Result<Funded> {
         let (handle, profile) = self.open(name).await?;
         let eng = self.engine(&handle, &profile);
+        self.core_sync(&handle, &profile, &eng).await?;
         let who = parse_address(&req.address)?;
         let addr = who.to_string();
         if req.native.is_none() && req.tokens.is_empty() {
@@ -1089,7 +1120,10 @@ impl Adapter for EvmAdapter {
 
     async fn snapshot(&self, name: &str) -> Result<Snapshot> {
         let (handle, profile) = self.open(name).await?;
-        let id = self.engine(&handle, &profile).rpc("evm_snapshot", json!([])).await?;
+        let eng = self.engine(&handle, &profile);
+        // Core state is fork state: bring it up to date so the snapshot holds it.
+        self.core_sync(&handle, &profile, &eng).await?;
+        let id = eng.rpc("evm_snapshot", json!([])).await?;
         Ok(Snapshot { id: id.as_str().unwrap_or_default().to_string() })
     }
 
@@ -1116,6 +1150,7 @@ impl Adapter for EvmAdapter {
         // The next block takes the new time, and one block is mined to carry it.
         eng.rpc("evm_setNextBlockTimestamp", json!([target])).await?;
         eng.rpc("evm_mine", json!([])).await?;
+        self.core_sync_after(&handle, &profile, &eng).await;
         let (height, after) = eng.latest_block().await?;
         Ok(json!({ "timestamp": after, "timestampUsecs": (after as u128 * 1_000_000).to_string(), "previous": before, "height": height }))
     }
@@ -1128,6 +1163,7 @@ impl Adapter for EvmAdapter {
             return Err(Error::new(ErrorCode::Usage, format!("mine takes 1 to {MAX_MINE} blocks")));
         }
         eng.rpc("anvil_mine", json!([qty(U256::from(n))])).await?;
+        self.core_sync_after(&handle, &profile, &eng).await;
         let (height, ts) = eng.latest_block().await?;
         Ok(json!({ "mined": n, "height": height, "timestamp": ts, "timestampUsecs": (ts as u128 * 1_000_000).to_string() }))
     }
@@ -1138,6 +1174,7 @@ impl Adapter for EvmAdapter {
         if !params.is_array() {
             return Err(Error::new(ErrorCode::Usage, "params must be a JSON array, such as '[\"0x…\", \"latest\"]'"));
         }
+        self.core_sync(&handle, &profile, &eng).await?;
         if method == "corewriter_actions" && profile.hypercore.is_some() {
             let first = handle.fork_point.number + 1;
             let from = match params.get(0) {
@@ -1145,7 +1182,12 @@ impl Adapter for EvmAdapter {
                 Some(p) => p.get("fromBlock").and_then(Value::as_u64).filter(|_| p.is_object()).ok_or_else(|| Error::new(ErrorCode::Usage, "corewriter_actions takes [] or [{\"fromBlock\": <block number>}]"))?,
             };
             let logs = eng.raw_actions(from.max(first)).await?;
-            return Ok(json!(logs.iter().map(hypercore::decode_log).collect::<Vec<_>>()));
+            let mut decoded: Vec<Value> = logs.iter().map(hypercore::decode_log).collect();
+            self.action_results(&eng, &mut decoded).await?;
+            return Ok(json!(decoded));
+        }
+        if method == "hypercore_state" && profile.hypercore.is_some() {
+            return self.hypercore_state(&eng, &handle, &params).await;
         }
         let result = match from {
             None => eng.rpc(method, params).await?,
@@ -1158,6 +1200,9 @@ impl Adapter for EvmAdapter {
                 eng.send_as(&from, tx).await?
             }
         };
+        if from.is_some() || MINING_METHODS.contains(&method) {
+            self.core_sync_after(&handle, &profile, &eng).await;
+        }
         // Some engine methods (anvil_nodeInfo) echo the fork URL: remove a provider URL.
         let text = eng.control.scrub_secret(&result.to_string());
         Ok(serde_json::from_str(&text).unwrap_or(Value::String(text)))

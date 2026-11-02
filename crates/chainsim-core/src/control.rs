@@ -18,6 +18,8 @@ pub enum Target {
     Engine(String),
     /// The upstream RPC, whose URL lives only in the sidecar environment.
     Upstream,
+    /// Another HTTP endpoint by URL, such as the Hyperliquid info API.
+    Http(String),
 }
 
 /// The control path of one fork.
@@ -56,7 +58,7 @@ impl<'a> Control<'a> {
         let secs = timeout.as_secs().max(1).to_string();
         let mut argv: Vec<String> = vec!["curl".into(), "-sS".into(), "--max-time".into(), secs, "-X".into(), "POST".into(), "-H".into(), "content-type: application/json".into(), "-w".into(), format!("{MARK}%{{http_code}}")];
         let argv = match target {
-            Target::Engine(url) => {
+            Target::Engine(url) | Target::Http(url) => {
                 argv.extend(["--data-raw".into(), body.to_string(), url.clone()]);
                 argv
             }
@@ -67,7 +69,7 @@ impl<'a> Control<'a> {
             }
         };
         let out = self.docker.exec(&self.container, &argv).await?;
-        let upstream = matches!(target, Target::Upstream);
+        let upstream = matches!(target, Target::Upstream | Target::Http(_));
         if out.exit_code != 0 {
             let msg = self.scrub(out.stderr.trim());
             let code = match out.exit_code {
@@ -76,7 +78,11 @@ impl<'a> Control<'a> {
                 28 => ErrorCode::UpstreamUnavailable,
                 _ => ErrorCode::EngineFailed,
             };
-            let what = if upstream { "upstream" } else { "engine" };
+            let what = match target {
+                Target::Upstream => "upstream",
+                Target::Http(_) => "info API",
+                Target::Engine(_) => "engine",
+            };
             let mut e = Error::new(code, format!("{what} call failed (curl exit {}): {msg}", out.exit_code));
             if code == ErrorCode::UpstreamUnavailable {
                 e = e.next(upstream_next(self.env.as_deref(), false));

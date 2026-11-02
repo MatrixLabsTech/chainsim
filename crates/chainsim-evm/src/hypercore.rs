@@ -20,6 +20,7 @@ pub const FIRST_PRECOMPILE: u16 = 0x800;
 pub const LAST_PRECOMPILE: u16 = 0x813;
 pub const POSITION: u16 = 0x800;
 pub const SPOT_BALANCE: u16 = 0x801;
+pub const WITHDRAWABLE: u16 = 0x803;
 pub const MARK_PX: u16 = 0x806;
 pub const ORACLE_PX: u16 = 0x807;
 pub const SPOT_PX: u16 = 0x808;
@@ -27,6 +28,7 @@ pub const L1_BLOCK_NUMBER: u16 = 0x809;
 pub const PERP_ASSET_INFO: u16 = 0x80a;
 pub const SPOT_INFO: u16 = 0x80b;
 pub const TOKEN_INFO: u16 = 0x80c;
+pub const ACCOUNT_MARGIN_SUMMARY: u16 = 0x80f;
 
 /// The CoreWriter system contract, and its `RawAction(address indexed user, bytes data)` event.
 pub const CORE_WRITER: &str = "0x3333333333333333333333333333333333333333";
@@ -73,9 +75,11 @@ pub fn mock_code() -> Vec<u8> {
     const UNSEEDED: usize = 0;
     const LOOP: usize = 1;
     const DONE: usize = 2;
+    const BODY: usize = 3;
+    const FALLBACK: usize = 4;
     let payload = revert_payload();
     let mut code: Vec<u8> = Vec::new();
-    let mut labels = [0usize; 3];
+    let mut labels = [0usize; 5];
     let mut patches: Vec<(usize, usize)> = Vec::new();
     let mut push2 = |code: &mut Vec<u8>, label: usize| {
         code.push(0x61);
@@ -84,12 +88,13 @@ pub fn mock_code() -> Vec<u8> {
     };
     // calldata to memory, k = keccak256(calldata), v = sload(k)
     code.extend([0x36, 0x5f, 0x5f, 0x37, 0x36, 0x5f, 0x20, 0x80, 0x54]);
-    // if v == 0: unseeded
+    // if v == 0: try the default answer
     code.extend([0x80, 0x15]);
-    push2(&mut code, UNSEEDED);
+    push2(&mut code, FALLBACK);
     code.push(0x57);
-    // len = v - 1, i = 0
-    code.extend([0x60, 0x01, 0x90, 0x03, 0x5f]);
+    // body: len = v - 1, i = 0
+    labels[BODY] = code.len();
+    code.extend([0x5b, 0x60, 0x01, 0x90, 0x03, 0x5f]);
     labels[LOOP] = code.len();
     // loop: if !(i * 32 < len) goto done
     code.extend([0x5b, 0x81, 0x81, 0x60, 0x05, 0x1b, 0x10, 0x15]);
@@ -102,6 +107,13 @@ pub fn mock_code() -> Vec<u8> {
     // done: return(0, len)
     labels[DONE] = code.len();
     code.extend([0x5b, 0x50, 0x5f, 0xf3]);
+    // fallback: k = 1, v = sload(1); if v == 0: unseeded, else the body
+    labels[FALLBACK] = code.len();
+    code.extend([0x5b, 0x50, 0x50, 0x60, 0x01, 0x80, 0x54, 0x80, 0x15]);
+    push2(&mut code, UNSEEDED);
+    code.push(0x57);
+    push2(&mut code, BODY);
+    code.push(0x56);
     // unseeded: codecopy the revert payload and revert with it
     labels[UNSEEDED] = code.len();
     let n = payload.len() as u16;
@@ -123,6 +135,21 @@ pub fn mock_code() -> Vec<u8> {
     code
 }
 
+/// The slot of the default answer: a fixed slot, where a keccak256 key never lands.
+const DEFAULT_SLOT: u64 = 1;
+
+/// The storage writes that make the mock answer every unseeded query with `result`.
+pub fn default_writes(result: &[u8]) -> Vec<(String, String)> {
+    words_at(U256::from(DEFAULT_SLOT), result)
+}
+
+/// The precompiles that answer an unseeded query with zeros, so any user
+/// reads empty Core state: position, spot balance, withdrawable and the
+/// account margin summary.
+pub fn zero_defaults() -> Vec<(u16, Vec<u8>)> {
+    [(POSITION, 5), (SPOT_BALANCE, 3), (WITHDRAWABLE, 1), (ACCOUNT_MARGIN_SUMMARY, 4)].into_iter().map(|(p, words)| (p, vec![0u8; 32 * words])).collect()
+}
+
 /// The mock's runtime bytecode as 0x hex, for `anvil_setCode`.
 pub fn mock_code_hex() -> String {
     format!("0x{}", alloy_primitives::hex::encode(mock_code()))
@@ -131,7 +158,10 @@ pub fn mock_code_hex() -> String {
 /// The storage writes that make the mock answer `calldata` with `result`:
 /// (slot, value) pairs as 0x plus 64 hex digits.
 pub fn storage_writes(calldata: &[u8], result: &[u8]) -> Vec<(String, String)> {
-    let k = U256::from_be_bytes(keccak256(calldata).0);
+    words_at(U256::from_be_bytes(keccak256(calldata).0), result)
+}
+
+fn words_at(k: U256, result: &[u8]) -> Vec<(String, String)> {
     let mut out = vec![(word_hex(k), word_hex(U256::from(result.len() + 1)))];
     for (i, chunk) in result.chunks(32).enumerate() {
         let mut w = [0u8; 32];
@@ -580,6 +610,23 @@ mod tests {
         assert!(!ok);
         assert_eq!(out, revert_payload());
         assert_eq!(crate::abi::revert_reason(&format!("0x{}", alloy_primitives::hex::encode(&out))).as_deref(), Some(UNSEEDED_REASON));
+    }
+
+    #[test]
+    fn an_unseeded_query_falls_back_to_the_default_answer() {
+        let code = mock_code();
+        let mut storage = HashMap::new();
+        let sb = spot_balance(Address::repeat_byte(0xc0), 150, 9, 0, 0);
+        seed(&mut storage, &sb.calldata, &sb.result);
+        let (_, zeros) = zero_defaults().into_iter().find(|(p, _)| *p == SPOT_BALANCE).unwrap();
+        for (k, v) in default_writes(&zeros) {
+            storage.insert(k.parse().unwrap(), v.parse().unwrap());
+        }
+        // A seeded user reads its answer, any other user reads three zero words.
+        assert_eq!(run(&code, &sb.calldata, &storage), (true, sb.result.clone()));
+        let other = spot_balance(Address::repeat_byte(0xd0), 150, 0, 0, 0);
+        assert_eq!(run(&code, &other.calldata, &storage), (true, vec![0u8; 96]));
+        assert_eq!(zero_defaults().iter().map(|(p, r)| (*p, r.len())).collect::<Vec<_>>(), [(POSITION, 160), (SPOT_BALANCE, 96), (WITHDRAWABLE, 32), (ACCOUNT_MARGIN_SUMMARY, 128)]);
     }
 
     #[test]
