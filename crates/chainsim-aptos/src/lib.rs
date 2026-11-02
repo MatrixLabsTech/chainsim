@@ -921,7 +921,18 @@ impl Adapter for AptosAdapter {
         let (handle, profile) = self.open(name).await?;
         let s = self.session(name, &profile);
         let parts = self.checks(&handle, &profile, &s).await;
-        selftest_result(SelftestReport { ok: parts.iter().all(|c| c.ok), parts })
+        let report = SelftestReport { ok: parts.iter().all(|c| c.ok), parts };
+        // Every CLI call reads the upstream, so a rate limit fails checks that
+        // say nothing about the copy: report it as the upstream failure it is.
+        if !report.ok {
+            if let Err(e) = s.upstream_get("/").await {
+                if e.code == ErrorCode::RateLimited {
+                    let next = format!("{}, such as CHAINSIM_APTOS_API_KEY=<API key>", e.next.unwrap_or_default());
+                    return Err(Error::new(ErrorCode::RateLimited, "selftest checks failed while the upstream rate-limits this host").next(next).data(serde_json::to_value(&report).expect("report serializes")));
+                }
+            }
+        }
+        selftest_result(report)
     }
 }
 
@@ -1004,7 +1015,7 @@ mod tests {
         assert_eq!((usdc.address.as_str(), usdc.decimals), ("0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b", 6));
         assert_eq!(p.selftest.token.as_deref(), Some("USDC"));
         parse_address(p.funder.as_deref().unwrap()).unwrap();
-        for words in ["experimental", "REST API", "rpcUrl", "one at a time", "authentication key", "chain id 1", "rate", "150 million", "first read", "config.json", "Innovation-Enabling Source Code License"] {
+        for words in ["experimental", "REST API", "rpcUrl", "one at a time", "authentication key", "chain id 1", "compute units", "150 million", "first read", "config.json", "Innovation-Enabling Source Code License"] {
             assert!(p.limits.iter().any(|l| l.to_lowercase().contains(&words.to_lowercase())), "no limit mentions {words}");
         }
     }
