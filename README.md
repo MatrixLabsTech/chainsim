@@ -60,8 +60,8 @@ on every supported chain.
 - `selftest` proves a fork is fit before a test spends anything on it.
 - Arc runs on Circle's own engine, so native USDC behaves as on Arc.
 - Robinhood Chain answers Arbitrum's ArbSys and ArbGasInfo precompiles.
-- HyperEVM contracts that read HyperCore run, on answers seeded from mainnet, and every
-  CoreWriter action is captured and decoded.
+- HyperEVM runs with a local HyperCore: limit orders fill against the mainnet order book,
+  balances bridge both ways, and any mainnet account can be mirrored onto the copy.
 - JSON output, fixed exit codes and `error.next`, so an agent can branch on every result.
 - One-line install from GitHub releases for Linux and macOS, and `chainsim doctor` to check the
   setup: Docker, engines, plugin and upstreams.
@@ -144,7 +144,7 @@ The full contract, with every error code, is in [docs/agent-contract.md](docs/ag
 | <img src="assets/chains/robinhood-chain.png" height="32" alt="Robinhood Chain"> &nbsp;**Robinhood Chain mainnet** `robinhood-mainnet` | Foundry anvil v1.8.5 with an ArbGasInfo mock | [chains/robinhood](chains/robinhood/README.md) |
 | <img src="assets/chains/sui.svg" height="32" alt="Sui"> &nbsp;**Sui mainnet** `sui-mainnet` | Mysten sui-fork mainnet-v1.82.3-de683df9e4e0, built with chainsim's SetObject patch | [chains/sui](chains/sui/README.md) |
 | <img src="assets/chains/aptos.svg" height="32" alt="Aptos"> &nbsp;**Aptos mainnet** `aptos-mainnet` | Aptos CLI 9.6.0 simulation sessions | [chains/aptos](chains/aptos/README.md) |
-| <img src="assets/chains/hyperliquid.svg" height="32" alt="Hyperliquid"> &nbsp;**HyperEVM mainnet** `hyperevm-mainnet` | Foundry anvil v1.8.5 with HyperCore precompile mocks | [chains/hyperliquid](chains/hyperliquid/README.md) |
+| <img src="assets/chains/hyperliquid.svg" height="32" alt="Hyperliquid"> &nbsp;**HyperEVM mainnet** `hyperevm-mainnet` | Foundry anvil v1.8.5 with HyperCore modeled on the copy | [chains/hyperliquid](chains/hyperliquid/README.md) |
 
 The chain logos are trademarks of their owners and identify the chains only.
 
@@ -177,26 +177,30 @@ chainsim send aptos-mainnet --as <any address> \
 
 ## Hyperliquid
 
-chainsim forks HyperEVM Mainnet, the EVM side of Hyperliquid, in one command, and makes
-contracts that read HyperCore run on it. HyperCore's prices, balances and positions reach
-HyperEVM contracts through read precompiles at `0x800` to `0x813`, which a plain fork leaves
-empty. chainsim answers them from a mock seeded with mainnet values, with the same JSON contract
-and exit codes as every other chain.
+chainsim forks HyperEVM Mainnet, the EVM side of Hyperliquid, in one command, and runs a local
+HyperCore beside it. HyperCore's prices, balances and positions reach HyperEVM contracts through
+read precompiles at `0x800` to `0x813`, which a plain fork leaves empty. On the copy they answer
+from the copy's own Core state, and the actions contracts send through CoreWriter change it, with
+the same JSON contract and exit codes as every other chain.
 
-- `up` seeds the L1 block number, mark and oracle prices and asset info for the BTC, ETH, SOL
-  and HYPE perps, token info for USDC and HYPE, and the HYPE/USDC spot price from mainnet.
-- `set hypercore price`, `spot-balance` and `position` change what a contract reads, and `set
-  precompile` stores any other answer or copies it from mainnet with `--live`.
-- `call corewriter_actions` decodes every action a contract sends through CoreWriter, such as a
-  limit order or a spot send.
-- `fund` gives a test wallet HYPE, USDC, USD₮0, WHYPE, UBTC and UETH, and `send --as` sends as
-  any account.
-- `snapshot` and `revert` reset the fork, HyperCore answers included.
+- `up` seeds mark and oracle prices, asset and token info from mainnet, and takes the BTC, ETH,
+  SOL and HYPE order books from the Hyperliquid info API.
+- Limit orders sent through CoreWriter fill against those books with mainnet depth: full and
+  partial fills, resting GTC orders, IOC remainders dropped, ALO orders that would cross
+  rejected. Cancels, spot sends and USD class transfers apply too.
+- HYPE sent to `0x2222…2222` and linked tokens sent to their system addresses credit Core spot,
+  and a spot send back to a system address credits the EVM balance.
+- `set hypercore mirror <user>` copies a mainnet account's positions, margin and spot balances
+  onto the copy, so a test starts from a real position and acts as that account with `send --as`.
+- `call hypercore_state <user>` returns an account's Core state in the info API's own shapes, and
+  `call corewriter_actions` shows each action with what it did.
+- chainsim applies Core actions on each command, and `snapshot` and `revert` carry Core state
+  with the rest of the fork.
 
 ```sh
 chainsim up hyperevm-mainnet
-chainsim fund hyperevm-mainnet <test address> --native 10 --token USDC:1000
-chainsim set hyperevm-mainnet hypercore price 0 650000
+chainsim set hyperevm-mainnet hypercore mirror <mainnet account>
+chainsim call hyperevm-mainnet hypercore_state <mainnet account>
 chainsim call hyperevm-mainnet corewriter_actions
 ```
 

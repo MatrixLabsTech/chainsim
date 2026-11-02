@@ -41,8 +41,10 @@ Work through these steps in order. Each ends on a check you can make.
    `address::module::function<T...>` with `<type>:<value>` arguments on Aptos. To change state
    directly, run `chainsim set <name> balance|token|owner|object|resource|storage|code ...`. On
    HyperEVM, `set <name> hypercore price|spot-balance|position ...` and `set <name> precompile`
-   set what contracts read from HyperCore, and `call <name> corewriter_actions` lists the
-   CoreWriter actions they sent, decoded.
+   set what contracts read from HyperCore, `set <name> hypercore mirror <user>` copies a mainnet
+   account's Core state onto the copy, `call <name> hypercore_state <user>` reads an account's
+   Core state, and `call <name> corewriter_actions` lists the CoreWriter actions contracts sent,
+   decoded, with what each did. Core actions apply when a chainsim command runs on the fork.
    `chainsim describe <chain>` lists what each chain supports. Done when the receipt `status` is
    1 (`success` on Aptos) or the read-back matches what you set.
 7. **Do the work.** Before each scenario run `chainsim snapshot <name>`, and after it

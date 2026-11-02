@@ -17,8 +17,11 @@ error codes from the binary.
   takes a kind: `balance`, `token`, `storage`, `code`, `owner`, `object`, `resource`,
   `precompile` or `hypercore`. On HyperEVM, `set precompile <address> <calldata> (--result <hex>
   | --live)` stores a HyperCore read precompile's answer, `set hypercore price|spot-balance|position`
-  encodes the common ones, and `call <name> corewriter_actions [{"fromBlock": <n>}]` returns every
-  CoreWriter action decoded.
+  sets prices and an account's Core state, `set hypercore book <coin> --live` refreshes a perp's
+  order book and `set hypercore mirror <user>` copies a mainnet account onto the copy. `call <name>
+  corewriter_actions [{"fromBlock": <n>}]` returns every CoreWriter action decoded with its
+  `result`, and `call <name> hypercore_state <user>` returns the account's Core state as
+  `clearinghouseState`, `spotClearinghouseState` and `openOrders`.
   `chainsim describe <chain>` and the chain pages say which kinds and commands each chain
   supports, and the rest exit 3.
 - Engines: `pull [<engine>]`, `engines`, `prune`.
@@ -49,9 +52,14 @@ error codes from the binary.
   differs from the real chain, to copy into a report word for word.
 - The `fork` object's `rpcUrl` is the engine's in-network RPC URL, or `null` when the engine
   serves no RPC (Aptos). `forkPoint.kind` is `block`, `checkpoint` (Sui) or `version` (Aptos).
-- On HyperEVM, the `fork` object carries a `hypercore` field: the HyperCore answers `up` seeded,
-  and in `status`, `coreWriterActions`, the count of captured CoreWriter actions. Other chains'
-  fork objects have no such field.
+- On HyperEVM, the `fork` object carries a `hypercore` field: the HyperCore answers `up` seeded
+  and, under `core`, the order books it took. In `status` it adds `coreWriterActions`, the count
+  of captured CoreWriter actions, and `coreState`. Other chains' fork objects have no such field.
+- HyperEVM applies CoreWriter actions and bridge transfers to the copy's HyperCore when a
+  chainsim command runs on the fork. A transaction sent straight to the RPC port by another tool
+  takes effect at the next chainsim command on that fork, so run one (`status` will do) before
+  reading Core state that such a transaction changed. `describe hyperevm-mainnet` lists in
+  `limits` what HyperCore does not model yet, such as fees, funding and liquidations.
 - `latest_state_only` (exit 7) means `up --block` was refused because the default upstream
   answers state reads at its latest block only. `error.next` names the variable that takes an
   archive provider URL.

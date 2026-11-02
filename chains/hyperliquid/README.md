@@ -5,7 +5,8 @@
 chainsim runs a private copy of HyperEVM Mainnet, the EVM side of Hyperliquid, in Docker as the
 chain `hyperevm-mainnet`. The commands and their JSON output are the same as on every chain, and
 the [README](../../README.md) covers the shared workflow. This page covers what is specific to
-HyperEVM. Every output below comes from a live run against HyperEVM Mainnet on 2026-11-01.
+HyperEVM. Every output below comes from a live run against HyperEVM Mainnet, on 2026-11-01 for
+the precompile answers and on 2026-11-02 for the local HyperCore.
 
 ## What chainsim gives on HyperEVM
 
@@ -13,12 +14,18 @@ HyperEVM. Every output below comes from a live run against HyperEVM Mainnet on 2
   positions reach HyperEVM contracts through read precompiles at `0x800` to `0x813`. A plain
   anvil fork leaves those addresses empty, so every contract that decodes their answer reverts.
   chainsim puts a mock at each of them.
-- HyperCore answers seeded from mainnet at `up`, and set per test with `set hypercore` and `set
-  precompile`.
-- Every action a contract sends through CoreWriter, captured and decoded by `call
+- A local HyperCore beside the fork. The precompiles answer from the copy's own Core state, for
+  any account, and the actions contracts send through CoreWriter change it.
+- Limit orders that fill against the mainnet order book, with its depth: full and partial fills,
+  resting orders, cancels, and IOC and ALO rules.
+- Bridging both ways: HYPE and linked tokens sent to their system addresses credit Core spot,
+  and a spot send back credits the EVM balance.
+- `set hypercore mirror`, which copies a mainnet account's positions, margin and balances onto the
+  copy, and `call hypercore_state`, which reads an account's Core state in the info API's shapes.
+- Every action a contract sends through CoreWriter, decoded with what it did by `call
   corewriter_actions`.
 - `fund` for HYPE and five ERC-20 tokens, and `send --as` for any account.
-- `snapshot` and `revert`, which restore the HyperCore answers with the rest of the state.
+- `snapshot` and `revert`, which restore Core state with the rest of the fork.
 - `selftest`, which checks the chain id, the mock and CoreWriter before a test relies on them.
 - The same JSON contract and exit codes as every other chain, so a script or an agent drives
   every chain the same way.
@@ -98,6 +105,20 @@ fork object, with its `limits` and `devAccounts` left out here:
 ```
 
 The `hypercore` field appears only on HyperEVM forks. Prices are in the precompiles' raw units.
+`up` also takes one order book per seeded perp from the Hyperliquid info API and lists them under
+`hypercore.core`. From the 2026-11-02 run, shortened to BTC:
+
+```json
+"core": {
+  "books": [
+    { "coin": "BTC", "perp": 0, "bestBid": "78257.0", "bestAsk": "78258.0", "bidLevels": 20, "askLevels": 20, "time": 1793600049698 }
+  ],
+  "infoCalls": 6,
+  "state": "0x9999999999999999999999999999999999999999"
+}
+```
+
+The copy keeps its Core state at `0x9999…9999`, so a snapshot holds it with everything else.
 
 `selftest` checks nine parts, the six every EVM chain has and three for HyperEVM:
 
@@ -150,6 +171,8 @@ chainsim set hyperevm-mainnet hypercore price 0 650000
 {
   "kind": "hypercore",
   "helper": "price",
+  "perp": 0,
+  "px": 650000,
   "sets": [
     { "kind": "precompile", "address": "0x0000000000000000000000000000000000000806", "calldata": "0x0000000000000000000000000000000000000000000000000000000000000000", "result": "0x000000000000000000000000000000000000000000000000000000000009eb10", "source": "given" },
     { "kind": "precompile", "address": "0x0000000000000000000000000000000000000807", "calldata": "0x0000000000000000000000000000000000000000000000000000000000000000", "result": "0x000000000000000000000000000000000000000000000000000000000009eb10", "source": "given" }
@@ -158,23 +181,26 @@ chainsim set hyperevm-mainnet hypercore price 0 650000
 }
 ```
 
-The same `eth_call` then returns `0x…09eb10`, which is 650000.
+The same `eth_call` then returns `0x…09eb10`, which is 650000. The new mark also reprices every
+position on the copy, so margin and withdrawable answers follow it.
 
 - `set <name> hypercore spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>]`
-  sets a user's HyperCore spot balance at `0x801`, in the token's raw units on HyperCore. USDC is
-  token 0, with 8 decimals there, so this gives `0x0000…c0ffee` 5 USDC:
+  sets a user's spot balance in the copy's Core state, in the token's raw units on HyperCore.
+  USDC is token 0, with 8 decimals there, so this gives `0x0000…c0ffee` 5 USDC:
 
   ```sh
   chainsim set hyperevm-mainnet hypercore spot-balance 0x0000000000000000000000000000000000c0ffee 0 500000000
   ```
 
 - `set <name> hypercore position <user> <perp> <szi> <entryNtl> [--leverage <n>]
-  [--isolated-raw-usd <n>] [--isolated]` sets a user's perp position at `0x800`. A negative `szi`
-  is a short.
+  [--isolated-raw-usd <n>] [--isolated]` sets a user's perp position in the copy's Core state.
+  A negative `szi` is a short.
 - `set <name> precompile <address> <calldata> --result <hex>` stores any other answer, for any
   precompile from `0x800` to `0x813`.
 
-A query nobody seeded reverts with a reason that names the fix. The oracle price of perp 2:
+Spot balance, position, withdrawable and margin summary reads answer for any user, with zeros
+for an account the copy has no Core state for. A price or info query nobody seeded reverts with a
+reason that names the fix. The oracle price of perp 2:
 
 ```json
 {
@@ -206,6 +232,125 @@ chainsim set hyperevm-mainnet precompile 0x807 0x0000000000000000000000000000000
 
 Every `set precompile` and `set hypercore` is listed under `status` modifications.
 
+## Local HyperCore
+
+chainsim keeps HyperCore state for the copy: spot balances, perp positions with cross margin, and
+open orders, per account. It applies each CoreWriter action and bridge transfer in block order
+when a chainsim command runs on the fork, and an action takes effect from the block after its
+own, as on mainnet.
+
+### Mirror a mainnet account
+
+`set hypercore mirror <user>` copies an account's perp positions, margin and spot balances from
+the info API, and its HYPE and token balances on the EVM side. This mirrors one of HLP's strategy
+vaults:
+
+```sh
+chainsim set hyperevm-mainnet hypercore mirror 0x010461c14e146ac35fe42271bdc1134ee31c703a
+```
+
+```json
+{
+  "kind": "hypercore",
+  "helper": "mirror",
+  "user": "0x010461C14e146ac35Fe42271BDC1134EE31C703a",
+  "positions": 177,
+  "spotBalances": 0,
+  "accountValue": "3043939.222041",
+  "evm": [
+    { "asset": "HYPE", "amount": "0.00185249" },
+    { "asset": "USDC", "amount": "0" }
+  ],
+  "skipped": [],
+  "infoCalls": 3,
+  "upstreamCalls": 6,
+  "note": "This result depends on a chainsim override that does not exist on mainnet (impersonation or a state change). chainsim status <name> lists every modification until down."
+}
+```
+
+The `evm` list is shortened here. The vault's BTC position then reads back through `0x800` from
+a contract, and `send --as` the vault address acts as it.
+
+### Orders
+
+A limit order sent through CoreWriter matches against the order book snapshot, best price first,
+and against orders resting on the copy. Each fill takes depth off the book, so a second order
+fills deeper. A GTC remainder rests, an IOC remainder is dropped, and an ALO order that would
+cross is rejected. A cancel by order id or client order id removes a resting order. Orders check
+the account's withdrawable margin at the order's leverage, 20 or the perp's maximum if lower.
+
+This run gave `0x0000…c0ffee` 1,000 USDC on spot, moved 500 USD to perp with a USD class
+transfer, bought 0.001 BTC with an IOC order above the ask, and left a GTC bid at 70,000.
+`call corewriter_actions` shows each action with its `result`:
+
+```json
+[
+  { "block": 50165643, "action": "usdClassTransfer", "fields": { "ntl": "500000000", "toPerp": true }, "result": "moved 500.0 USD to perp" },
+  { "block": 50165644, "action": "limitOrder", "fields": { "asset": "0", "isBuy": true, "limitPx": "7904058000000", "sz": "100000", "reduceOnly": false, "encodedTif": "3", "cloid": "0" }, "result": "filled 0.001 at 78258.0" },
+  { "block": 50165645, "action": "limitOrder", "fields": { "asset": "0", "isBuy": true, "limitPx": "7000000000000", "sz": "100000", "reduceOnly": false, "encodedTif": "2", "cloid": "77" }, "result": "0.001 resting as oid 1" }
+]
+```
+
+Each entry also carries `txHash`, `logIndex`, `user`, `version` and `actionId`. The IOC filled at
+78,258, the best ask in the book `up` took.
+
+### Core state
+
+`call <name> hypercore_state <user>` returns an account's Core state in the info API's own
+shapes, `clearinghouseState` and `spotClearinghouseState`, plus `openOrders`:
+
+```sh
+chainsim call hyperevm-mainnet hypercore_state 0x0000000000000000000000000000000000c0ffee
+```
+
+```json
+{
+  "user": "0x0000000000000000000000000000000000C0FFEE",
+  "clearinghouseState": {
+    "marginSummary": { "accountValue": "486.742", "totalNtlPos": "65.0", "totalRawUsd": "421.742", "totalMarginUsed": "3.25" },
+    "withdrawable": "479.992",
+    "assetPositions": [
+      {
+        "type": "oneWay",
+        "position": {
+          "coin": "BTC", "szi": "0.001", "leverage": { "type": "cross", "value": 20 }, "entryPx": "78258.0",
+          "positionValue": "65.0", "unrealizedPnl": "-13.258", "returnOnEquity": "-3.3882797924", "liquidationPx": null,
+          "marginUsed": "3.25", "maxLeverage": 40, "cumFunding": { "allTime": "0.0", "sinceOpen": "0.0", "sinceChange": "0.0" }
+        }
+      }
+    ],
+    "time": 1793600069000
+  },
+  "spotClearinghouseState": {
+    "balances": [
+      { "coin": "USDC", "token": 0, "total": "500.0", "hold": "0.0", "entryNtl": "0.0" },
+      { "coin": "HYPE", "token": 150, "total": "2.0", "hold": "0.0", "entryNtl": "0.0" }
+    ]
+  },
+  "openOrders": [
+    { "coin": "BTC", "asset": 0, "side": "B", "limitPx": "70000.0", "sz": "0.001", "oid": 1, "cloid": "0x0000000000000000000000000000004d", "tif": "Gtc" }
+  ]
+}
+```
+
+`crossMarginSummary` and `crossMaintenanceMarginUsed` are left out here. The BTC mark had been
+set to 65,000 earlier in the run with `set hypercore price`, so the position shows a loss against
+its 78,258 entry. The same figures answer the `0x800`, `0x801`, `0x803` and `0x80f` precompiles.
+
+`set hypercore book <coin> --live` takes a fresh book for one perp from the info API, by name or
+index, and replaces the one fills have consumed.
+
+### Bridging
+
+- HYPE sent to `0x2222222222222222222222222222222222222222` credits the sender's Core spot HYPE.
+  In the run above, `send --as 0x0000…c0ffee --to 0x2222…2222 --value 2` gave the 2.0 HYPE in
+  the balances.
+- An ERC-20 linked to a spot token, sent to that token's system address (`0x20` followed by
+  zeros and the token index), credits the sender's Core spot balance of it.
+- A spot send to a system address debits Core and credits the sender's EVM balance. A spot send
+  of 1 HYPE to `0x2222…2222` left 1.0 HYPE on Core and raised the EVM balance by 1 HYPE, less the
+  gas of the transaction that sent the action.
+
 ## CoreWriter actions
 
 CoreWriter at `0x3333333333333333333333333333333333333333` keeps its mainnet code and emits
@@ -214,7 +359,9 @@ block, or since `[{"fromBlock": <n>}]`, and decodes them: the sender, the versio
 and name, and the action's fields, with integers as decimal strings. An action id chainsim does
 not know comes back as `raw` hex.
 
-This sends a limit order for perp 0 as `0x0000…c0ffee`, then reads it back:
+This sends a limit order for perp 0 as `0x0000…c0ffee`, then reads it back. The output below is
+from the 2026-11-01 run, before the local HyperCore. Today each entry also carries a `result`,
+as in [Orders](#orders):
 
 ```sh
 chainsim send hyperevm-mainnet --as 0x0000000000000000000000000000000000c0ffee \
@@ -241,7 +388,9 @@ chainsim call hyperevm-mainnet corewriter_actions
 chainsim decodes action ids 1 to 13, 15 and 16: limit order, vault transfer, token delegate,
 staking deposit and withdraw, spot send, USD class transfer, finalize EVM contract, add API
 wallet, cancel by order id and by client order id, approve builder fee, send asset, borrow and
-lend, and set abstraction. `status` counts the captured actions as `hypercore.coreWriterActions`.
+lend, and set abstraction. Limit orders, cancels, spot sends and USD class transfers change Core
+state, and the others are recorded only. `status` counts the captured actions as
+`hypercore.coreWriterActions`.
 
 ## Fund
 
@@ -313,15 +462,16 @@ chainsim revert hyperevm-mainnet 0x2
 { "reverted": "0x2", "snapshot": "0x3" }
 ```
 
-The HyperCore answers live in the mock contracts' storage, so a snapshot includes them. In the
-run above, the BTC oracle price was set to 1 after the snapshot, and `revert` brought it back to
-650000. As on every chain, `revert` consumes its id and returns a fresh snapshot of the restored
+The HyperCore answers live in the mock contracts' storage and Core state at `0x9999…9999`, so a
+snapshot includes them. In the 2026-11-01 run, the BTC oracle price was set to 1 after the
+snapshot, and `revert` brought it back to 650000. In the 2026-11-02 run, an IOC buy after the
+snapshot moved the position, and after `revert` `hypercore_state` matched what it was before. As on every chain, `revert` consumes its id and returns a fresh snapshot of the restored
 state.
 
 ## Call
 
 `call` sends any JSON-RPC method to the fork, as on the other EVM chains, and adds
-`corewriter_actions`. A precompile answers `eth_call` like any contract, since the mock is
+`corewriter_actions` and `hypercore_state`. A precompile answers `eth_call` like any contract, since the mock is
 ordinary code on the fork.
 
 ## Status and clean up
@@ -331,16 +481,22 @@ chainsim status hyperevm-mainnet
 chainsim down hyperevm-mainnet
 ```
 
-`status` adds the head block, the captured CoreWriter action count and the `modifications`
-list, every `send --as` and `set` since `up`. Shortened here:
+`status` adds the head block, the captured CoreWriter action count, a summary of Core state and
+the `modifications` list, every `send --as` and `set` since `up`. From the 2026-11-02 run,
+shortened here:
 
 ```json
 {
-  "head": 50151647,
-  "uptimeSecs": 21,
-  "hypercore": { "coreWriterActions": 1, "seeded": 17 },
+  "head": 50165647,
+  "uptimeSecs": 36,
+  "hypercore": {
+    "seeded": 17,
+    "coreWriterActions": 5,
+    "coreState": { "accounts": 2, "openOrders": 0, "books": ["BTC", "ETH", "SOL", "HYPE"], "appliedThrough": 50165647 }
+  },
   "modifications": [
-    { "kind": "set-precompile", "address": "0x0000000000000000000000000000000000000801", "calldata": "0x0000000000000000000000000000000000000000000000000000000000c0ffee0000000000000000000000000000000000000000000000000000000000000000", "result": "0x000000000000000000000000000000000000000000000000000000001dcd650000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", "source": "given", "at": 1793586289 }
+    { "kind": "set-hypercore", "helper": "price", "perp": 0, "px": 650000, "at": 1793600051 },
+    { "kind": "set-hypercore", "helper": "mirror", "user": "0x010461C14e146ac35Fe42271BDC1134EE31C703a", "positions": 177, "at": 1793600054 }
   ]
 }
 ```
