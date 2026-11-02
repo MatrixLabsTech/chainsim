@@ -186,7 +186,8 @@ mod tests {
         assert!(epilog().contains("hyperevm-mainnet") && epilog().contains("chainsim chains"));
     }
 
-    /// The README's Supported chains table: (chain key, engine cell) per row.
+    /// The README's Supported chains table: (chain key, engine cell) per row. It lists mainnet
+    /// forks only, and testnet profiles are on their chain pages.
     fn readme_rows(readme: &str) -> Vec<(String, String)> {
         let section = readme.split("## Supported chains").nth(1).expect("a Supported chains section").split("\n## ").next().unwrap();
         section
@@ -205,7 +206,7 @@ mod tests {
         let rows = readme_rows(readme);
         let mut bad = Vec::new();
         let mut keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
-        let mut want: Vec<&str> = d["chains"].as_array().unwrap().iter().map(|c| c["chain"].as_str().unwrap()).collect();
+        let mut want: Vec<&str> = d["chains"].as_array().unwrap().iter().map(|c| c["chain"].as_str().unwrap()).filter(|k| k.ends_with("-mainnet")).collect();
         keys.sort();
         want.sort();
         if keys != want {
