@@ -504,7 +504,8 @@ fn hyperevm_local_hypercore() {
     let fork = ok(&["up", "hyperevm-mainnet", "--name", name]);
     println!("up: {:.1} s", t.elapsed().as_secs_f64());
     let core = &fork["hypercore"]["core"];
-    assert_eq!(core["infoCalls"], 6, "{core}");
+    // metaAndAssetCtxs, spotMeta, and an l2Book and a fundingHistory per seeded perp.
+    assert_eq!(core["infoCalls"], 10, "{core}");
     let btc = core["books"].as_array().unwrap().iter().find(|b| b["coin"] == "BTC").cloned().unwrap();
     let (best_bid, best_ask) = (fixed(btc["bestBid"].as_str().unwrap(), 8), fixed(btc["bestAsk"].as_str().unwrap(), 8));
     assert!(best_bid > 0 && best_ask > best_bid, "{btc}");
@@ -546,7 +547,7 @@ fn hyperevm_local_hypercore() {
     let t = Instant::now();
     let ioc = send_action(name, &wallet, &limit_order(0, true, (best_ask * 101 / 100) as u64, 100_000, false, 3, 0));
     println!("IOC buy: {:.1} s, {}", t.elapsed().as_secs_f64(), ioc["result"]);
-    assert_eq!(ioc["result"], json!(format!("filled 0.001 at {}", btc["bestAsk"].as_str().unwrap())), "{ioc}");
+    assert!(ioc["result"].as_str().unwrap().starts_with(&format!("filled 0.001 at {}, fee ", btc["bestAsk"].as_str().unwrap())), "{ioc}");
     assert_eq!(read_btc_szi(name, reader, &wallet), 100);
     let state = ok(&["call", name, "hypercore_state", &wallet]);
     assert_eq!(btc_position(&state).unwrap()["szi"], "0.001");
@@ -586,6 +587,102 @@ fn hyperevm_local_hypercore() {
 
     let status = ok(&["status", name]);
     println!("status hypercore: {}", status["hypercore"]["coreState"]);
+    ok(&["down", name]);
+    assert_gone(name);
+    println!("whole run: {:.1} s", started.elapsed().as_secs_f64());
+}
+
+/// A wallet with 500 USD of perp margin on the copy's HyperCore.
+fn margin_wallet(name: &str, tag: u64) -> String {
+    use chainsim_evm::hypercore::{encode_action, word_u};
+    let wallet = fresh_address(tag);
+    ok(&["fund", name, &wallet, "--native", "1"]);
+    ok(&["set", name, "hypercore", "spot-balance", &wallet, "0", "100000000000"]);
+    let moved = send_action(name, &wallet, &encode_action(7, &[word_u(500_000_000), word_u(1)].concat()));
+    assert_eq!(moved["result"], "moved 500.0 USD to perp", "{moved}");
+    wallet
+}
+
+fn history(name: &str, user: &str) -> Vec<String> {
+    let state = ok(&["call", name, "hypercore_state", user]);
+    state["history"].as_array().unwrap().iter().map(|h| h["event"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+#[ignore]
+fn hyperevm_market_scripting() {
+    use chainsim_evm::hypercore::limit_order;
+    let name = "acc-market";
+    chainsim(&["down", name]);
+    let started = Instant::now();
+
+    let t = Instant::now();
+    let fork = ok(&["up", "hyperevm-mainnet", "--name", name]);
+    println!("up: {:.1} s, {} info calls", t.elapsed().as_secs_f64(), fork["hypercore"]["core"]["infoCalls"]);
+    let core = &fork["hypercore"]["core"];
+    println!("funding at up: {}", core["funding"]);
+    let btc = core["books"].as_array().unwrap().iter().find(|b| b["coin"] == "BTC").cloned().unwrap();
+    let (best_bid, best_ask) = (fixed(btc["bestBid"].as_str().unwrap(), 8), fixed(btc["bestAsk"].as_str().unwrap(), 8));
+    let reader = "0x000000000000000000000000000000000000c0de";
+    ok(&["set", name, "code", reader, POSITION_READER]);
+
+    // A 0.1 BTC long at about 16x, and a resting bid 8% under the book.
+    let long = margin_wallet(name, 31);
+    let ioc = send_action(name, &long, &limit_order(0, true, (best_ask * 101 / 100) as u64, 10_000_000, false, 3, 0));
+    let r = ioc["result"].as_str().unwrap();
+    assert!(r.starts_with(&format!("filled 0.1 at {}, fee ", btc["bestAsk"].as_str().unwrap())), "{ioc}");
+    assert_eq!(read_btc_szi(name, reader, &long), 10_000);
+    let bidder = margin_wallet(name, 32);
+    let bid_px = best_bid * 92 / 100 / 100_000_000 * 100_000_000;
+    let gtc = send_action(name, &bidder, &limit_order(0, true, bid_px as u64, 1_000_000, false, 2, 0));
+    assert!(gtc["result"].as_str().unwrap().contains("resting as oid"), "{gtc}");
+
+    // A 10% drop: the bid fills as the price falls through it, and the long is liquidated.
+    let drop_raw = (best_ask * 90 / 100 / 100_000_000) * 10;
+    let t = Instant::now();
+    let moved = ok(&["set", name, "hypercore", "price", "0", &drop_raw.to_string()]);
+    println!("price drop: {:.1} s, {moved}", t.elapsed().as_secs_f64());
+    assert_eq!(moved["filled"], 1, "{moved}");
+    assert_eq!(moved["liquidated"].as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_lowercase()).collect::<Vec<_>>(), [long.to_lowercase()]);
+    assert_eq!(read_btc_szi(name, reader, &long), 0);
+    assert!(history(name, &long).last().unwrap().starts_with("liquidated: account value"), "{:?}", history(name, &long));
+    assert_eq!(read_btc_szi(name, reader, &bidder), 1_000);
+    assert!(history(name, &bidder).iter().any(|h| h.contains("as the price moved to")), "{:?}", history(name, &bidder));
+
+    // Funding accrues once the clock passes an hour boundary.
+    ok(&["set", name, "hypercore", "funding", "0", "0.0001"]);
+    ok(&["time", name, "--advance", "3600"]);
+    let state = ok(&["call", name, "hypercore_state", &bidder]);
+    let cum = &btc_position(&state).unwrap()["cumFunding"]["sinceOpen"];
+    assert!(fixed(cum.as_str().unwrap(), 6) > 0, "{state}");
+    assert!(history(name, &bidder).iter().any(|h| h.starts_with("funding on BTC at rate 0.0001: paid")));
+
+    // Replay a past day of BTC candles: the mark ends at the last close.
+    let day = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / 86_400;
+    let (from, to) = (((day - 2) * 86_400).to_string(), ((day - 1) * 86_400).to_string());
+    let t = Instant::now();
+    let replay = ok(&["time", name, "--replay", "BTC", "--from", &from, "--to", &to]);
+    println!("replay: {:.1} s, {replay}", t.elapsed().as_secs_f64());
+    assert!(replay["candles"].as_u64().unwrap() >= 24, "{replay}");
+    assert_eq!(replay["infoCalls"], 1);
+    let mark = ok(&["call", name, "eth_call", &json!([{ "to": "0x0000000000000000000000000000000000000806", "data": word(0) }, "latest"]).to_string()]);
+    let mark = u64::from_str_radix(mark.as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+    assert_eq!(json!(mark), replay["markPx"]);
+    assert_eq!(fixed(replay["lastClose"].as_str().unwrap(), 1) as u64, mark);
+
+    // Snapshot, a price move, revert: positions and margin are as before.
+    let core_of = |s: Value| {
+        let mut s = s;
+        s["clearinghouseState"]["time"] = json!(0);
+        s
+    };
+    let snap = ok(&["snapshot", name]);
+    let held = core_of(ok(&["call", name, "hypercore_state", &bidder]));
+    ok(&["set", name, "hypercore", "price", "0", &(mark / 2).to_string()]);
+    assert_ne!(core_of(ok(&["call", name, "hypercore_state", &bidder])), held);
+    ok(&["revert", name, snap["id"].as_str().unwrap()]);
+    assert_eq!(core_of(ok(&["call", name, "hypercore_state", &bidder])), held);
+
     ok(&["down", name]);
     assert_gone(name);
     println!("whole run: {:.1} s", started.elapsed().as_secs_f64());
