@@ -21,7 +21,7 @@
   "selftest": { "token": "PURR", "extras": ["chain-id", "hypercore", "corewriter"] },
   "hypercore": {
     "perps": [3, 4, 0, 135],
-    "tokens": [0, 1105],
+    "tokens": [0, 1105, 1],
     "spots": [1035],
     "info": { "default": "https://api.hyperliquid-testnet.xyz/info", "env": "CHAINSIM_HYPERLIQUID_TESTNET_INFO" },
     "hypeToken": 1105

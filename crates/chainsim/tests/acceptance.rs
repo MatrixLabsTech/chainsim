@@ -731,7 +731,7 @@ fn hyperevm_proxy() {
     println!("up: {:.1} s", t.elapsed().as_secs_f64());
     let (network, rpc) = (fork["network"].as_str().unwrap().to_string(), fork["rpcUrl"].as_str().unwrap().to_string());
     assert_eq!(rpc, format!("http://{name}:8545"));
-    assert_eq!(fork["wsUrl"], format!("ws://{name}-engine:8545"));
+    assert_eq!(fork["wsUrl"], format!("ws://{name}:8545"));
     let roles = docker(&["ps", "--filter", &format!("label=org.chainsim.fork={name}"), "--format", "{{.Label \"org.chainsim.role\"}}"]);
     let mut roles: Vec<&str> = roles.lines().collect();
     roles.sort();
@@ -970,6 +970,31 @@ fn hyperevm_testnet() {
     assert_eq!(sent["status"], 1);
     let state = ok(&["call", name, "hypercore_state", ADDR_A]);
     assert!(state["spotClearinghouseState"]["balances"].as_array().unwrap().iter().any(|b| b["token"] == 1105 && b["total"] == "1.0"), "{state}");
+
+    // The PURR bridge both ways: 10 PURR sent to its system address (token 1)
+    // credits Core spot, and a spot send of 4 back credits the ERC-20.
+    let t = Instant::now();
+    ok(&["fund", name, ADDR_A, "--token", "PURR:100"]);
+    let purr = "0xa9056c15938f9aff34cd497c722ce33db0c2fd57";
+    let purr_of = |who: &str| -> u128 {
+        let out = cast(&network, &format!("cast call --rpc-url {rpc} {purr} 'balanceOf(address)(uint256)' {who}"));
+        out.split_whitespace().next().unwrap().parse().unwrap()
+    };
+    let one = 10u128.pow(18);
+    assert_eq!(purr_of(ADDR_A), 100 * one);
+    let r: Value = serde_json::from_str(&cast(&network, &format!("cast send --rpc-url {rpc} --private-key {KEY_A} {purr} 'transfer(address,uint256)' 0x2000000000000000000000000000000000000001 {} --json", 10 * one))).unwrap();
+    assert_eq!(r["status"], "0x1", "{r}");
+    let core_purr = |who: &str| -> String {
+        let state = ok(&["call", name, "hypercore_state", who]);
+        state["spotClearinghouseState"]["balances"].as_array().unwrap().iter().find(|b| b["token"] == 1).map_or("0".into(), |b| b["total"].as_str().unwrap().to_string())
+    };
+    assert_eq!(core_purr(ADDR_A), "10.0");
+    // 0x801 reads the Core balance: 10 PURR in weiDecimals 5.
+    assert_eq!(precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000801", &user_word(ADDR_A, 1), 0), 1_000_000);
+    cast_action(&network, &rpc, KEY_A, &chainsim_evm::hypercore::encode_action(6, &[chainsim_evm::hypercore::word_addr("0x2000000000000000000000000000000000000001".parse().unwrap()), chainsim_evm::hypercore::word_u(1), chainsim_evm::hypercore::word_u(400_000)].concat()));
+    assert_eq!(core_purr(ADDR_A), "6.0");
+    assert_eq!(purr_of(ADDR_A), 94 * one);
+    println!("PURR bridge round trip: {:.1} s", t.elapsed().as_secs_f64());
     ok(&["down", name]);
     assert_gone(name);
     println!("whole run: {:.1} s", started.elapsed().as_secs_f64());
@@ -977,4 +1002,233 @@ fn hyperevm_testnet() {
 
 fn alloy_hex(s: &str) -> String {
     s.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A WebSocket JSON-RPC client in plain Python, run on the fork's network:
+/// `heads <url>` subscribes to newHeads and mines three blocks over the same
+/// socket, `time <url>` times 200 eth_chainId round trips (microseconds each).
+const WS_CLIENT: &str = r#"
+import base64, json, os, socket, struct, sys, time
+from urllib.parse import urlparse
+def conn(url):
+    u = urlparse(url)
+    s = socket.create_connection((u.hostname, u.port or 80), timeout=30)
+    key = base64.b64encode(os.urandom(16)).decode()
+    s.sendall(f"GET / HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode())
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        buf += s.recv(4096)
+    head, rest = buf.split(b"\r\n\r\n", 1)
+    assert b" 101 " in head.split(b"\r\n")[0], head
+    return [s, rest]
+def send(c, obj):
+    data = json.dumps(obj).encode()
+    mask = os.urandom(4)
+    n = len(data)
+    hdr = bytes([0x81]) + (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n))
+    c[0].sendall(hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+def need(c, n):
+    while len(c[1]) < n:
+        d = c[0].recv(65536)
+        if not d:
+            raise EOFError
+        c[1] += d
+    out, c[1] = c[1][:n], c[1][n:]
+    return out
+def recv(c):
+    while True:
+        b0, b1 = need(c, 2)
+        n = b1 & 0x7f
+        if n == 126:
+            n = struct.unpack(">H", need(c, 2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", need(c, 8))[0]
+        data = need(c, n)
+        if b0 & 0x0f == 1:
+            return json.loads(data)
+        if b0 & 0x0f == 8:
+            raise EOFError
+def call(c, method, params, i):
+    send(c, {"jsonrpc": "2.0", "id": i, "method": method, "params": params})
+    notes = []
+    while True:
+        m = recv(c)
+        if m.get("id") == i:
+            return m, notes
+        notes.append(m)
+mode, url = sys.argv[1], sys.argv[2]
+c = conn(url)
+if mode == "heads":
+    r, _ = call(c, "eth_subscribe", ["newHeads"], 1)
+    sub = r["result"]
+    heads = []
+    def take(notes):
+        heads.extend(n["params"]["result"]["number"] for n in notes if n.get("params", {}).get("subscription") == sub)
+    for i in range(3):
+        take(call(c, "evm_mine", [], 10 + i)[1])
+    end = time.time() + 5
+    while len(heads) < 3 and time.time() < end:
+        take([recv(c)])
+    bn, notes = call(c, "eth_blockNumber", [], 20)
+    take(notes)
+    print(json.dumps({"subscription": sub, "heads": heads, "blockNumber": bn["result"]}))
+else:
+    call(c, "eth_chainId", [], 0)
+    t = time.perf_counter()
+    for i in range(200):
+        call(c, "eth_chainId", [], i + 1)
+    print(round((time.perf_counter() - t) / 200 * 1e6))
+"#;
+
+fn ws_client(network: &str, args: &[&str]) -> String {
+    let out = Command::new("docker").args(["run", "--rm", "--network", network, "python:3.12-slim", "python", "-c", WS_CLIENT]).args(args).output().expect("docker");
+    assert!(out.status.success(), "ws client {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+#[ignore]
+fn hyperevm_websocket() {
+    use chainsim_evm::hypercore::{encode_action, limit_order, word_u};
+    let name = "acc-ws";
+    chainsim(&["down", name]);
+    let started = Instant::now();
+    let fork = ok(&["up", "hyperevm-mainnet", "--name", name]);
+    let (network, rpc, ws) = (fork["network"].as_str().unwrap().to_string(), fork["rpcUrl"].as_str().unwrap().to_string(), fork["wsUrl"].as_str().unwrap().to_string());
+    assert_eq!(ws, format!("ws://{name}:8545"));
+
+    // newHeads through wsUrl sees the blocks mined over the same socket.
+    let heads: Value = serde_json::from_str(&ws_client(&network, &["heads", &ws])).unwrap();
+    println!("newHeads: {heads}");
+    let numbers: Vec<u64> = heads["heads"].as_array().unwrap().iter().map(|h| u64::from_str_radix(h.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()).collect();
+    assert_eq!(numbers.len(), 3, "{heads}");
+    assert!(numbers.windows(2).all(|w| w[1] == w[0] + 1));
+    assert_eq!(format!("0x{:x}", numbers[2]), heads["blockNumber"].as_str().unwrap());
+
+    // A CoreWriter IOC sent with cast over the WebSocket: Core is current at the next read.
+    ok(&["set", name, "balance", ADDR_A, "10"]);
+    ok(&["set", name, "hypercore", "spot-balance", ADDR_A, "0", "100000000000"]);
+    cast_action(&network, &ws, KEY_A, &encode_action(7, &[word_u(500_000_000), word_u(1)].concat()));
+    let btc = fork["hypercore"]["core"]["books"].as_array().unwrap().iter().find(|b| b["coin"] == "BTC").cloned().unwrap();
+    let best_ask = fixed(btc["bestAsk"].as_str().unwrap(), 8);
+    let a = cast_action(&network, &ws, KEY_A, &limit_order(0, true, (best_ask * 101 / 100) as u64, 100_000, false, 3, 0));
+    let block = u64::from_str_radix(a["blockNumber"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+    assert_eq!(precompile_word(&network, &ws, "0x0000000000000000000000000000000000000800", &user_word(ADDR_A, 0), 0), 100);
+    assert_eq!(precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000800", &user_word(ADDR_A, 0), 0), 100);
+    let ch = info(&network, &rpc, json!({ "type": "clearinghouseState", "user": ADDR_A }));
+    assert_eq!(ch["assetPositions"][0]["position"]["szi"], "0.001", "{ch}");
+    println!("WebSocket IOC in block {block}: Core current");
+
+    // Overhead per WebSocket request, against the engine's own socket.
+    let via: u64 = ws_client(&network, &["time", &ws]).parse().unwrap();
+    let direct: u64 = ws_client(&network, &["time", &format!("ws://{name}-engine:8545")]).parse().unwrap();
+    println!("eth_chainId over WebSocket: {via} us through the proxy, {direct} us direct");
+
+    // How long a client's request waits behind a chainsim command holding the lease.
+    let probe = format!("chainsim-{name}-probe");
+    let _ = Command::new("docker").args(["rm", "-f", &probe]).output();
+    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": [] }).to_string();
+    let script = format!("end=$(( $(date +%s) + 45 )); while [ $(date +%s) -lt $end ]; do curl -s -o /dev/null -w '%{{time_total}}\n' -X POST -H 'content-type: application/json' --data-raw '{body}' {rpc}; sleep 0.05; done");
+    docker(&["run", "-d", "--name", &probe, "--network", &network, "--entrypoint", "sh", CURL, "-c", &script]);
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let t = Instant::now();
+    let day = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() / 86_400;
+    let (from, to) = (((day - 2) * 86_400).to_string(), ((day - 1) * 86_400).to_string());
+    ok(&["time", name, "--replay", "BTC", "--from", &from, "--to", &to]);
+    ok(&["set", name, "hypercore", "book", "BTC", "--live"]);
+    println!("replay and book refresh under load: {:.1} s", t.elapsed().as_secs_f64());
+    let _ = Command::new("docker").args(["wait", &probe]).output();
+    let logs = docker(&["logs", &probe]);
+    docker(&["rm", "-f", &probe]);
+    let mut ms: Vec<f64> = logs.lines().filter_map(|l| l.trim().parse::<f64>().ok()).map(|s| s * 1000.0).collect();
+    ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert!(ms.len() > 50, "{} probes", ms.len());
+    let pct = |p: f64| ms[((ms.len() - 1) as f64 * p) as usize];
+    println!("eth_blockNumber while commands run: {} requests, p50 {:.1} ms, p95 {:.1} ms, max {:.1} ms", ms.len(), pct(0.5), pct(0.95), ms[ms.len() - 1]);
+
+    ok(&["down", name]);
+    assert_gone(name);
+    println!("whole run: {:.1} s", started.elapsed().as_secs_f64());
+}
+
+#[test]
+#[ignore]
+fn hyperevm_lend_liquidation_and_isolated_margin() {
+    use chainsim_evm::hypercore::{encode_action, limit_order, word_addr, word_u};
+    let name = "acc-phase4";
+    chainsim(&["down", name]);
+    let started = Instant::now();
+    let fork = ok(&["up", "hyperevm-mainnet", "--name", name]);
+    let (network, rpc) = (fork["network"].as_str().unwrap().to_string(), fork["rpcUrl"].as_str().unwrap().to_string());
+
+    // HYPE collateral follows the HYPE perp: B supplies 10 HYPE and borrows 5.5 x its price in USDC.
+    let reserve = |token: u64| info(&network, &rpc, json!({ "type": "borrowLendReserveState", "token": token }));
+    let px = fixed(reserve(150)["oraclePx"].as_str().unwrap(), 8);
+    println!("HYPE collateral price at up: {}", reserve(150)["oraclePx"]);
+    ok(&["set", name, "balance", ADDR_B, "10"]);
+    ok(&["set", name, "hypercore", "spot-balance", ADDR_B, "150", "1000000000"]);
+    cast_action(&network, &rpc, KEY_B, &encode_action(15, &[word_u(0), word_u(150), word_u(0)].concat()));
+    cast_action(&network, &rpc, KEY_B, &encode_action(16, &[word_addr(ADDR_B.parse().unwrap()), word_u(3)].concat()));
+    let borrow_wei = (px * 55 / 10) as u64 / 100_000_000 * 100_000_000;
+    cast_action(&network, &rpc, KEY_B, &encode_action(6, &[word_addr(ADDR_A.parse().unwrap()), word_u(0), word_u(borrow_wei as u128)].concat()));
+    assert_eq!(precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000811", &user_word(ADDR_B, 0), 1), borrow_wei as u128);
+    // HYPE (perp 159, szDecimals 2: raw prices carry 4 decimals) to 85%: healthy. To 65%: liquidated.
+    let raw = |pct: i128| (px * pct / 100 / 10_000).to_string();
+    let t = Instant::now();
+    let kept = ok(&["set", name, "hypercore", "price", "159", &raw(85)]);
+    assert!(kept["liquidated"].as_array().unwrap().is_empty(), "{kept}");
+    assert_eq!(fixed(reserve(150)["oraclePx"].as_str().unwrap(), 8), px * 85 / 100 / 10_000 * 10_000);
+    let moved = ok(&["set", name, "hypercore", "price", "159", &raw(65)]);
+    println!("HYPE price drops: {:.1} s, liquidated {}", t.elapsed().as_secs_f64(), moved["liquidated"]);
+    let liquidated: Vec<String> = moved["liquidated"].as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_lowercase()).collect();
+    assert_eq!(liquidated, [ADDR_B.to_lowercase()]);
+    let supplied = precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000811", &user_word(ADDR_B, 150), 3);
+    let borrowed = precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000811", &user_word(ADDR_B, 0), 1);
+    println!("after liquidation: {supplied} wei of HYPE supplied, {borrowed} wei of USDC borrowed");
+    assert!(supplied < 1_000_000_000 && supplied > 0 && borrowed < borrow_wei as u128);
+    let bl = info(&network, &rpc, json!({ "type": "borrowLendUserState", "user": ADDR_B }));
+    let hype = bl["tokenToState"].as_array().unwrap().iter().find(|t| t[0] == 150).cloned().unwrap();
+    assert_eq!(fixed(hype[1]["supply"]["value"].as_str().unwrap(), 8) as u128, supplied, "{bl}");
+    let line = history(name, ADDR_B).into_iter().find(|h| h.starts_with("liquidated: portfolio margin ratio")).expect("a lend liquidation line");
+    println!("B: {line}");
+
+    // An isolated xyz:HOOD long takes 50 USD of added margin, and the CoreWriter close after it returns that margin.
+    ok(&["set", name, "balance", ADDR_A, "10"]);
+    ok(&["set", name, "hypercore", "spot-balance", ADDR_A, "0", "200000000000"]);
+    cast_action(&network, &rpc, KEY_A, &encode_action(7, &[word_u(1_000_000_000), word_u(1)].concat()));
+    cast_action(&network, &rpc, KEY_A, &encode_action(13, &[word_addr(ADDR_A.parse().unwrap()), word_addr(Default::default()), word_u(0), word_u(1), word_u(0), word_u(60_000_000_000)].concat()));
+    let hood = ok(&["set", name, "hypercore", "book", "xyz:HOOD", "--live"]);
+    let hood_ask = fixed(hood["book"]["bestAsk"].as_str().unwrap(), 8);
+    let hood_bid = fixed(hood["book"]["bestBid"].as_str().unwrap(), 8);
+    let hood_d = info(&network, &rpc, json!({ "type": "meta", "dex": "xyz" }))["universe"][4]["szDecimals"].as_u64().unwrap() as u32;
+    let step = 10u128.pow(8 - hood_d);
+    let hood_sz = (10_000_000_000_000_000_000u128 / hood_ask as u128 / step * step) as u64;
+    cast_action(&network, &rpc, KEY_A, &limit_order(110_004, true, (hood_ask * 101 / 100) as u64, hood_sz, false, 3, 0));
+    let dex_usd = |who: &str| fixed(info(&network, &rpc, json!({ "type": "clearinghouseState", "user": who, "dex": "xyz" }))["withdrawable"].as_str().unwrap(), 6);
+    let before = dex_usd(ADDR_A);
+    let margin_of = || {
+        let ch = info(&network, &rpc, json!({ "type": "clearinghouseState", "user": ADDR_A, "dex": "xyz" }));
+        let p = ch["assetPositions"].as_array().unwrap().iter().find(|p| p["position"]["coin"] == "xyz:HOOD").cloned().unwrap();
+        fixed(p["position"]["marginUsed"].as_str().unwrap(), 6)
+    };
+    let m0 = margin_of();
+    let added = ok(&["set", name, "hypercore", "isolated-margin", ADDR_A, "10004", "+50"]);
+    println!("isolated margin: {}", added["status"]);
+    assert_eq!(margin_of(), m0 + 50_000_000);
+    assert_eq!(dex_usd(ADDR_A), before - 50_000_000);
+    let refused = chainsim(&["set", name, "hypercore", "isolated-margin", ADDR_A, "10004", "-100000"]);
+    assert_eq!(refused.code, 2, "{}", refused.stdout);
+    // The 0x813 position2 answer carries the added margin.
+    let iso = precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000813", &user_word(ADDR_A, 10_004), 2);
+    println!("0x813 isolated raw USD: {iso}");
+    assert!(iso >= 50_000_000);
+    let c = cast_action(&network, &rpc, KEY_A, &limit_order(110_004, false, (hood_bid * 99 / 100) as u64, hood_sz, true, 3, 0));
+    let actions = ok(&["call", name, "corewriter_actions"]);
+    let closed = actions.as_array().unwrap().iter().find(|x| x["txHash"] == c["transactionHash"]).cloned().unwrap();
+    println!("close: {}", closed["result"]);
+    assert!(dex_usd(ADDR_A) > before - 50_000_000 + m0 / 2, "the close returns the position's margin, the added 50 included");
+
+    ok(&["down", name]);
+    assert_gone(name);
+    println!("whole run: {:.1} s", started.elapsed().as_secs_f64());
 }
