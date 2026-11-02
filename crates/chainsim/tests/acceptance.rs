@@ -304,3 +304,139 @@ fn contract_exit_codes() {
     assert!(!out.stdout.contains("secret-key-123"));
     assert_eq!(out.json["data"]["upstream"]["set"], true);
 }
+
+/// A contract that reads a HyperCore oracle price the way Solidity callers
+/// do: it forwards its calldata (`abi.encode(uint32 perp)`) to 0x807 with
+/// STATICCALL, bubbles a revert up, and returns the 32-byte answer.
+const PRICE_READER: &str = concat!(
+    "0x",
+    "365f5f37",     // calldatacopy(0, 0, calldatasize)
+    "5f5f365f",     // retSize 0, retOffset 0, argsSize calldatasize, argsOffset 0
+    "6108075afa",   // staticcall(gas, 0x807, ...)
+    "3d5f5f3e",     // returndatacopy(0, 0, returndatasize)
+    "61001857",     // success: jump to 0x18
+    "3d5ffd",       // revert(0, returndatasize)
+    "5b3d602014",   // 0x18: returndatasize == 32
+    "61002457",     // yes: jump to 0x24
+    "5f5ffd",       // revert(0, 0)
+    "5b60205ff3",   // 0x24: return(0, 32)
+);
+
+/// The CoreDepositWallet, which holds USDC on HyperEVM Mainnet.
+const HYPEREVM_USDC_HOLDER: &str = "0x6B9E773128f453f5c2C60935Ee2DE2CBc5390A24";
+const HYPEREVM_USDC: &str = "0xb88339CB7199b77E23DB6E890353E22632Ba630f";
+
+fn word(n: u64) -> String {
+    format!("0x{n:064x}")
+}
+
+/// The oracle price the reader returns for a perp, or the failed call.
+fn read_price(name: &str, reader: &str, perp: u64) -> Result<u64, Out> {
+    let params = json!([{ "to": reader, "data": word(perp) }, "latest"]).to_string();
+    let out = chainsim(&["call", name, "eth_call", &params]);
+    if out.code != 0 {
+        return Err(out);
+    }
+    Ok(u64::from_str_radix(out.json["data"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap())
+}
+
+#[test]
+#[ignore]
+fn hyperevm_mainnet() {
+    let name = "acc-hyperevm";
+    chainsim(&["down", name]);
+
+    // --block on the default upstream: refused, and nothing is created.
+    let refused = chainsim_env(&["up", "hyperevm-mainnet", "--name", name, "--block", "1000000"], &[("CHAINSIM_HYPEREVM_MAINNET_RPC", "")]);
+    assert_eq!((refused.code, refused.json["error"]["code"].as_str()), (7, Some("latest_state_only")), "{}", refused.json);
+    assert!(refused.json["error"]["next"].as_str().unwrap().contains("CHAINSIM_HYPEREVM_MAINNET_RPC"));
+    assert_gone(name);
+
+    let t = Instant::now();
+    let fork = ok(&["up", "hyperevm-mainnet", "--name", name]);
+    println!("up: {:.1} s", t.elapsed().as_secs_f64());
+    assert_eq!(fork["chainId"], "eip155:999");
+    let hc = &fork["hypercore"];
+    assert_eq!(hc["seeded"], 17, "{hc}");
+    assert!(hc["l1BlockNumber"].as_u64().unwrap() > 0);
+    let coins: Vec<_> = hc["perps"].as_array().unwrap().iter().map(|p| p["coin"].as_str().unwrap().to_string()).collect();
+    assert_eq!(coins, ["BTC", "ETH", "SOL", "HYPE"]);
+    let btc_oracle: u64 = hc["perps"][0]["oraclePx"].as_str().unwrap().parse().unwrap();
+    println!("seeded: {hc}");
+    let t = Instant::now();
+    assert_eq!(ok(&["up", "hyperevm-mainnet", "--name", name])["hypercore"], *hc, "up on a running fork returns it as is");
+    println!("up of the running fork: {:.1} s", t.elapsed().as_secs_f64());
+    check_hardening(name, false);
+    let t = Instant::now();
+    check_selftest(name, &["chain-id", "hypercore", "corewriter"]);
+    println!("selftest: {:.1} s", t.elapsed().as_secs_f64());
+
+    // A contract that calls 0x807 reads the seeded price, then the one set.
+    let reader = "0x000000000000000000000000000000000000c0de";
+    ok(&["set", name, "code", reader, PRICE_READER]);
+    assert_eq!(read_price(name, reader, 0).ok(), Some(btc_oracle));
+    let set = ok(&["set", name, "hypercore", "price", "0", "123456"]);
+    assert_eq!(set["sets"].as_array().unwrap().len(), 2, "{set}");
+    assert_eq!(read_price(name, reader, 0).ok(), Some(123456));
+    let mark = ok(&["call", name, "eth_call", &json!([{ "to": "0x0000000000000000000000000000000000000806", "data": word(0) }, "latest"]).to_string()]);
+    assert_eq!(mark, json!(word(123456)));
+
+    // An unseeded query reverts with the chainsim reason, and --live copies the upstream's answer.
+    let unseeded = read_price(name, reader, 2).unwrap_err();
+    assert_eq!(unseeded.code, 1);
+    let reason = chainsim_evm::hypercore::UNSEEDED_REASON;
+    let reason_hex = alloy_hex(reason);
+    assert!(unseeded.stdout.contains(reason) || unseeded.stdout.contains(&reason_hex), "{}", unseeded.stdout);
+    let live = ok(&["set", name, "precompile", "0x807", &word(2), "--live"]);
+    assert_eq!(live["source"], "live");
+    let live_px = u64::from_str_radix(live["result"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+    assert!(live_px > 0);
+    assert_eq!(read_price(name, reader, 2).ok(), Some(live_px));
+
+    // fund, then send as a USDC holder.
+    let wallet = fresh_address(9);
+    let t = Instant::now();
+    let funded = ok(&["fund", name, &wallet, "--native", "10", "--token", "USDC:1000"]);
+    println!("fund: {:.1} s", t.elapsed().as_secs_f64());
+    let amounts: Vec<_> = funded["balances"].as_array().unwrap().iter().map(|b| (b["asset"].as_str().unwrap().to_string(), b["amount"].as_str().unwrap().to_string())).collect();
+    assert_eq!(amounts, vec![("HYPE".into(), "10".into()), ("USDC".into(), "1000".into())]);
+    let t = Instant::now();
+    let sent = ok(&["send", name, "--as", HYPEREVM_USDC_HOLDER, "--to", HYPEREVM_USDC, "--sig", "transfer(address,uint256)", &wallet, "250000000"]);
+    println!("send --as: {:.1} s", t.elapsed().as_secs_f64());
+    assert_eq!(sent["status"], 1);
+    let data = format!("0x70a08231{:0>64}", wallet.trim_start_matches("0x"));
+    let bal = ok(&["call", name, "eth_call", &json!([{ "to": HYPEREVM_USDC, "data": data }, "latest"]).to_string()]);
+    assert_eq!(u64::from_str_radix(bal.as_str().unwrap().trim_start_matches("0x"), 16).unwrap(), 1_250_000_000);
+
+    // A limit order sent through CoreWriter shows decoded.
+    let order = chainsim_evm::hypercore::limit_order(0, true, 900_000, 100, false, 2, 0);
+    let order_hex = chainsim_evm::hypercore::to_hex(&order);
+    let sent = ok(&["send", name, "--as", &wallet, "--to", "0x3333333333333333333333333333333333333333", "--sig", "sendRawAction(bytes)", &order_hex]);
+    assert_eq!(sent["status"], 1);
+    let actions = ok(&["call", name, "corewriter_actions"]);
+    let last = actions.as_array().unwrap().last().cloned().unwrap_or_default();
+    println!("corewriter_actions: {actions}");
+    assert_eq!(last["action"], "limitOrder");
+    assert_eq!(last["user"].as_str().unwrap().to_lowercase(), wallet.to_lowercase());
+    assert_eq!(last["fields"], json!({ "asset": "0", "isBuy": true, "limitPx": "900000", "sz": "100", "reduceOnly": false, "encodedTif": "2", "cloid": "0" }));
+    let status = ok(&["status", name]);
+    assert_eq!(status["hypercore"]["coreWriterActions"], 1);
+    let kinds: Vec<_> = status["modifications"].as_array().unwrap().iter().map(|m| m["kind"].as_str().unwrap().to_string()).collect();
+    assert!(kinds.contains(&"set-precompile".to_string()) && kinds.contains(&"send-as".to_string()), "{kinds:?}");
+
+    // Snapshot, a price set, revert: the old price is back.
+    let snap = ok(&["snapshot", name]);
+    ok(&["set", name, "hypercore", "price", "0", "999"]);
+    assert_eq!(read_price(name, reader, 0).ok(), Some(999));
+    let t = Instant::now();
+    ok(&["revert", name, snap["id"].as_str().unwrap()]);
+    println!("revert: {:.1} s", t.elapsed().as_secs_f64());
+    assert_eq!(read_price(name, reader, 0).ok(), Some(123456));
+
+    ok(&["down", name]);
+    assert_gone(name);
+}
+
+fn alloy_hex(s: &str) -> String {
+    s.bytes().map(|b| format!("{b:02x}")).collect()
+}
