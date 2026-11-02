@@ -266,7 +266,9 @@ impl Proxy {
         let state = coresync::load_state(&self.engine).await.map_err(internal)?.ok_or((StatusCode::SERVICE_UNAVAILABLE, "the copy has no HyperCore state yet".to_string()))?;
         let meta = {
             let mut cached = self.meta.lock().await;
-            if cached.as_ref().is_none_or(|m| m.universe.is_empty()) {
+            // The snapshot grows when a command adds a builder-deployed dex: reload for a dex it lacks.
+            let dex = body["dex"].as_str().unwrap_or("");
+            if cached.as_ref().is_none_or(|m| m.universe.is_empty() || (!dex.is_empty() && !m.dexes.contains_key(dex))) {
                 *cached = Some(coresync::load_meta(&self.engine).await.map_err(internal)?);
             }
             cached.clone().unwrap_or_default()
