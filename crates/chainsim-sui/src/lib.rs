@@ -964,6 +964,9 @@ impl Adapter for SuiAdapter {
                 )
             }
             SetKind::Object { fields, bcs } => self.set_object(&g, name, &req.address, fields, bcs.as_deref()).await?,
+            SetKind::Precompile { .. } => {
+                return Err(Error::unsupported("set precompile on Sui", "Sui has no precompiles: chainsim set <name> object <id> --field <name>=<value> changes an object's fields"));
+            }
             SetKind::Resource { .. } => {
                 return Err(Error::unsupported("set resource on Sui", "Sui keeps state in objects, not account resources: chainsim set <name> object <id> --field <name>=<value> changes an object's fields"));
             }

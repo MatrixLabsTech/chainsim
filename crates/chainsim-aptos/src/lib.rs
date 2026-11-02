@@ -822,9 +822,9 @@ impl Adapter for AptosAdapter {
                     json!({ "kind": "set-resource", "address": who, "structTag": tag, "bytes": bytes.len() }),
                 )
             }
-            SetKind::Storage { .. } | SetKind::Code | SetKind::Owner | SetKind::Object { .. } => {
+            SetKind::Storage { .. } | SetKind::Code | SetKind::Owner | SetKind::Object { .. } | SetKind::Precompile { .. } => {
                 return Err(Error::unsupported(
-                    "set storage, code, owner and object on Aptos",
+                    "set storage, code, owner, object and precompile on Aptos",
                     "Aptos keeps state in Move resources: chainsim set <name> resource <address> <struct tag> --bcs <hex> replaces one, and chainsim send --as calls its module as any address",
                 ));
             }

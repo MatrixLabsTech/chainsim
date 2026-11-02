@@ -105,6 +105,7 @@ impl ForkHandle {
             dev_accounts,
             upstream: profile.upstream_info(),
             limits: profile.limits.clone(),
+            hypercore: None,
         }
     }
 }

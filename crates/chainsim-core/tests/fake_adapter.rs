@@ -50,6 +50,7 @@ impl Adapter for Fake {
             dev_accounts: None,
             upstream: profile.upstream_info(),
             limits: profile.limits.clone(),
+            hypercore: None,
         };
         forks.insert(req.name.clone(), fork.clone());
         Ok(fork)

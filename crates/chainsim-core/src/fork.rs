@@ -49,6 +49,10 @@ pub struct Fork {
     pub upstream: UpstreamInfo,
     /// What differs from the real chain, word for word from the profile.
     pub limits: Vec<String>,
+    /// HyperEVM: the HyperCore answers seeded at `up` (and, in `status`, the
+    /// captured CoreWriter actions). Absent on every other chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hypercore: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -139,6 +143,10 @@ pub enum SetKind {
     Token { coin_type: String, from: Option<String> },
     /// The owner of an object: `address` is the object, `value` the new owner.
     Owner,
+    /// The answer of a mocked precompile (HyperEVM): `address` is the
+    /// precompile, `calldata` the query as hex, and `result` the answer as
+    /// hex, or None to copy the upstream's answer.
+    Precompile { calldata: String, result: Option<String> },
     /// The contents of an object: `address` is the object. `fields` holds
     /// `name=value` pairs, nested fields by dotted path; `bcs` is the whole
     /// new contents as hex instead.

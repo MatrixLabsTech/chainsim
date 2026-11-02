@@ -32,13 +32,30 @@ pub struct Ports {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ForkSettings {
     /// The default fork point: `latest`.
     pub default: String,
     /// Engine flags such as the rate budget and retries.
     #[serde(default)]
     pub flags: Vec<String>,
+    /// The default upstream answers state reads at the latest block whatever
+    /// block they name (HyperEVM), so `up --block` needs a provider URL.
+    #[serde(default)]
+    pub latest_state_only: bool,
+}
+
+/// HyperEVM: the HyperCore read precompiles chainsim mocks, and what `up`
+/// seeds from the upstream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HyperCoreSettings {
+    /// Perp indexes whose mark price, oracle price and asset info are seeded.
+    pub perps: Vec<u32>,
+    /// Spot token indexes whose token info is seeded.
+    pub tokens: Vec<u32>,
+    /// Spot pair indexes whose spot info and spot price are seeded.
+    pub spots: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +137,8 @@ pub struct Profile {
     /// The control sidecar's engine ID in the lock (default `control-curl`),
     /// for a family whose engine needs another client, such as grpcurl.
     pub control: Option<String>,
+    /// HyperEVM: the HyperCore precompile mock and its seeds.
+    pub hypercore: Option<HyperCoreSettings>,
     pub limits: Vec<String>,
 }
 

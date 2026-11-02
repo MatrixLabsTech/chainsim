@@ -40,12 +40,15 @@ pub enum ErrorCode {
     SelftestFailed,
     /// Exit 7: `fund` refused an address that is in use on mainnet.
     MainnetAddress,
+    /// Exit 7: `up --block` refused an upstream that serves only the latest
+    /// state, which would mix an old header with current state.
+    LatestStateOnly,
     /// Exit 8: the name is taken by a fork of another chain or fork point.
     NameConflict,
 }
 
 impl ErrorCode {
-    pub const ALL: [ErrorCode; 17] = [
+    pub const ALL: [ErrorCode; 18] = [
         Self::DockerUnavailable,
         Self::EngineFailed,
         Self::RpcError,
@@ -62,6 +65,7 @@ impl ErrorCode {
         Self::RateLimited,
         Self::SelftestFailed,
         Self::MainnetAddress,
+        Self::LatestStateOnly,
         Self::NameConflict,
     ];
 
@@ -73,7 +77,7 @@ impl ErrorCode {
             Self::ForkNotFound | Self::UnknownChain | Self::UnknownToken | Self::SnapshotNotFound => 4,
             Self::UpstreamUnavailable | Self::RateLimited => 5,
             Self::SelftestFailed => 6,
-            Self::MainnetAddress => 7,
+            Self::MainnetAddress | Self::LatestStateOnly => 7,
             Self::NameConflict => 8,
         }
     }
@@ -96,6 +100,7 @@ impl ErrorCode {
             Self::RateLimited => "rate_limited",
             Self::SelftestFailed => "selftest_failed",
             Self::MainnetAddress => "mainnet_address",
+            Self::LatestStateOnly => "latest_state_only",
             Self::NameConflict => "name_conflict",
         }
     }
