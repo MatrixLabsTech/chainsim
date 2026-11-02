@@ -118,15 +118,22 @@ enum Command {
         #[command(subcommand)]
         what: SetWhat,
     },
-    /// Move the fork's clock forward by seconds, or to a Unix time.
+    /// Move the fork's clock forward by seconds, or to a Unix time, or replay
+    /// a perp's mainnet price path (HyperEVM).
     Time {
         name: String,
         /// Seconds to move forward.
-        #[arg(long, required_unless_present = "to", conflicts_with = "to")]
+        #[arg(long, required_unless_present_any = ["to", "replay"], conflicts_with_all = ["to", "replay"])]
         advance: Option<u64>,
-        /// The Unix time in seconds to move to.
+        /// The Unix time in seconds to move to, or with --replay the end of the range.
         #[arg(long)]
-        to: Option<u64>,
+        to: Option<String>,
+        /// HyperEVM: replay this perp's hourly mainnet candles (BTC, ETH...) as its price path.
+        #[arg(long, requires_all = ["from", "to"])]
+        replay: Option<String>,
+        /// With --replay: the start of the range (Unix seconds, YYYY-MM-DD or YYYY-MM-DDTHH:MMZ).
+        #[arg(long, requires = "replay")]
+        from: Option<String>,
     },
     /// Produce blocks on the fork (default: 1).
     Mine {
@@ -255,6 +262,12 @@ enum HyperCoreWhat {
     },
     /// Copy a mainnet account's HyperCore state and EVM balances onto the copy.
     Mirror { user: String },
+    /// A perp's hourly funding rate on the copy, such as 0.0000125 (negative: shorts pay).
+    Funding {
+        perp: u32,
+        #[arg(allow_hyphen_values = true)]
+        rate: String,
+    },
 }
 
 /// `set hypercore`: a change to the copy's local HyperCore state.
@@ -272,6 +285,7 @@ async fn set_hypercore(name: &str, what: HyperCoreWhat) -> Result<Value> {
         HyperCoreWhat::Position { user, perp, szi, entry_ntl, leverage, isolated_raw_usd, isolated } => CoreOp::Position { user, perp, szi, entry_ntl, leverage, isolated_raw_usd, isolated },
         HyperCoreWhat::Book { coin, live: _ } => CoreOp::Book { coin },
         HyperCoreWhat::Mirror { user } => CoreOp::Mirror { user },
+        HyperCoreWhat::Funding { perp, rate } => CoreOp::Funding { perp, rate },
     };
     EvmAdapter::connect().await?.hypercore(name, op).await
 }
@@ -312,7 +326,7 @@ fn describe_profile(p: &Profile, lock: &EngineLock) -> Value {
         "overrides": p.overrides.iter().map(|o| json!({ "kind": o.kind, "target": o.target, "note": o.note })).collect::<Vec<_>>(),
         "hypercore": p.hypercore.as_ref().map(|h| json!({
             "perps": h.perps, "tokens": h.tokens, "spots": h.spots,
-            "set": chainsim_evm::HYPERCORE_SETS, "call": chainsim_evm::HYPERCORE_CALLS,
+            "set": chainsim_evm::HYPERCORE_SETS, "call": chainsim_evm::HYPERCORE_CALLS, "time": chainsim_evm::HYPERCORE_TIME,
         })),
         "limits": p.limits,
     })
@@ -341,8 +355,8 @@ fn describe(chain: Option<&str>) -> Result<Value> {
             "revert <name> <id>",
             "call <name> <method> [<params-json>] [--from <address>]  (HyperEVM: call <name> corewriter_actions [{\"fromBlock\": <n>}])",
             "send <name> --as <address> --to <address> (--sig \"<fn(types)>\" [<arg>...] | --data <hex>) [--value <amount>]",
-            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex> | precompile <address> <calldata hex> (--result <hex> | --live) | hypercore (price <perp> <px> | spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>] | position <user> <perp> <szi> <entryNtl> [--leverage <n>] [--isolated-raw-usd <n>] [--isolated] | book <coin> --live | mirror <user>)",
-            "time <name> (--advance <seconds> | --to <unix seconds>)",
+            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex> | precompile <address> <calldata hex> (--result <hex> | --live) | hypercore (price <perp> <px> | spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>] | position <user> <perp> <szi> <entryNtl> [--leverage <n>] [--isolated-raw-usd <n>] [--isolated] | book <coin> --live | mirror <user> | funding <perp> <rate>)",
+            "time <name> (--advance <seconds> | --to <unix seconds> | --replay <perp> --from <time> --to <time>)",
             "mine <name> [--blocks <n>]",
             "selftest <name>",
             "pull [<engine>]",
@@ -541,10 +555,19 @@ async fn run(command: Command) -> Result<Value> {
             };
             adapter_of(&name).await?.call(&name, &method, params, from.as_deref()).await
         }
-        Command::Time { name, advance, to } => {
+        Command::Time { name, advance, to, replay, from } => {
+            if let (Some(coin), Some(from), Some(to)) = (&replay, &from, &to) {
+                use chainsim_evm::parse_time;
+                let docker = Docker::connect().await?;
+                let handle = docker.find(&name).await?.ok_or_else(|| Error::fork_not_found(&name))?;
+                if profile::get(&handle.chain)?.family != "evm" {
+                    return Err(Error::unsupported(&format!("time --replay on {}", handle.chain), "chainsim time <name> --advance <seconds> moves the clock"));
+                }
+                return EvmAdapter::connect().await?.replay(&name, coin, parse_time(from)?, parse_time(to)?).await;
+            }
             let req = match (advance, to) {
                 (Some(secs), None) => TimeRequest::Advance(secs),
-                (None, Some(t)) => TimeRequest::To(t),
+                (None, Some(t)) => TimeRequest::To(t.trim().parse().map_err(|_| Error::new(ErrorCode::Usage, format!("--to {t:?} is not Unix seconds")))?),
                 _ => unreachable!("clap requires exactly one"),
             };
             adapter_of(&name).await?.time(&name, &req).await

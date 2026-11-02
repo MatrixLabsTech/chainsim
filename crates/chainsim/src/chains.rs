@@ -42,10 +42,10 @@ pub fn feature_rows() -> Vec<(String, String)> {
         rows.push((format!("set.{}", kind.name()), format!("set {}", kind.name())));
     }
     rows.push(("set.hypercore".into(), "set hypercore".into()));
-    for (k, l) in [("hypercoreBook", "set hypercore book"), ("hypercoreMirror", "set hypercore mirror"), ("hypercoreState", "call hypercore_state")] {
+    for (k, l) in [("hypercoreBook", "set hypercore book"), ("hypercoreMirror", "set hypercore mirror"), ("hypercoreFunding", "set hypercore funding"), ("hypercoreState", "call hypercore_state")] {
         rows.push((k.into(), l.into()));
     }
-    for (k, l) in [("snapshotRevert", "snapshot, revert"), ("time", "time"), ("mine", "mine"), ("call", "call"), ("selftest", "selftest")] {
+    for (k, l) in [("snapshotRevert", "snapshot, revert"), ("time", "time"), ("timeReplay", "time --replay"), ("mine", "mine"), ("call", "call"), ("selftest", "selftest")] {
         rows.push((k.into(), l.into()));
     }
     rows
@@ -72,9 +72,11 @@ fn features(p: &Profile) -> Value {
         "set": set,
         "hypercoreBook": core,
         "hypercoreMirror": core,
+        "hypercoreFunding": core,
         "hypercoreState": core && has("call"),
         "snapshotRevert": has("snapshot") && has("revert"),
         "time": has("time"),
+        "timeReplay": core && has("time"),
         "mine": has("mine"),
         "call": has("call"),
         "selftest": has("selftest"),
@@ -158,7 +160,7 @@ mod tests {
             let want = c["chain"] == "hyperevm-mainnet";
             assert_eq!(c["features"]["set"]["precompile"], json!(want), "{}", c["chain"]);
             assert_eq!(c["features"]["set"]["hypercore"], json!(want), "{}", c["chain"]);
-            for k in ["hypercoreBook", "hypercoreMirror", "hypercoreState"] {
+            for k in ["hypercoreBook", "hypercoreMirror", "hypercoreFunding", "hypercoreState", "timeReplay"] {
                 assert_eq!(c["features"][k], json!(want), "{k} on {}", c["chain"]);
             }
         }
