@@ -477,7 +477,8 @@ fn add_tokens(state: &mut State, spot: &Value, tokens: impl Iterator<Item = u64>
     let list = spot["tokens"].as_array().cloned().unwrap_or_default();
     for t in tokens {
         let Some(m) = list.iter().find(|x| x["index"].as_u64() == Some(t)) else { continue };
-        let evm = m["evmContract"]["address"].as_str().map(|a| (a.to_string(), m["evmContract"]["evm_extra_wei_decimals"].as_i64().unwrap_or(0) as i8));
+        // USDC's evmContract is the CoreDepositWallet, not an ERC-20: its path is not modeled.
+        let evm = m["evmContract"]["address"].as_str().filter(|_| t != 0).map(|a| (a.to_string(), m["evmContract"]["evm_extra_wei_decimals"].as_i64().unwrap_or(0) as i8));
         state.tokens.insert(t, hc::TokenMeta { name: m["name"].as_str().unwrap_or_default().to_string(), wei_decimals: m["weiDecimals"].as_u64().unwrap_or(8) as u8, evm });
     }
 }
@@ -509,6 +510,20 @@ mod tests {
         assert!(decode_state(&json!("0x6080")).is_err());
         // A call into the state address stops at once.
         assert_eq!(MARKER[0], 0x00);
+    }
+
+    #[test]
+    fn usdc_has_no_evm_side_and_linked_tokens_do() {
+        let spot = json!({ "tokens": [
+            { "name": "USDC", "index": 0, "weiDecimals": 8, "evmContract": { "address": "0x6b9e773128f453f5c2c60935ee2de2cbc5390a24", "evm_extra_wei_decimals": -2 } },
+            { "name": "TKN", "index": 200, "weiDecimals": 6, "evmContract": { "address": "0x00000000000000000000000000000000000000aa", "evm_extra_wei_decimals": 12 } },
+            { "name": "HYPE", "index": 150, "weiDecimals": 8, "evmContract": null },
+        ] });
+        let mut s = State::new();
+        add_tokens(&mut s, &spot, [0, 150, 200, 9].into_iter());
+        assert_eq!((s.tokens[&0].evm.clone(), s.tokens[&150].evm.clone()), (None, None));
+        assert_eq!(s.tokens[&200].evm, Some(("0x00000000000000000000000000000000000000aa".to_string(), 12)));
+        assert!(!s.tokens.contains_key(&9));
     }
 
     #[test]

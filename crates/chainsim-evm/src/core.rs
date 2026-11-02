@@ -1058,6 +1058,10 @@ mod tests {
         assert_eq!(a.credits[0].token, Some("0x00000000000000000000000000000000000000aa".parse().unwrap()));
         assert_eq!(a.credits[0].amount, U256::from(2_000_000u64) * U256::from(10u64).pow(U256::from(12u64)));
         assert!(run(&mut s, 14, ALICE, encode_action(6, &[word_addr(BOB), word_u(0), word_u(1)].concat())).starts_with("rejected: insufficient"));
+        // USDC to its system address: no EVM side, rejected before any debit.
+        s.account(ALICE).spot.insert(0, Spot(9, 0, 0));
+        assert_eq!(run(&mut s, 15, ALICE, encode_action(6, &[word_addr(system_address(0)), word_u(0), word_u(5)].concat())), "rejected: token 0 has no EVM side");
+        assert_eq!(s.accounts[&ALICE].spot[&0].0, 9);
     }
 
     #[test]
