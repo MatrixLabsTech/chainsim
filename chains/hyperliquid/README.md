@@ -593,10 +593,10 @@ dex 1, so xyz:XYZ100 is perp 10000 and asset 110000.
 In the 2026-11-02 run, a wallet sent 600 USD to xyz with sendAsset, bought 0.01 xyz:XYZ100 with an
 IOC at 28,610.0 (the book's best ask), read szi 100 back through `0x800` and `0x813`, and opened
 an isolated xyz:HOOD long and a cross BTC long. A 30% HOOD drop liquidated the HOOD position
-alone:
+alone. The loss past the position's own margin was absorbed, not taken from the xyz balance:
 
 ```text
-liquidated: isolated xyz:HOOD equity … USD below maintenance margin … USD, closed … xyz:HOOD at …
+liquidated: isolated xyz:HOOD equity -199.999776 USD below maintenance margin 34.99996 USD, closed 11.542 xyz:HOOD at 60.648, shortfall 199.999776 USD absorbed
 ```
 
 XYZ100 on xyz and BTC on the main dex kept their positions.
