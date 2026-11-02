@@ -198,7 +198,8 @@ position on the copy, so margin and withdrawable answers follow it.
 
 - `set <name> hypercore position <user> <perp> <szi> <entryNtl> [--leverage <n>]
   [--isolated-raw-usd <n>] [--isolated]` sets a user's perp position in the copy's Core state.
-  A negative `szi` is a short.
+  A negative `szi` is a short. Give the account perp USD first, with `spot-balance` and a USD
+  class transfer, or the next price move or funding payment liquidates it.
 - `set <name> precompile <address> <calldata> --result <hex>` stores any other answer, for any
   precompile from `0x800` to `0x813`.
 
@@ -362,9 +363,15 @@ A test moves the market on the copy and watches what follows. Each move runs the
 1. The perp's mark and oracle prices take the new value, and every position reprices: unrealized
    PnL, margin used, withdrawable and the margin summary follow it.
 2. Resting orders the move crosses fill at their own limit price, as makers.
-3. Accounts whose account value falls below their maintenance margin are liquidated.
+3. Accounts whose account value falls below their maintenance margin are liquidated. The same
+   check runs after each funding payment.
 
-The rules, from Hyperliquid's documentation on margining, liquidations, funding and fees:
+The rules follow Hyperliquid's documentation on
+[margining](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/margining),
+[liquidations](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/liquidations),
+[funding](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding) and
+[fees](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees), simplified where the
+profile limits say:
 
 - Maintenance margin is half the initial margin at the perp's maximum leverage, so 1/80 of the
   position's value for BTC at 40x.

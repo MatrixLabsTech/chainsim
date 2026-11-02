@@ -828,8 +828,8 @@ impl State {
 
     /// One replayed candle: the block that carries it (funding up to its
     /// time, then liquidations), then the move to the candle's close.
-    pub fn candle_step(&mut self, asset: u32, close: u64, head: (u64, String), time: u64) -> Applied {
-        let mut applied = self.apply(&[], head, time);
+    pub fn candle_step(&mut self, events: &[Logged], asset: u32, close: u64, head: (u64, String), time: u64) -> Applied {
+        let mut applied = self.apply(events, head, time);
         let step = self.set_price(asset, close, time);
         applied.users.extend(step.users);
         applied.margin_users.extend(step.margin_users);
@@ -873,11 +873,12 @@ impl State {
 
     /// Pays funding for every interval boundary up to `time`: each position
     /// pays size x oracle price x the perp's hourly rate, longs paying shorts
-    /// when the rate is positive.
-    fn fund_until(&mut self, time: u64, applied: &mut Applied) {
+    /// when the rate is positive. Returns whether anything was paid.
+    fn fund_until(&mut self, time: u64, applied: &mut Applied) -> bool {
+        let mut paid = false;
         if self.funding_time == 0 {
             self.funding_time = time / FUNDING_INTERVAL * FUNDING_INTERVAL;
-            return;
+            return false;
         }
         while self.funding_time + FUNDING_INTERVAL <= time {
             self.funding_time += FUNDING_INTERVAL;
@@ -901,13 +902,16 @@ impl State {
                     let coin = self.coin(asset);
                     self.note(user, format!("funding on {coin} at rate {rate}: {} {} USD", if pay >= 0 { "paid" } else { "received" }, fmt_dec(pay.unsigned_abs() as i128, 6)));
                     applied.margin_users.insert(user);
+                    paid = true;
                 }
             }
         }
+        paid
     }
 
     /// Applies events in order and moves the cursor to `head` (number, hash),
-    /// then pays funding up to the head's block time and liquidates. Events
+    /// then pays funding up to the head's block time, with a liquidation check
+    /// when funding was paid. Events
     /// at or below the cursor are skipped, so re-applying a range is a no-op.
     pub fn apply(&mut self, events: &[Logged], head: (u64, String), time: u64) -> Applied {
         let mut applied = Applied::default();
@@ -956,9 +960,12 @@ impl State {
         let drop = self.results.len().saturating_sub(MAX_RESULTS);
         self.results.drain(..drop);
         self.cursor = Some(head);
-        self.fund_until(time, &mut applied);
-        self.now = time;
-        self.liquidate(&mut applied);
+        // Liquidation follows what moves margin outside an order: funding
+        // here, price moves in `set_price`.
+        if self.fund_until(time, &mut applied) {
+            self.now = time;
+            self.liquidate(&mut applied);
+        }
         applied
     }
 
@@ -1477,6 +1484,21 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_block_does_not_liquidate() {
+        let mut s = state();
+        s.account(BOB).positions.insert(0, Pos { szi_x8: x8(1.0) as i64, entry_ntl: 100_000_000, leverage: 20, ..Default::default() });
+        let t0 = 1_793_599_200;
+        s.apply(&[], (11, "0xb".into()), t0 + 10);
+        let a = s.apply(&[], (12, "0xc".into()), t0 + 20);
+        assert!(a.liquidated.is_empty());
+        assert_eq!(s.accounts[&BOB].positions[&0].szi_x8, x8(1.0) as i64);
+        // A funding payment is a margin move: it runs the check.
+        s.perps.get_mut(&0).unwrap().funding_e12 = 1;
+        let a = s.apply(&[], (13, "0xd".into()), t0 + 3600);
+        assert_eq!(a.liquidated, vec![BOB]);
+    }
+
+    #[test]
     fn liquidation_cancels_open_orders() {
         let mut s = state();
         s.account(BOB).usd = usd(1.0);
@@ -1546,7 +1568,7 @@ mod tests {
         let mut fills = 0;
         let mut liquidated = Vec::new();
         for (i, close) in path.iter().enumerate() {
-            let a = s.candle_step(0, x8(*close), (13 + i as u64, format!("0x{i}")), t0 + 3600 * (i as u64 + 1));
+            let a = s.candle_step(&[], 0, x8(*close), (13 + i as u64, format!("0x{i}")), t0 + 3600 * (i as u64 + 1));
             fills += a.fills;
             liquidated.extend(a.liquidated);
         }

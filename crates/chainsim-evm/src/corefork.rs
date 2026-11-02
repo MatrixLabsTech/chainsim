@@ -225,14 +225,7 @@ impl EvmAdapter {
             eng.settle_credits(&mut state).await?;
             return Ok(Some(state));
         }
-        let mut addresses = vec![json!(hypercore::CORE_WRITER), json!(hc::HYPE_SYSTEM.to_string())];
-        addresses.extend(state.tokens.values().filter_map(|t| t.evm.as_ref()).map(|(a, _)| json!(a)));
-        let filter = json!({
-            "fromBlock": format!("0x{:x}", at + 1), "toBlock": format!("0x{:x}", head.0), "address": addresses,
-            "topics": [[hypercore::RAW_ACTION_TOPIC, hc::received_topic(), hc::TRANSFER_TOPIC]],
-        });
-        let logs = eng.rpc("eth_getLogs", json!([filter])).await?;
-        let events = hc::events_from_logs(logs.as_array().map_or(&[][..], Vec::as_slice));
+        let events = core_events(eng, &state, at + 1, head.0).await?;
         let applied = state.apply(&events, head, time);
         let answers = state.answers_for(&applied);
         eng.store(&state, &answers).await?;
@@ -564,7 +557,10 @@ impl EvmAdapter {
             let b = eng.rpc("eth_getBlockByNumber", json!(["latest", false])).await?;
             let (head, time) = (block_ref(&b)?, block_time(&b)?);
             height = head.0;
-            let applied = state.candle_step(asset, *close, head, time);
+            // Blocks another client mined since the cursor are applied too, never skipped.
+            let from = state.cursor.as_ref().map_or(head.0, |c| c.0 + 1);
+            let events = core_events(eng, &state, from, head.0).await?;
+            let applied = state.candle_step(&events, asset, *close, head, time);
             fills += applied.fills;
             liquidated.extend(applied.liquidated.iter().map(|a| a.to_string()));
             let mut answers = state.answers_for(&applied);
@@ -624,6 +620,19 @@ fn add_tokens(state: &mut State, spot: &Value, tokens: impl Iterator<Item = u64>
         let evm = m["evmContract"]["address"].as_str().filter(|_| t != 0).map(|a| (a.to_string(), m["evmContract"]["evm_extra_wei_decimals"].as_i64().unwrap_or(0) as i8));
         state.tokens.insert(t, hc::TokenMeta { name: m["name"].as_str().unwrap_or_default().to_string(), wei_decimals: m["weiDecimals"].as_u64().unwrap_or(8) as u8, evm });
     }
+}
+
+/// The Core events in blocks `from..=to`: RawAction, HYPE to its system
+/// address, and Transfers of linked tokens.
+async fn core_events(eng: &Engine<'_>, state: &State, from: u64, to: u64) -> Result<Vec<hc::Logged>> {
+    let mut addresses = vec![json!(hypercore::CORE_WRITER), json!(hc::HYPE_SYSTEM.to_string())];
+    addresses.extend(state.tokens.values().filter_map(|t| t.evm.as_ref()).map(|(a, _)| json!(a)));
+    let filter = json!({
+        "fromBlock": format!("0x{from:x}"), "toBlock": format!("0x{to:x}"), "address": addresses,
+        "topics": [[hypercore::RAW_ACTION_TOPIC, hc::received_topic(), hc::TRANSFER_TOPIC]],
+    });
+    let logs = eng.rpc("eth_getLogs", json!([filter])).await?;
+    Ok(hc::events_from_logs(logs.as_array().map_or(&[][..], Vec::as_slice)))
 }
 
 /// The candles' open times (ms) and closes (x8), oldest first.
