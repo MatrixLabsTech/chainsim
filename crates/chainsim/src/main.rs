@@ -169,7 +169,7 @@ enum SetWhat {
     /// A token balance, in whole units of the token, minted or taken from a holder.
     Token {
         address: String,
-        /// The token: a Sui coin type such as 0x...::usdc::USDC.
+        /// The token: on EVM a profile symbol or an ERC-20 address, on Sui a coin type such as 0x...::usdc::USDC.
         coin_type: String,
         amount: String,
         /// Take the amount from this holder instead of minting.

@@ -140,8 +140,11 @@ mod tests {
         assert_eq!(d["chains"].as_array().unwrap().len(), profile::all().unwrap().len());
         let aptos = &chain(&d, "aptos-mainnet")["features"];
         assert_eq!((aptos["time"].clone(), aptos["mine"].clone(), aptos["set"]["resource"].clone()), (json!(true), json!(true), json!(true)));
-        let eth = &chain(&d, "ethereum-mainnet")["features"];
-        assert_eq!((eth["time"].clone(), eth["set"]["storage"].clone(), eth["set"]["token"].clone()), (json!(false), json!(true), json!(false)));
+        for key in ["ethereum-mainnet", "arc-mainnet", "robinhood-mainnet", "hyperevm-mainnet"] {
+            let f = &chain(&d, key)["features"];
+            assert_eq!((f["time"].clone(), f["mine"].clone(), f["set"]["storage"].clone(), f["set"]["token"].clone(), f["set"]["owner"].clone()), (json!(true), json!(true), json!(true), json!(true), json!(false)), "{key}");
+        }
+        assert_eq!(chain(&d, "sui-mainnet")["features"]["fundTokens"], true);
         assert_eq!(chain(&d, "sui-mainnet")["features"]["set"]["object"], true);
         for c in d["chains"].as_array().unwrap() {
             let want = c["chain"] == "hyperevm-mainnet";

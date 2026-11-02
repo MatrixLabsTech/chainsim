@@ -43,15 +43,18 @@ const ARB_GAS_INFO: &str = "0x000000000000000000000000000000000000006C";
 /// (profiles/assets/src/ArbGasInfoMock.sol).
 const MOCK_L1_BASE_FEE: u64 = 255074;
 
-pub const OPERATIONS: &[&str] = &["describe", "up", "down", "ls", "status", "fund", "snapshot", "revert", "call", "send", "set", "selftest"];
+pub const OPERATIONS: &[&str] = &["describe", "up", "down", "ls", "status", "fund", "snapshot", "revert", "call", "send", "set", "time", "mine", "selftest"];
+
+/// The most blocks one `mine` produces.
+const MAX_MINE: u64 = 10_000;
 
 /// Whether `set <kind>` works on this profile. It mirrors the arms of
 /// `EvmAdapter::set`, and the match makes a new kind a compile error here.
 pub fn supports_set(profile: &Profile, kind: &SetKind) -> bool {
     match kind {
-        SetKind::Storage { .. } | SetKind::Code | SetKind::Balance => true,
+        SetKind::Storage { .. } | SetKind::Code | SetKind::Balance | SetKind::Token { .. } => true,
         SetKind::Precompile { .. } => profile.hypercore.is_some(),
-        SetKind::Token { .. } | SetKind::Owner | SetKind::Object { .. } | SetKind::Resource { .. } => false,
+        SetKind::Owner | SetKind::Object { .. } | SetKind::Resource { .. } => false,
     }
 }
 
@@ -77,6 +80,12 @@ impl Engine<'_> {
 
     async fn upstream(&self, method: &str, params: Value) -> Result<Value> {
         self.control.rpc(&Target::Upstream, method, params, Duration::from_secs(30)).await
+    }
+
+    /// The latest block's number and timestamp in seconds.
+    async fn latest_block(&self) -> Result<(u64, u64)> {
+        let b = self.rpc("eth_getBlockByNumber", json!(["latest", false])).await?;
+        Ok((parse_qty(&b["number"])?.to::<u64>(), parse_qty(&b["timestamp"])?.to::<u64>()))
     }
 
     async fn head(&self) -> Result<u64> {
@@ -917,12 +926,9 @@ impl Adapter for EvmAdapter {
             out["note"] = json!(chainsim_core::mods::NOTE);
             return Ok(out);
         }
-        let address = parse_address(&req.address)?.to_string();
-        let (mut out, entry) = match &req.kind {
-            SetKind::Precompile { .. } => unreachable!("handled above"),
-            SetKind::Token { .. } => {
-                return Err(Error::unsupported("set token on EVM", "chainsim fund <name> <address> --token <symbol|address>:<amount> sets a token balance"));
-            }
+        // Kinds EVM lacks answer before the address is parsed, so a Sui or
+        // Aptos id gets unsupported (exit 3), not a usage error.
+        match &req.kind {
             SetKind::Object { .. } => {
                 return Err(Error::unsupported("set object on EVM", "EVM has no objects: chainsim set <name> storage <contract> <slot> <value> changes a contract's state"));
             }
@@ -931,6 +937,38 @@ impl Adapter for EvmAdapter {
             }
             SetKind::Owner => {
                 return Err(Error::unsupported("set owner on EVM", "EVM has no object owners: chainsim set <name> storage <contract> <slot> <value> changes the slot that records an owner"));
+            }
+            SetKind::Token { from: Some(_), .. } => {
+                return Err(Error::unsupported(
+                    "set token --from on EVM",
+                    "set token sets the balance directly; chainsim send <name> --as <holder> --to <token> --sig \"transfer(address,uint256)\" <address> <raw amount> moves tokens from a holder",
+                ));
+            }
+            _ => {}
+        }
+        let address = parse_address(&req.address)?.to_string();
+        let (mut out, entry) = match &req.kind {
+            SetKind::Precompile { .. } | SetKind::Object { .. } | SetKind::Resource { .. } | SetKind::Owner | SetKind::Token { from: Some(_), .. } => unreachable!("handled above"),
+            SetKind::Token { coin_type, from: None } => {
+                let who = parse_address(&address)?;
+                let ft = self.resolve_token(&eng, &profile, coin_type).await?;
+                let amount = parse_amount(&req.value, ft.decimals)?;
+                if ft.native_view {
+                    // Arc USDC: the token is a view of the native balance.
+                    let native_decimals = profile.native.as_ref().map_or(18, |n| n.decimals);
+                    eng.set_balance(&address, amount * U256::from(10u64).pow(U256::from(native_decimals - ft.decimals))).await?;
+                } else {
+                    eng.deal(&ft.address, who, amount).await?;
+                }
+                let read = eng.token_balance(&ft.address, who).await?;
+                if read != amount {
+                    return Err(Error::new(ErrorCode::ReadbackMismatch, format!("{address} reads {} {} after setting {}", format_amount(read, ft.decimals), ft.symbol, format_amount(amount, ft.decimals))));
+                }
+                let amount_s = format_amount(read, ft.decimals);
+                (
+                    json!({ "kind": "token", "address": address, "symbol": ft.symbol, "token": ft.address, "decimals": ft.decimals, "amount": amount_s, "raw": read.to_string() }),
+                    json!({ "kind": "set-token", "address": address, "symbol": ft.symbol, "token": ft.address, "amount": amount_s }),
+                )
             }
             SetKind::Storage { slot } => {
                 let (slot, value) = (word_hex(slot)?, word_hex(&req.value)?);
@@ -1064,6 +1102,34 @@ impl Adapter for EvmAdapter {
         }
         let fresh = eng.rpc("evm_snapshot", json!([])).await?;
         Ok(Reverted { reverted: id.to_string(), snapshot: fresh.as_str().unwrap_or_default().to_string() })
+    }
+
+    async fn time(&self, name: &str, req: &TimeRequest) -> Result<Value> {
+        let (handle, profile) = self.open(name).await?;
+        let eng = self.engine(&handle, &profile);
+        let (_, before) = eng.latest_block().await?;
+        let target = match req {
+            TimeRequest::Advance(secs) => before.checked_add(*secs).ok_or_else(|| Error::new(ErrorCode::Usage, "the offset is too large"))?,
+            TimeRequest::To(t) if *t <= before => return Err(Error::new(ErrorCode::Usage, format!("the fork is already at {before} s; time only moves forward"))),
+            TimeRequest::To(t) => *t,
+        };
+        // The next block takes the new time, and one block is mined to carry it.
+        eng.rpc("evm_setNextBlockTimestamp", json!([target])).await?;
+        eng.rpc("evm_mine", json!([])).await?;
+        let (height, after) = eng.latest_block().await?;
+        Ok(json!({ "timestamp": after, "timestampUsecs": (after as u128 * 1_000_000).to_string(), "previous": before, "height": height }))
+    }
+
+    async fn mine(&self, name: &str, blocks: Option<u64>) -> Result<Value> {
+        let (handle, profile) = self.open(name).await?;
+        let eng = self.engine(&handle, &profile);
+        let n = blocks.unwrap_or(1);
+        if n == 0 || n > MAX_MINE {
+            return Err(Error::new(ErrorCode::Usage, format!("mine takes 1 to {MAX_MINE} blocks")));
+        }
+        eng.rpc("anvil_mine", json!([qty(U256::from(n))])).await?;
+        let (height, ts) = eng.latest_block().await?;
+        Ok(json!({ "mined": n, "height": height, "timestamp": ts, "timestampUsecs": (ts as u128 * 1_000_000).to_string() }))
     }
 
     async fn call(&self, name: &str, method: &str, params: Value, from: Option<&str>) -> Result<Value> {
