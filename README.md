@@ -58,8 +58,12 @@ on every supported chain.
 - `set` overrides state directly: balance, token, storage, code and owner, a Sui object's
   fields, an Aptos resource, or a HyperCore precompile answer.
 - `selftest` proves a fork is fit before a test spends anything on it.
+- `time` and `mine` move a fork's clock and add blocks on every EVM chain and on Aptos.
+- `chainsim chains` prints every chain's engine and which commands it supports.
 - Arc runs on Circle's own engine, so native USDC behaves as on Arc.
 - Robinhood Chain answers Arbitrum's ArbSys and ArbGasInfo precompiles.
+- Sui runs on Mysten's sui-fork mainnet-v1.82.3, which serves Sui Mainnet's protocol 139, with
+  chainsim's patch that lets `set object` change any Move object's fields.
 - HyperEVM runs with a local HyperCore: limit orders fill against the mainnet order book,
   balances bridge both ways, and any mainnet account can be mirrored onto the copy.
 - JSON output, fixed exit codes and `error.next`, so an agent can branch on every result.
