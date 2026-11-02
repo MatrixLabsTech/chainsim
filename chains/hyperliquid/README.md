@@ -6,7 +6,7 @@ chainsim runs a private copy of HyperEVM Mainnet, the EVM side of Hyperliquid, i
 chain `hyperevm-mainnet`. The commands and their JSON output are the same as on every chain, and
 the [README](../../README.md) covers the shared workflow. This page covers what is specific to
 HyperEVM. Every output below comes from a live run against HyperEVM Mainnet, on 2026-11-01 for
-the precompile answers and on 2026-11-02 for the local HyperCore.
+the precompile answers and on 2026-11-02 for the local HyperCore and market scripting.
 
 ## What chainsim gives on HyperEVM
 
@@ -22,6 +22,10 @@ the precompile answers and on 2026-11-02 for the local HyperCore.
   and a spot send back credits the EVM balance.
 - `set hypercore mirror`, which copies a mainnet account's positions, margin and balances onto the
   copy, and `call hypercore_state`, which reads an account's Core state in the info API's shapes.
+- Market scripting: `set hypercore price` reprices positions, fills the resting orders a move
+  crosses and liquidates accounts below maintenance margin, `time --replay` plays a past stretch
+  of mainnet candles as the price path, funding accrues every hour of the fork's clock, and every
+  fill pays maker or taker fees.
 - Every action a contract sends through CoreWriter, decoded with what it did by `call
   corewriter_actions`.
 - `fund` for HYPE and five ERC-20 tokens, and `send --as` for any account.
@@ -350,6 +354,113 @@ index, and replaces the one fills have consumed.
 - A spot send to a system address debits Core and credits the sender's EVM balance. A spot send
   of 1 HYPE to `0x2222…2222` left 1.0 HYPE on Core and raised the EVM balance by 1 HYPE, less the
   gas of the transaction that sent the action.
+
+## Market scripting
+
+A test moves the market on the copy and watches what follows. Each move runs the same steps:
+
+1. The perp's mark and oracle prices take the new value, and every position reprices: unrealized
+   PnL, margin used, withdrawable and the margin summary follow it.
+2. Resting orders the move crosses fill at their own limit price, as makers.
+3. Accounts whose account value falls below their maintenance margin are liquidated.
+
+The rules, from Hyperliquid's documentation on margining, liquidations, funding and fees:
+
+- Maintenance margin is half the initial margin at the perp's maximum leverage, so 1/80 of the
+  position's value for BTC at 40x.
+- A liquidation closes every position of the account at the mark price and cancels its open
+  orders. Collateral that remains stays with the account. A balance below zero is reset to zero,
+  the loss the backstop liquidator takes on mainnet.
+- Funding is paid every hour of the fork's clock: size times oracle price times the perp's hourly
+  rate. Longs pay shorts when the rate is positive, and shorts pay longs when it is negative.
+  `up` takes each seeded perp's last settled rate from the info API's `fundingHistory`.
+- Fills pay the base-tier fees: 0.045% of the notional for the taker and 0.015% for the maker.
+
+### Move the price
+
+This run opened a 0.1 BTC long for one wallet with 500 USD of margin, and a resting bid 8% under
+the book for another. The IOC paid the taker fee:
+
+```json
+{ "block": 50169604, "action": "limitOrder", "result": "filled 0.1 at 78090.0, fee 3.51405 USD" }
+```
+
+Then `set hypercore price` dropped BTC 10%, to 70,281:
+
+```sh
+chainsim set hyperevm-mainnet hypercore price 0 702810
+```
+
+```json
+{
+  "kind": "hypercore",
+  "helper": "price",
+  "perp": 0,
+  "px": 702810,
+  "filled": 1,
+  "liquidated": ["0x00000000000000000000000000000000000A11cE"]
+}
+```
+
+The `sets` list, the two price answers written, is left out here.
+
+The bid filled on the way down and the long was liquidated, so its `0x800` position reads zero.
+`hypercore_state` lists what happened under `history`, newest last. For the long:
+
+```json
+"history": [
+  { "time": 1793603950000, "event": "liquidated: account value -284.41405 USD below maintenance margin 87.85125 USD, closed 0.1 BTC at 70281.0, shortfall 284.41405 USD absorbed" }
+]
+```
+
+### Funding
+
+`set hypercore funding <perp> <rate>` sets a perp's hourly rate. A negative rate makes shorts
+pay. After a rate of 0.0001 and `time --advance 3600`, the bidder's history reads:
+
+```json
+"history": [
+  { "time": 1793603950000, "event": "oid 1 bought 0.01 BTC at 71841.0 as the price moved to 70281.0, fee 0.107761 USD" },
+  { "time": 1793606400000, "event": "funding on BTC at rate 0.0001: paid 0.070281 USD" }
+]
+```
+
+The position's `cumFunding` carries the total paid since it opened, `"0.070281"` here.
+
+### Replay a past day
+
+`time <name> --replay <perp> --from <time> --to <time>` takes the perp's hourly candles from the
+info API's `candleSnapshot`, both ends included, and plays their closes as the price path. Each
+candle mines one block an hour after the last, pays funding, then moves the price with the steps
+above. The times take Unix seconds, a date, or a date and time such as `2026-10-31T12:00Z`.
+
+```sh
+chainsim time hyperevm-mainnet --replay BTC --from 2026-10-31 --to 2026-11-01
+```
+
+```json
+{
+  "coin": "BTC",
+  "perp": 0,
+  "interval": "1h",
+  "candles": 25,
+  "from": 1793404800,
+  "to": 1793491200,
+  "firstClose": "77536.0",
+  "lastClose": "77638.0",
+  "lowClose": "77120.0",
+  "highClose": "77671.0",
+  "markPx": 776380,
+  "height": 50169631,
+  "filled": 0,
+  "liquidated": [],
+  "infoCalls": 1
+}
+```
+
+The replay took one info API request. After it, `0x806` reads 776380, the last close in the
+precompile's units, and the bidder had paid 25 more hours of funding, 1.999287 USD in all.
+`snapshot` and `revert` restore prices, positions, margin and funding with the rest of the fork.
 
 ## CoreWriter actions
 

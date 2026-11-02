@@ -65,7 +65,8 @@ on every supported chain.
 - Sui runs on Mysten's sui-fork mainnet-v1.82.3, which serves Sui Mainnet's protocol 139, with
   chainsim's patch that lets `set object` change any Move object's fields.
 - HyperEVM runs with a local HyperCore: limit orders fill against the mainnet order book,
-  balances bridge both ways, and any mainnet account can be mirrored onto the copy.
+  balances bridge both ways, any mainnet account can be mirrored onto the copy, and a test can move
+  prices, replay a past day and watch fills, funding and liquidations follow.
 - JSON output, fixed exit codes and `error.next`, so an agent can branch on every result.
 - One-line install from GitHub releases for Linux and macOS, and `chainsim doctor` to check the
   setup: Docker, engines, plugin and upstreams.
@@ -196,8 +197,14 @@ the same JSON contract and exit codes as every other chain.
   and a spot send back to a system address credits the EVM balance.
 - `set hypercore mirror <user>` copies a mainnet account's positions, margin and spot balances
   onto the copy, so a test starts from a real position and acts as that account with `send --as`.
-- `call hypercore_state <user>` returns an account's Core state in the info API's own shapes, and
-  `call corewriter_actions` shows each action with what it did.
+- `set hypercore price` moves a perp: positions reprice, resting orders the move crosses fill,
+  and accounts below maintenance margin are liquidated. `time --replay BTC --from <date> --to
+  <date>` plays a past stretch of mainnet candles as the price path.
+- Funding accrues every hour of the fork's clock, from mainnet's last rate or one set with `set
+  hypercore funding`, and every fill pays maker or taker fees.
+- `call hypercore_state <user>` returns an account's Core state in the info API's own shapes,
+  with its fills, funding and liquidations, and `call corewriter_actions` shows each action with
+  what it did.
 - chainsim applies Core actions on each command, and `snapshot` and `revert` carry Core state
   with the rest of the fork.
 
@@ -205,7 +212,7 @@ the same JSON contract and exit codes as every other chain.
 chainsim up hyperevm-mainnet
 chainsim set hyperevm-mainnet hypercore mirror <mainnet account>
 chainsim call hyperevm-mainnet hypercore_state <mainnet account>
-chainsim call hyperevm-mainnet corewriter_actions
+chainsim time hyperevm-mainnet --replay BTC --from 2026-10-31 --to 2026-11-01
 ```
 
 [chains/hyperliquid](chains/hyperliquid/README.md) covers every command on HyperEVM.

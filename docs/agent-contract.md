@@ -18,10 +18,14 @@ error codes from the binary.
   `precompile` or `hypercore`. On HyperEVM, `set precompile <address> <calldata> (--result <hex>
   | --live)` stores a HyperCore read precompile's answer, `set hypercore price|spot-balance|position`
   sets prices and an account's Core state, `set hypercore book <coin> --live` refreshes a perp's
-  order book and `set hypercore mirror <user>` copies a mainnet account onto the copy. `call <name>
+  order book, `set hypercore mirror <user>` copies a mainnet account onto the copy, and `set
+  hypercore funding <perp> <rate>` sets a perp's hourly funding rate. `set hypercore price` also
+  fills crossed resting orders and liquidates, and returns `filled` and `liquidated`. `time <name>
+  --replay <perp> --from <time> --to <time>` replays hourly mainnet candles as the price path. `call <name>
   corewriter_actions [{"fromBlock": <n>}]` returns every CoreWriter action decoded with its
   `result`, and `call <name> hypercore_state <user>` returns the account's Core state as
-  `clearinghouseState`, `spotClearinghouseState` and `openOrders`.
+  `clearinghouseState`, `spotClearinghouseState`, `openOrders` and `history` (fills from price
+  moves, funding and liquidations).
   `chainsim describe <chain>` and the chain pages say which kinds and commands each chain
   supports, and the rest exit 3.
 - Engines: `pull [<engine>]`, `engines`, `prune`.
