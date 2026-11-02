@@ -26,20 +26,52 @@ pub fn upstream_next(upstream_env: &str) -> String {
     format!("retry, or set {upstream_env} to a provider GraphQL URL; the public endpoint rate-limits heavy runs (chainsim describe sui-mainnet)")
 }
 
+/// The engine's descriptor set in the control sidecar. It lives on the
+/// sidecar's tmpfs, so it goes with the sidecar at down. With it, grpcurl
+/// skips server reflection, which measured about 0.8 s of each call.
+pub const PROTOSET: &str = "/tmp/sui.protoset";
+
+/// The grpcurl arguments for one unary call, through the descriptor set or
+/// through server reflection.
+pub fn call_argv(target: &str, method: &str, body: &Value, timeout: Duration, protoset: bool) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["grpcurl".into(), "-plaintext".into()];
+    if protoset {
+        argv.extend(["-protoset".into(), PROTOSET.into()]);
+    }
+    argv.extend(["-max-time".into(), timeout.as_secs().max(1).to_string(), "-d".into(), body.to_string(), target.into(), method.into()]);
+    argv
+}
+
+/// The command that writes the descriptor set of every service the engine
+/// exposes, to a temporary file first so a reader never sees half of it.
+pub fn protoset_argv(target: &str) -> Vec<String> {
+    let script = format!("grpcurl -plaintext -protoset-out \"{PROTOSET}.$$\" \"$1\" describe >/dev/null && mv \"{PROTOSET}.$$\" {PROTOSET}");
+    vec!["sh".into(), "-c".into(), script, "sh".into(), target.into()]
+}
+
+/// True when grpcurl failed on the descriptor set rather than on the call:
+/// the file is missing (an older fork, a restarted sidecar) or lacks the service.
+pub fn descriptor_failure(exit_code: i64, stderr: &str) -> bool {
+    exit_code == 1 && (stderr.contains("proto descriptor sets") || stderr.contains("does not expose"))
+}
+
 impl<'a> Grpc<'a> {
+    /// Writes the engine's descriptor set in the sidecar. Returns whether it worked.
+    pub async fn write_protoset(&self) -> bool {
+        self.docker.exec(&self.container, &protoset_argv(&self.target)).await.is_ok_and(|o| o.exit_code == 0)
+    }
+
     /// One unary gRPC call with a protobuf-JSON body. Returns the response as JSON.
+    /// It goes through the descriptor set, and on a descriptor failure runs once
+    /// more through reflection and rewrites the set.
     pub async fn call(&self, method: &str, body: &Value, timeout: Duration) -> Result<Value> {
-        let argv: Vec<String> = vec![
-            "grpcurl".into(),
-            "-plaintext".into(),
-            "-max-time".into(),
-            timeout.as_secs().max(1).to_string(),
-            "-d".into(),
-            body.to_string(),
-            self.target.clone(),
-            method.into(),
-        ];
-        let out = self.docker.exec(&self.container, &argv).await?;
+        let mut out = self.docker.exec(&self.container, &call_argv(&self.target, method, body, timeout, true)).await?;
+        if descriptor_failure(out.exit_code, &out.stderr) {
+            out = self.docker.exec(&self.container, &call_argv(&self.target, method, body, timeout, false)).await?;
+            if out.exit_code == 0 {
+                self.write_protoset().await;
+            }
+        }
         if out.exit_code == 0 {
             let text = out.stdout.trim();
             if text.is_empty() {
@@ -153,6 +185,34 @@ pub fn rpc_names(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_argv_uses_the_descriptor_set_or_reflection() {
+        let body = json!({ "objectId": "0x6" });
+        let with = call_argv("f:9000", "sui.rpc.v2.LedgerService/GetObject", &body, Duration::from_secs(60), true);
+        assert_eq!(with[..4], ["grpcurl", "-plaintext", "-protoset", PROTOSET]);
+        assert_eq!(with[4..], ["-max-time", "60", "-d", r#"{"objectId":"0x6"}"#, "f:9000", "sui.rpc.v2.LedgerService/GetObject"]);
+        let without = call_argv("f:9000", "sui.rpc.v2.LedgerService/GetObject", &body, Duration::from_millis(10), false);
+        assert_eq!(without, ["grpcurl", "-plaintext", "-max-time", "1", "-d", r#"{"objectId":"0x6"}"#, "f:9000", "sui.rpc.v2.LedgerService/GetObject"]);
+        assert!(!without.iter().any(|a| a == "-protoset"));
+    }
+
+    #[test]
+    fn protoset_is_written_whole_then_moved() {
+        let argv = protoset_argv("f:9000");
+        assert_eq!(argv[..2], ["sh", "-c"]);
+        assert!(argv[2].contains("-protoset-out \"/tmp/sui.protoset.$$\" \"$1\" describe") && argv[2].ends_with("&& mv \"/tmp/sui.protoset.$$\" /tmp/sui.protoset"), "{}", argv[2]);
+        assert_eq!(argv[3..], ["sh", "f:9000"]);
+    }
+
+    #[test]
+    fn descriptor_failures_are_told_apart_from_call_errors() {
+        assert!(descriptor_failure(1, "Failed to process proto descriptor sets.: could not load protoset file \"/tmp/sui.protoset\": open /tmp/sui.protoset: no such file or directory"));
+        assert!(descriptor_failure(1, "Error invoking method \"grpc.health.v1.Health/Check\": target server does not expose service \"grpc.health.v1.Health\""));
+        assert!(!descriptor_failure(1, "Failed to dial target host \"f:9000\": context deadline exceeded"));
+        assert!(!descriptor_failure(69, "ERROR:\n  Code: NotFound\n  Message: does not expose"));
+        assert!(!descriptor_failure(0, ""));
+    }
 
     #[test]
     fn classifies_grpcurl_exits() {
