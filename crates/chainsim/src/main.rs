@@ -6,6 +6,7 @@
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
+mod chains;
 mod install;
 
 use chainsim_core::docker::Docker;
@@ -16,7 +17,7 @@ use chainsim_core::profile::{self, Profile};
 use chainsim_core::{envelope, Adapter, Error, ErrorCode, Result};
 use chainsim_evm::EvmAdapter;
 use chainsim_sui::SuiAdapter;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde_json::{json, Value};
 
 #[derive(Parser)]
@@ -33,6 +34,8 @@ struct Cli {
 enum Command {
     /// List the chains, or one chain's engine, maturity, operations, tokens and limits.
     Describe { chain: Option<String> },
+    /// Every supported chain with its engine and the features it supports.
+    Chains,
     /// Start a fork and print the fork object. Returns a running fork of the same name and chain as is.
     Up {
         chain: String,
@@ -322,6 +325,7 @@ fn describe(chain: Option<&str>) -> Result<Value> {
         "chains": chains,
         "commands": [
             "describe [<chain>]",
+            "chains",
             "up <chain> [--name <n>] [--block <n>] [--network <net> --alias <host>] [--publish]",
             "ls",
             "status <name>",
@@ -471,6 +475,7 @@ fn to_value<T: serde::Serialize>(r: Result<T>) -> Result<Value> {
 async fn run(command: Command) -> Result<Value> {
     match command {
         Command::Describe { chain } => describe(chain.as_deref()),
+        Command::Chains => chains::data(),
         Command::Up { chain, name, block, network, alias, publish } => {
             let profile = profile::get(&chain)?;
             let req = UpRequest { name: name.unwrap_or_else(|| profile.key.clone()), block, network, alias, publish };
@@ -557,7 +562,8 @@ fn print(value: &Value, pretty: bool) {
 #[tokio::main]
 async fn main() {
     let pretty_default = std::io::stdout().is_terminal();
-    let cli = match Cli::try_parse() {
+    let parsed = Cli::command().after_help(chains::epilog()).try_get_matches().and_then(|m| Cli::from_arg_matches(&m));
+    let cli = match parsed {
         Ok(cli) => cli,
         Err(e) => {
             use clap::error::ErrorKind;
@@ -577,6 +583,14 @@ async fn main() {
         }
     };
     let pretty = pretty_default && !cli.json;
+    // In a terminal, `chains` is a table for people. Piped or with --json it is the envelope.
+    if pretty && matches!(cli.command, Command::Chains) {
+        if let Ok(data) = chains::data() {
+            let mut out = std::io::stdout().lock();
+            let _ = write!(out, "{}", chains::table(&data)).and_then(|()| out.flush());
+            std::process::exit(0);
+        }
+    }
     let result = run(cli.command).await;
     let (out, code) = envelope::render(&result);
     print(&out, pretty);

@@ -1,6 +1,7 @@
 {
   "engines": {
     "foundry": {
+      "name": "Foundry anvil",
       "version": "v1.8.5",
       "user": "foundry",
       "home": "/home/foundry/.foundry",
@@ -14,6 +15,7 @@
       }
     },
     "arc-foundry": {
+      "name": "Circle arc-foundry",
       "version": "v0.8.0-2",
       "user": "chainsim",
       "home": "/home/chainsim/.foundry",
@@ -36,6 +38,7 @@
       }
     },
     "sui-fork-chainsim": {
+      "name": "Mysten sui-fork",
       "version": "mainnet-v1.81.1-485d5ec0a773",
       "user": "65534:65534",
       "build": {
@@ -68,6 +71,7 @@
       }
     },
     "aptos-cli": {
+      "name": "Aptos CLI",
       "version": "9.6.0",
       "user": "10001:10001",
       "build": {
@@ -87,6 +91,7 @@
       }
     },
     "control-grpcurl": {
+      "name": "grpcurl",
       "version": "1.9.3",
       "user": "grpcurl",
       "pull": {
@@ -99,6 +104,7 @@
       }
     },
     "control-curl": {
+      "name": "curl",
       "version": "8.16.0",
       "user": "curl_user",
       "pull": {

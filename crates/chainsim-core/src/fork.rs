@@ -156,6 +156,37 @@ pub enum SetKind {
     Resource { struct_tag: String, bcs: String },
 }
 
+impl SetKind {
+    /// The kind as the CLI names it: `chainsim set <name> <kind> ...`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Storage { .. } => "storage",
+            Self::Code => "code",
+            Self::Balance => "balance",
+            Self::Token { .. } => "token",
+            Self::Owner => "owner",
+            Self::Precompile { .. } => "precompile",
+            Self::Object { .. } => "object",
+            Self::Resource { .. } => "resource",
+        }
+    }
+
+    /// One value of each kind, in the order `chains` lists them, so an
+    /// adapter's `supports_set` can be asked about every kind.
+    pub fn examples() -> Vec<SetKind> {
+        vec![
+            Self::Balance,
+            Self::Token { coin_type: String::new(), from: None },
+            Self::Storage { slot: String::new() },
+            Self::Code,
+            Self::Owner,
+            Self::Object { fields: vec![], bcs: None },
+            Self::Resource { struct_tag: String::new(), bcs: String::new() },
+            Self::Precompile { calldata: String::new(), result: None },
+        ]
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SetRequest {
     pub kind: SetKind,

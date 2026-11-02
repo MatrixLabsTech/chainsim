@@ -45,6 +45,16 @@ const MOCK_L1_BASE_FEE: u64 = 255074;
 
 pub const OPERATIONS: &[&str] = &["describe", "up", "down", "ls", "status", "fund", "snapshot", "revert", "call", "send", "set", "selftest"];
 
+/// Whether `set <kind>` works on this profile. It mirrors the arms of
+/// `EvmAdapter::set`, and the match makes a new kind a compile error here.
+pub fn supports_set(profile: &Profile, kind: &SetKind) -> bool {
+    match kind {
+        SetKind::Storage { .. } | SetKind::Code | SetKind::Balance => true,
+        SetKind::Precompile { .. } => profile.hypercore.is_some(),
+        SetKind::Token { .. } | SetKind::Owner | SetKind::Object { .. } | SetKind::Resource { .. } => false,
+    }
+}
+
 pub struct EvmAdapter {
     docker: Docker,
     lock: EngineLock,

@@ -18,6 +18,8 @@ pub struct EngineLock {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Engine {
+    /// The engine as people know it, such as `Foundry anvil`.
+    pub name: Option<String>,
     pub version: String,
     /// The user the engine runs as, when the image allows a non-root user.
     pub user: Option<String>,
@@ -187,6 +189,7 @@ mod tests {
 
     fn pull(platforms: &[(&str, &str)]) -> Engine {
         Engine {
+            name: None,
             version: "v1".into(),
             user: None,
             home: None,

@@ -25,6 +25,15 @@ use serde_json::{json, Value};
 use state::*;
 use units::*;
 
+/// Whether `set <kind>` works on Aptos. It mirrors the arms of
+/// `AptosAdapter::set`, and the match makes a new kind a compile error here.
+pub fn supports_set(_profile: &Profile, kind: &SetKind) -> bool {
+    match kind {
+        SetKind::Balance | SetKind::Token { .. } | SetKind::Resource { .. } => true,
+        SetKind::Storage { .. } | SetKind::Code | SetKind::Owner | SetKind::Object { .. } | SetKind::Precompile { .. } => false,
+    }
+}
+
 pub const OPERATIONS: &[&str] = &["describe", "up", "down", "ls", "status", "fund", "send", "set", "snapshot", "revert", "time", "mine", "call", "selftest"];
 
 /// The variable that may hold an API key for the upstream fullnode. It is

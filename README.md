@@ -139,17 +139,18 @@ The full contract, with every error code, is in [docs/agent-contract.md](docs/ag
 
 | Chain | Engine | Details |
 | --- | --- | --- |
-| <img src="assets/chains/ethereum.svg" height="32" alt="Ethereum"> &nbsp;**Ethereum mainnet** | Foundry anvil v1.8.5 | [chains/ethereum](chains/ethereum/README.md) |
-| <img src="assets/chains/arc.svg" height="32" alt="Arc"> &nbsp;**Arc mainnet** | Circle arc-foundry v0.8.0-2 | [chains/arc](chains/arc/README.md) |
-| <img src="assets/chains/robinhood-chain.png" height="32" alt="Robinhood Chain"> &nbsp;**Robinhood Chain mainnet** | Foundry anvil v1.8.5 with an ArbGasInfo mock | [chains/robinhood](chains/robinhood/README.md) |
-| <img src="assets/chains/sui.svg" height="32" alt="Sui"> &nbsp;**Sui mainnet** | Mysten sui-fork mainnet-v1.81.1, built with chainsim's SetObject patch | [chains/sui](chains/sui/README.md) |
-| <img src="assets/chains/aptos.svg" height="32" alt="Aptos"> &nbsp;**Aptos mainnet** | Aptos CLI 9.6.0 simulation sessions | [chains/aptos](chains/aptos/README.md) |
-| <img src="assets/chains/hyperliquid.svg" height="32" alt="Hyperliquid"> &nbsp;**HyperEVM mainnet** | Foundry anvil v1.8.5 with HyperCore precompile mocks | [chains/hyperliquid](chains/hyperliquid/README.md) |
+| <img src="assets/chains/ethereum.svg" height="32" alt="Ethereum"> &nbsp;**Ethereum mainnet** `ethereum-mainnet` | Foundry anvil v1.8.5 | [chains/ethereum](chains/ethereum/README.md) |
+| <img src="assets/chains/arc.svg" height="32" alt="Arc"> &nbsp;**Arc mainnet** `arc-mainnet` | Circle arc-foundry v0.8.0-2 | [chains/arc](chains/arc/README.md) |
+| <img src="assets/chains/robinhood-chain.png" height="32" alt="Robinhood Chain"> &nbsp;**Robinhood Chain mainnet** `robinhood-mainnet` | Foundry anvil v1.8.5 with an ArbGasInfo mock | [chains/robinhood](chains/robinhood/README.md) |
+| <img src="assets/chains/sui.svg" height="32" alt="Sui"> &nbsp;**Sui mainnet** `sui-mainnet` | Mysten sui-fork mainnet-v1.81.1-485d5ec0a773, built with chainsim's SetObject patch | [chains/sui](chains/sui/README.md) |
+| <img src="assets/chains/aptos.svg" height="32" alt="Aptos"> &nbsp;**Aptos mainnet** `aptos-mainnet` | Aptos CLI 9.6.0 simulation sessions | [chains/aptos](chains/aptos/README.md) |
+| <img src="assets/chains/hyperliquid.svg" height="32" alt="Hyperliquid"> &nbsp;**HyperEVM mainnet** `hyperevm-mainnet` | Foundry anvil v1.8.5 with HyperCore precompile mocks | [chains/hyperliquid](chains/hyperliquid/README.md) |
 
 The chain logos are trademarks of their owners and identify the chains only.
 
 Each chain page says what is specific to it: engine, tokens, funding, `send` and `set` support,
-and selftest checks. `chainsim describe` prints the same from the binary.
+and selftest checks. `chainsim chains` prints every chain's engine and the features it
+supports, and `chainsim describe <chain>` prints one chain's details.
 
 ## Aptos
 

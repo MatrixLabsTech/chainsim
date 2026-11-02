@@ -41,6 +41,15 @@ const DATA: &str = "/data";
 /// A throwaway receiver for the selftest transfer, never active on mainnet.
 const ST_RECEIVER: &str = "0x000000000000000000000000000000000000000000000000000000000000c5e2";
 
+/// Whether `set <kind>` works on Sui. It mirrors the arms of
+/// `SuiAdapter::set`, and the match makes a new kind a compile error here.
+pub fn supports_set(_profile: &Profile, kind: &SetKind) -> bool {
+    match kind {
+        SetKind::Balance | SetKind::Token { .. } | SetKind::Owner | SetKind::Object { .. } => true,
+        SetKind::Storage { .. } | SetKind::Code | SetKind::Resource { .. } | SetKind::Precompile { .. } => false,
+    }
+}
+
 pub const OPERATIONS: &[&str] = &["describe", "up", "down", "ls", "status", "fund", "send", "set", "snapshot", "revert", "call", "selftest"];
 
 /// One fork's control path, profile and handle, for the transaction helpers.
