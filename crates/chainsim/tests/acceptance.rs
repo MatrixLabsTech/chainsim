@@ -628,9 +628,12 @@ fn hyperevm_market_scripting() {
 
     // A 0.1 BTC long at about 16x, and a resting bid 8% under the book.
     let long = margin_wallet(name, 31);
-    let ioc = send_action(name, &long, &limit_order(0, true, (best_ask * 101 / 100) as u64, 10_000_000, false, 3, 0));
+    // The fill walks the live book, so its average price lies between the best ask and the limit.
+    let limit = best_ask * 101 / 100;
+    let ioc = send_action(name, &long, &limit_order(0, true, limit as u64, 10_000_000, false, 3, 0));
     let r = ioc["result"].as_str().unwrap();
-    assert!(r.starts_with(&format!("filled 0.1 at {}, fee ", btc["bestAsk"].as_str().unwrap())), "{ioc}");
+    let avg = r.strip_prefix("filled 0.1 at ").and_then(|s| s.split(',').next()).unwrap_or_else(|| panic!("{ioc}"));
+    assert!((best_ask..=limit).contains(&fixed(avg, 8)), "average {avg} outside best ask {} and limit: {ioc}", btc["bestAsk"]);
     assert_eq!(read_btc_szi(name, reader, &long), 10_000);
     let bidder = margin_wallet(name, 32);
     let bid_px = best_bid * 92 / 100 / 100_000_000 * 100_000_000;
