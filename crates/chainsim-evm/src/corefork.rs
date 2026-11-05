@@ -103,13 +103,14 @@ impl Engine<'_> {
         Ok(out)
     }
 
-    /// One info API request, or its answer read before the command took the lock.
+    /// One info API request, or its answer read before the command took the
+    /// lock. Either counts as one call.
     async fn info(&self, body: Value, calls: &mut u32) -> Result<Value> {
+        *calls += 1;
         let read = self.prefetched.lock().expect("prefetch cache").get(&body.to_string()).cloned();
         if let Some(v) = read {
             return Ok(v);
         }
-        *calls += 1;
         let (url, env) = self.info.clone().unwrap_or_else(|| (INFO_DEFAULT.to_string(), INFO_ENV.to_string()));
         let info_next = || format!("retry in a minute, or export {env}=<info API URL>");
         let reply = self.control.post(&Target::Http(url), &body.to_string(), Duration::from_secs(30)).await.map_err(|e| e.next(info_next()))?;
@@ -283,8 +284,13 @@ impl EvmAdapter {
     }
 
     /// The info API reads a helper makes for a perp the copy does not track
-    /// yet, done before the lock so other clients do not wait on them.
+    /// yet, and the book a refresh reads, done before the lock so other
+    /// clients do not wait on them. A read the helper then does not ask for
+    /// is unused, and one it asks for that is not here goes to the info API.
     async fn prefetch(&self, eng: &Engine<'_>, op: &CoreOp) -> Result<()> {
+        if let CoreOp::Book { coin } = op {
+            return self.prefetch_book(eng, coin).await;
+        }
         let perp = match op {
             CoreOp::Price { perp, .. } if *perp >= hc::DEX_SIZE => *perp,
             CoreOp::Funding { perp, .. } => *perp,
@@ -304,6 +310,30 @@ impl EvmAdapter {
         } else {
             eng.prefetch(json!({ "type": "metaAndAssetCtxs" }), &mut calls).await?;
         }
+        Ok(())
+    }
+
+    /// `book`: the perp's meta when the copy does not track it (as
+    /// `resolve_perp` reads it), then its l2Book.
+    async fn prefetch_book(&self, eng: &Engine<'_>, coin: &str) -> Result<()> {
+        let Some(state) = coresync::load_state(eng).await? else { return Ok(()) };
+        let mut calls = 0u32;
+        let tracked = state.perps.iter().find(|(a, p)| p.name.eq_ignore_ascii_case(coin) || coin.parse::<u32>().ok() == Some(**a)).map(|(_, p)| p.name.clone());
+        let name = match (tracked, coin.split_once(':')) {
+            (Some(name), _) => name,
+            // An index the copy does not track: resolved under the lock.
+            (None, _) if coin.parse::<u32>().is_ok() => return Ok(()),
+            (None, Some((dex, _))) => {
+                eng.prefetch(json!({ "type": "perpDexs" }), &mut calls).await?;
+                eng.prefetch(json!({ "type": "metaAndAssetCtxs", "dex": dex }), &mut calls).await?;
+                coin.to_string()
+            }
+            (None, None) => {
+                eng.prefetch(json!({ "type": "metaAndAssetCtxs" }), &mut calls).await?;
+                coin.to_string()
+            }
+        };
+        eng.prefetch(json!({ "type": "l2Book", "coin": name }), &mut calls).await?;
         Ok(())
     }
 

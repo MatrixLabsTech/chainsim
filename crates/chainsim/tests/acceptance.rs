@@ -1269,6 +1269,7 @@ fn hyperevm_set_hypercore_releases_the_lease_per_step() {
     // Commands that read mainnet: a book refresh, and perps the copy does not track yet.
     let mut waits = Vec::new();
     for (label, args) in [
+        ("book on an untracked HIP-3 perp", vec!["set", name, "hypercore", "book", "xyz:HOOD", "--live"]),
         ("book BTC --live", vec!["set", name, "hypercore", "book", "BTC", "--live"]),
         ("price on an untracked HIP-3 perp", vec!["set", name, "hypercore", "price", "10000", "1"]),
         ("funding on an untracked perp", vec!["set", name, "hypercore", "funding", "2", "0.00001"]),
