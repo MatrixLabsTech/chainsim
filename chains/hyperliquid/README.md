@@ -533,7 +533,21 @@ position, szi 100 (0.001 BTC in szDecimals 5):
 "0x0000000000000000000000000000000000000000000000000000000000000064000000000000000000000000000000000000000000000000000000000004a7b238…"
 ```
 
-The proxy's overhead was about 0.1 to 0.2 ms per request in this run.
+The proxy's overhead was about 0.1 to 0.2 ms per request in this run. A batch with no
+transaction, mining or chainsim method goes to anvil as one request.
+
+### Requests during a chainsim command
+
+A chainsim command that changes HyperCore state holds a lock in the proxy, and other clients'
+requests wait while it holds it. Commands read the info API and the upstream first, with no lock
+held, except `set hypercore book --live`, which reads its book under the lock. They then change
+Core state in steps, each under the lock on its own, and each step leaves the state whole. A
+request served between two steps sees the state after the last finished step, and a transaction
+that lands between steps is applied by the next step, as any other block is. `time --replay`
+takes one step per candle, and `set hypercore mirror` takes three: the perps and tokens the
+account needs, the account, then its EVM balances. In the 2026-11-04 run, a client sending
+`eth_blockNumber` every 50 ms waited at most 397 ms during a mirror of the 177-position HLP vault
+above, and at most 359 ms during `set hypercore book BTC --live`.
 
 ### Block types
 

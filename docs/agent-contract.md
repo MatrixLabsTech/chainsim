@@ -68,9 +68,10 @@ error codes from the binary.
   allBorrowLendReserveStates, with `"dex"` for builder-deployed dexes. `wsUrl` is the proxy too: a
   transaction sent over a WebSocket is applied to HyperCore after its block, as over HTTP, and
   `eth_subscribe` works as on anvil. Other clients' requests wait while a chainsim command
-  changes HyperCore state, and `time --replay` changes it one candle at a time, so a request
-  waits at most one candle and a transaction sent between candles is applied before the next
-  one. `describe
+  changes HyperCore state. Commands read the info API before they take the lock, except
+  `set hypercore book --live`. `time --replay` takes the lock one candle at a time and
+  `set hypercore mirror` in three steps, so a request waits at most one step, and a transaction
+  sent between steps is applied by the next one. `describe
   hyperevm-mainnet` lists the info request types and RPC methods the proxy serves, and in
   `limits` what HyperCore does not model.
 - On Sui, `selftest` has a `funding-health` part that fails when the funder or the USDC holder
