@@ -128,12 +128,12 @@
           "amd64": {
             "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.10-ac9e3226c6a6/hyperevm-proxy-0.1.10-ac9e3226c6a6-linux-amd64.tar.gz",
             "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.10-ac9e3226c6a6/hyperevm-proxy-0.1.10-ac9e3226c6a6-linux-amd64.tar.gz.sha256",
-            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+            "sha256": "f6d21b9852383b8b2695c6115886941d62bf68098a2dfe30e927999759192a54"
           },
           "arm64": {
             "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.10-ac9e3226c6a6/hyperevm-proxy-0.1.10-ac9e3226c6a6-linux-arm64.tar.gz",
             "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.10-ac9e3226c6a6/hyperevm-proxy-0.1.10-ac9e3226c6a6-linux-arm64.tar.gz.sha256",
-            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+            "sha256": "61ed9529f88eb000da94c3d883bd2d34690f48a51f111b07e5766df5d1915f21"
           }
         }
       }
