@@ -119,6 +119,11 @@ fn reply(id: &Value, result: Result<Value>) -> Value {
     }
 }
 
+/// A method the proxy only forwards to anvil.
+fn forwards_as_is(method: &str) -> bool {
+    !(method.starts_with("chainsim_") || method == "eth_bigBlockGasPrice" || method == "eth_usingBigBlocks" || SENDS.contains(&method) || MINING.contains(&method))
+}
+
 fn head_of(v: &Value) -> u64 {
     v.as_str().and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).unwrap_or(0)
 }
@@ -252,6 +257,19 @@ impl Proxy {
     /// A JSON-RPC body: one request or a batch.
     async fn rpc(&self, body: &Value, peer: IpAddr) -> Value {
         match body.as_array() {
+            Some(batch) if !batch.is_empty() && batch.iter().all(|r| forwards_as_is(r["method"].as_str().unwrap_or_default())) => {
+                // Nothing in it sends, mines or is answered here: anvil takes
+                // it whole, after one catch-up, with no apply in between.
+                let (_g, holder) = self.enter(peer).await;
+                let result: Result<Value> = async {
+                    if !holder {
+                        self.sync_if_behind().await?;
+                    }
+                    self.engine.forward(body).await
+                }
+                .await;
+                result.unwrap_or_else(|e| reply(&Value::Null, Err(e)))
+            }
             Some(batch) => {
                 let mut out = Vec::with_capacity(batch.len());
                 for req in batch {
@@ -351,5 +369,20 @@ async fn main() {
             let service = hyper::service::service_fn(move |req| serve(proxy.clone(), req, addr.ip()));
             let _ = hyper::server::conn::http1::Builder::new().keep_alive(true).serve_connection(TokioIo::new(stream), service).with_upgrades().await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_batches_of_plain_methods_go_to_anvil_whole() {
+        for m in ["anvil_setStorageAt", "eth_getCode", "eth_call", "eth_blockNumber", "anvil_setCode"] {
+            assert!(forwards_as_is(m), "{m}");
+        }
+        for m in ["chainsim_coreLock", "chainsim_coreUnlock", "eth_bigBlockGasPrice", "eth_usingBigBlocks", "eth_sendRawTransaction", "eth_sendTransaction", "evm_mine", "anvil_mine", "evm_revert", "anvil_reset"] {
+            assert!(!forwards_as_is(m), "{m}");
+        }
     }
 }
