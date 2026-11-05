@@ -1240,6 +1240,99 @@ fn hyperevm_replay_releases_the_lease_per_candle() {
     println!("whole run: {:.1} s", started.elapsed().as_secs_f64());
 }
 
+/// How long a client polling every 50 ms waits while each `set hypercore`
+/// command runs, and how long the command takes.
+fn measure_set(network: &str, rpc: &str, name: &str, label: &str, args: &[&str]) -> (Value, f64, Vec<f64>) {
+    let (mut out, mut took) = (Value::Null, 0.0);
+    let ms = probe_waits(network, rpc, &format!("chainsim-{name}-probe"), || {
+        let t = Instant::now();
+        out = ok(args);
+        took = t.elapsed().as_secs_f64();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    });
+    println!("{label}: {took:.2} s, eth_blockNumber during it: {}", wait_summary(&ms));
+    (out, took, ms)
+}
+
+#[test]
+#[ignore]
+fn hyperevm_set_hypercore_releases_the_lease_per_step() {
+    use chainsim_evm::hypercore::{encode_action, word_addr, word_u};
+    let name = "acc-steps";
+    chainsim(&["down", name]);
+    let started = Instant::now();
+    let fork = ok(&["up", "hyperevm-mainnet", "--name", name]);
+    let (network, rpc) = (fork["network"].as_str().unwrap().to_string(), fork["rpcUrl"].as_str().unwrap().to_string());
+    ok(&["set", name, "balance", ADDR_A, "10"]);
+    ok(&["set", name, "hypercore", "spot-balance", ADDR_A, "0", "100000000000"]);
+
+    // Commands that read mainnet: a book refresh, and perps the copy does not track yet.
+    let mut waits = Vec::new();
+    for (label, args) in [
+        ("book BTC --live", vec!["set", name, "hypercore", "book", "BTC", "--live"]),
+        ("price on an untracked HIP-3 perp", vec!["set", name, "hypercore", "price", "10000", "1"]),
+        ("funding on an untracked perp", vec!["set", name, "hypercore", "funding", "2", "0.00001"]),
+        ("position on an untracked perp", vec!["set", name, "hypercore", "position", ADDR_B, "3", "100", "1000000", "--leverage", "5"]),
+        ("spot-balance (local)", vec!["set", name, "hypercore", "spot-balance", ADDR_B, "0", "100000000"]),
+        ("big-blocks (local)", vec!["set", name, "hypercore", "big-blocks", ADDR_B, "on"]),
+    ] {
+        let (_, _, ms) = measure_set(&network, &rpc, name, label, &args);
+        waits.push((label, ms[ms.len() - 1]));
+    }
+
+    // A mirror of an account with many perps, while A sends 1 USDC on Core.
+    let to = fresh_address(19);
+    let whale = HLP_CHILDREN[0];
+    let (mut mirror, mut took, mut sent) = (Value::Null, 0.0, Value::Null);
+    let ms = probe_waits(&network, &rpc, &format!("chainsim-{name}-probe"), || {
+        std::thread::scope(|s| {
+            let send = s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                cast_action(&network, &rpc, KEY_A, &encode_action(6, &[word_addr(to.parse().unwrap()), word_u(0), word_u(100_000_000)].concat()))
+            });
+            let t = Instant::now();
+            mirror = ok(&["set", name, "hypercore", "mirror", whale]);
+            took = t.elapsed().as_secs_f64();
+            sent = send.join().unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    });
+    println!("mirror {whale}: {took:.2} s, {} positions, {} info calls, eth_blockNumber during it: {}", mirror["positions"], mirror["infoCalls"], wait_summary(&ms));
+    waits.push(("mirror of an HLP vault", ms[ms.len() - 1]));
+
+    // A mirror of an account with spot balances and borrow and lend state.
+    let lender = LEND_USERS[0];
+    let (lend, _, ms) = measure_set(&network, &rpc, name, &format!("mirror {lender}"), &["set", name, "hypercore", "mirror", lender]);
+    waits.push(("mirror of a borrow and lend account", ms[ms.len() - 1]));
+
+    for (label, max) in &waits {
+        println!("max wait {label}: {max:.0} ms");
+    }
+
+    // The mirrored account reads back as the mirror reported it.
+    let state = ok(&["call", name, "hypercore_state", whale]);
+    let positions = state["clearinghouseState"]["assetPositions"].as_array().unwrap();
+    assert_eq!(json!(positions.len()), mirror["positions"], "{state}");
+    assert_eq!(state["clearinghouseState"]["marginSummary"]["accountValue"], mirror["accountValue"]);
+    assert!(fixed(mirror["accountValue"].as_str().unwrap(), 6) > 0, "{mirror}");
+    let state = ok(&["call", name, "hypercore_state", lender]);
+    assert_eq!(json!(state["borrowLendUserState"]["tokenToState"].as_array().map_or(0, Vec::len)), lend["borrowLend"], "{state}");
+
+    // The send that landed during the mirror is applied once.
+    let block = u64::from_str_radix(sent["blockNumber"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+    println!("spot send in block {block}");
+    let spot = info(&network, &rpc, json!({ "type": "spotClearinghouseState", "user": to }));
+    let usdc = spot["balances"].as_array().unwrap().iter().find(|b| b["coin"] == "USDC").cloned().unwrap_or_else(|| panic!("{spot}"));
+    assert_eq!(fixed(usdc["total"].as_str().unwrap(), 8), 100_000_000, "{spot}");
+
+    for (label, max) in &waits {
+        assert!(*max < 1000.0, "a request waited {max:.0} ms during {label}");
+    }
+    ok(&["down", name]);
+    assert_gone(name);
+    println!("whole run: {:.1} s", started.elapsed().as_secs_f64());
+}
+
 #[test]
 #[ignore]
 fn hyperevm_lend_liquidation_and_isolated_margin() {
