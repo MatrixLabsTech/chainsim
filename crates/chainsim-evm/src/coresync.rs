@@ -260,28 +260,29 @@ pub async fn settle_credits(rpc: &dyn CoreRpc, state: &mut State) -> Result<()> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::core::{Perp, Spot, TokenMeta};
     use crate::hypercore::{encode_action, word_addr, word_u};
     use std::sync::Mutex;
 
-    const ALICE: Address = Address::repeat_byte(0xa1);
-    const BOB: Address = Address::repeat_byte(0xb0);
+    pub(crate) const ALICE: Address = Address::repeat_byte(0xa1);
+    pub(crate) const BOB: Address = Address::repeat_byte(0xb0);
 
     /// anvil and the proxy's lock, in memory. At the first unlock another
     /// client's transaction lands in a block of its own, and with `proxy_applies`
     /// the proxy brings Core up to it at once, as it does for a client's send.
     #[derive(Default)]
-    struct Chain {
-        state: Mutex<Option<String>>,
+    pub(crate) struct Chain {
+        /// Code by address.
+        pub(crate) code: Mutex<std::collections::BTreeMap<String, String>>,
         /// (number, timestamp) of each block, oldest first.
-        blocks: Mutex<Vec<(u64, u64)>>,
-        logs: Mutex<Vec<Value>>,
-        next_time: Mutex<Option<u64>>,
-        trace: Mutex<Vec<&'static str>>,
-        pending: Mutex<Option<Value>>,
-        proxy_applies: bool,
+        pub(crate) blocks: Mutex<Vec<(u64, u64)>>,
+        pub(crate) logs: Mutex<Vec<Value>>,
+        pub(crate) next_time: Mutex<Option<u64>>,
+        pub(crate) trace: Mutex<Vec<&'static str>>,
+        pub(crate) pending: Mutex<Option<Value>>,
+        pub(crate) proxy_applies: bool,
     }
 
     impl Chain {
@@ -302,9 +303,9 @@ mod tests {
     impl CoreRpc for Chain {
         async fn call(&self, method: &str, params: Value) -> Result<Value> {
             Ok(match method {
-                "eth_getCode" => json!(self.state.lock().unwrap().clone().unwrap_or("0x".into())),
+                "eth_getCode" => json!(self.code.lock().unwrap().get(params[0].as_str().unwrap()).cloned().unwrap_or("0x".into())),
                 "anvil_setCode" => {
-                    *self.state.lock().unwrap() = params[1].as_str().map(str::to_string);
+                    self.code.lock().unwrap().insert(params[0].as_str().unwrap().to_string(), params[1].as_str().unwrap().to_string());
                     Value::Null
                 }
                 "eth_getBlockByNumber" => {
@@ -360,7 +361,7 @@ mod tests {
     }
 
     /// A RawAction log of `payload` sent by `user`.
-    fn raw_action(user: Address, payload: &[u8]) -> Value {
+    pub(crate) fn raw_action(user: Address, payload: &[u8]) -> Value {
         let mut data = word_u(32).to_vec();
         data.extend(word_u(payload.len() as u128));
         data.extend(payload);

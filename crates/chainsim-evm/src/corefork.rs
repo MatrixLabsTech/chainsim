@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use alloy_primitives::U256;
+use alloy_primitives::{Address, U256};
 use chainsim_core::control::Target;
 use chainsim_core::docker::ForkHandle;
 use chainsim_core::profile::Profile;
@@ -26,8 +26,8 @@ use crate::{now_secs, Engine, EvmAdapter, CALL_TIMEOUT};
 /// The default Hyperliquid info API, replaced by `CHAINSIM_HYPERLIQUID_INFO`.
 pub const INFO_DEFAULT: &str = "https://api.hyperliquid.xyz/info";
 pub const INFO_ENV: &str = "CHAINSIM_HYPERLIQUID_INFO";
-/// Requests per batch, below the control path's argument size limit.
-const BATCH: usize = 150;
+/// The largest batch body, below the control path's 128 KiB argument limit.
+const BATCH_BYTES: usize = 100_000;
 
 /// A `set hypercore` helper.
 #[derive(Debug, Clone)]
@@ -83,9 +83,9 @@ impl Engine<'_> {
     /// Several JSON-RPC calls in one request per batch. Any error fails the whole call.
     pub(crate) async fn rpc_batch(&self, calls: &[(&str, Value)]) -> Result<Vec<Value>> {
         let mut out = Vec::with_capacity(calls.len());
-        for chunk in calls.chunks(BATCH) {
-            let body: Vec<Value> = chunk.iter().enumerate().map(|(i, (m, p))| json!({ "jsonrpc": "2.0", "id": i, "method": m, "params": p })).collect();
-            let reply = self.control.post(&self.url, &Value::Array(body).to_string(), CALL_TIMEOUT).await?;
+        for (chunk, body) in batch_bodies(calls) {
+            let chunk = &calls[chunk];
+            let reply = self.control.post(&self.url, &body, CALL_TIMEOUT).await?;
             let v: Value = serde_json::from_str(&reply.body).map_err(|_| Error::new(ErrorCode::EngineFailed, format!("batch of {}: HTTP {} with a body that is not JSON-RPC", chunk.len(), reply.status)))?;
             let mut replies = v.as_array().cloned().ok_or_else(|| Error::new(ErrorCode::EngineFailed, format!("batch of {}: the engine did not answer a list", chunk.len())))?;
             replies.sort_by_key(|r| r["id"].as_u64().unwrap_or(u64::MAX));
@@ -103,8 +103,12 @@ impl Engine<'_> {
         Ok(out)
     }
 
-    /// One info API request.
+    /// One info API request, or its answer read before the command took the lock.
     async fn info(&self, body: Value, calls: &mut u32) -> Result<Value> {
+        let read = self.prefetched.lock().expect("prefetch cache").get(&body.to_string()).cloned();
+        if let Some(v) = read {
+            return Ok(v);
+        }
         *calls += 1;
         let (url, env) = self.info.clone().unwrap_or_else(|| (INFO_DEFAULT.to_string(), INFO_ENV.to_string()));
         let info_next = || format!("retry in a minute, or export {env}=<info API URL>");
@@ -118,6 +122,36 @@ impl Engine<'_> {
         serde_json::from_str(&reply.body).map_err(|_| Error::new(ErrorCode::UpstreamUnavailable, format!("info API {}: the answer is not JSON", body["type"])).next(info_next()))
     }
 
+    /// Reads an info API answer now, for a step that runs later under the lock.
+    async fn prefetch(&self, body: Value, calls: &mut u32) -> Result<Value> {
+        let v = self.info(body.clone(), calls).await?;
+        self.prefetched.lock().expect("prefetch cache").insert(body.to_string(), v.clone());
+        Ok(v)
+    }
+}
+
+/// The calls split into JSON-RPC batch bodies of at most [`BATCH_BYTES`]
+/// each (a single larger call goes alone), with the range each one covers.
+fn batch_bodies(calls: &[(&str, Value)]) -> Vec<(std::ops::Range<usize>, String)> {
+    let mut out = Vec::new();
+    let (mut start, mut body) = (0, String::new());
+    for (i, (m, p)) in calls.iter().enumerate() {
+        let one = json!({ "jsonrpc": "2.0", "id": i - start, "method": m, "params": p }).to_string();
+        if !body.is_empty() && body.len() + one.len() + 2 > BATCH_BYTES {
+            out.push((start..i, format!("[{body}]")));
+            start = i;
+            body = json!({ "jsonrpc": "2.0", "id": 0, "method": m, "params": p }).to_string();
+            continue;
+        }
+        if !body.is_empty() {
+            body.push(',');
+        }
+        body.push_str(&one);
+    }
+    if !body.is_empty() {
+        out.push((start..calls.len(), format!("[{body}]")));
+    }
+    out
 }
 
 /// Precompile prices are decimal strings with up to 6 - szDecimals decimals.
@@ -232,17 +266,48 @@ impl EvmAdapter {
             return Err(Error::unsupported(&format!("set hypercore on {}", profile.key), "only HyperEVM has HyperCore"));
         }
         let eng = self.engine(&handle, &profile);
-        let lease = self.core_lock(&eng).await?;
-        let r = self.hypercore_locked(&handle, &profile, &eng, op).await;
-        self.core_unlock(&eng, &lease).await;
-        let (mut out, mut entry) = r?;
+        let (mut out, mut entry) = match op {
+            CoreOp::Mirror { user } => self.mirror(&handle, &eng, &profile, &user).await?,
+            op => {
+                self.prefetch(&eng, &op).await?;
+                let lease = self.core_lock(&eng).await?;
+                let r = self.hypercore_locked(&handle, &eng, op).await;
+                self.core_unlock(&eng, &lease).await;
+                r?
+            }
+        };
         entry["at"] = json!(now_secs());
         chainsim_core::mods::record(&self.docker, name, &entry).await?;
         out["note"] = json!(chainsim_core::mods::NOTE);
         Ok(out)
     }
 
-    async fn hypercore_locked(&self, handle: &ForkHandle, profile: &Profile, eng: &Engine<'_>, op: CoreOp) -> Result<(Value, Value)> {
+    /// The info API reads a helper makes for a perp the copy does not track
+    /// yet, done before the lock so other clients do not wait on them.
+    async fn prefetch(&self, eng: &Engine<'_>, op: &CoreOp) -> Result<()> {
+        let perp = match op {
+            CoreOp::Price { perp, .. } if *perp >= hc::DEX_SIZE => *perp,
+            CoreOp::Funding { perp, .. } => *perp,
+            CoreOp::Position { perp, .. } => *perp as u32,
+            _ => return Ok(()),
+        };
+        if coresync::load_state(eng).await?.is_none_or(|s| s.perps.contains_key(&perp)) {
+            return Ok(());
+        }
+        let mut calls = 0u32;
+        if matches!(op, CoreOp::Price { .. }) {
+            // A builder-deployed perp: the dex list, then the dex's meta.
+            let list = eng.prefetch(json!({ "type": "perpDexs" }), &mut calls).await?;
+            if let Some((_, name)) = dex_names(&list).into_iter().find(|(d, _)| *d == hc::dex_of(perp)) {
+                eng.prefetch(json!({ "type": "metaAndAssetCtxs", "dex": name }), &mut calls).await?;
+            }
+        } else {
+            eng.prefetch(json!({ "type": "metaAndAssetCtxs" }), &mut calls).await?;
+        }
+        Ok(())
+    }
+
+    async fn hypercore_locked(&self, handle: &ForkHandle, eng: &Engine<'_>, op: CoreOp) -> Result<(Value, Value)> {
         let mut state = coresync::sync_locked(eng).await?.ok_or_else(|| Error::new(ErrorCode::Internal, "this fork has no HyperCore state").next(format!("chainsim down {0} && chainsim up {1} --name {0}", handle.name, handle.chain)))?;
         let mut calls = 0u32;
         match op {
@@ -350,7 +415,7 @@ impl EvmAdapter {
                     json!({ "kind": "set-hypercore", "helper": "book", "coin": name, "time": summary["time"] }),
                 ))
             }
-            CoreOp::Mirror { user } => self.mirror(eng, profile, &mut state, &user).await,
+            CoreOp::Mirror { .. } => Err(Error::new(ErrorCode::Internal, "mirror takes the HyperCore lock per step")),
             CoreOp::IsolatedMargin { user, perp, usd } => {
                 let who = parse_address(&user)?;
                 let ntli = hc::parse_dec(usd.trim().trim_start_matches('+'), 6).and_then(|v| i64::try_from(v).ok()).ok_or_else(|| Error::new(ErrorCode::Usage, format!("{usd:?} is not a USD amount, such as +25 or -10.5")))?;
@@ -464,105 +529,94 @@ impl EvmAdapter {
 
     /// `set hypercore mirror <user>`: the user's Core state from the info API,
     /// and its native HYPE and profile token balances from the upstream.
-    async fn mirror(&self, eng: &Engine<'_>, profile: &Profile, state: &mut State, user: &str) -> Result<(Value, Value)> {
+    /// Every read comes first, with no lock held. Then each step takes the
+    /// lock on its own and leaves Core state whole: the perps, tokens and dex
+    /// metas the account needs, then the account, then its EVM balances.
+    async fn mirror(&self, handle: &ForkHandle, eng: &Engine<'_>, profile: &Profile, user: &str) -> Result<(Value, Value)> {
         let who = parse_address(user)?;
         let started = Instant::now();
         let mut calls = 0u32;
-        let ch = eng.info(json!({ "type": "clearinghouseState", "user": who.to_string().to_lowercase() }), &mut calls).await?;
-        let sch = eng.info(json!({ "type": "spotClearinghouseState", "user": who.to_string().to_lowercase() }), &mut calls).await?;
-        let by_name: BTreeSet<String> = state.perps.values().map(|p| p.name.clone()).collect();
-        let wanted: Vec<String> = ch["assetPositions"].as_array().map_or(vec![], |a| a.iter().filter_map(|p| p["position"]["coin"].as_str().map(str::to_string)).filter(|c| !by_name.contains(c)).collect());
-        if !wanted.is_empty() {
-            let meta = eng.info(json!({ "type": "metaAndAssetCtxs" }), &mut calls).await?;
-            let universe = meta[0]["universe"].as_array().cloned().unwrap_or_default();
-            let assets: Vec<u32> = wanted.iter().filter_map(|c| universe.iter().position(|u| u["name"] == json!(c)).map(|i| i as u32)).collect();
-            // Uses the same meta: one more call would only repeat it.
-            let mut entries = Vec::new();
-            for a in assets {
-                let (u, ctx) = (&universe[a as usize], &meta[1][a as usize]);
-                let d = u["szDecimals"].as_u64().unwrap_or(0) as u8;
-                state.perps.insert(a, perp_from_ctx(u, ctx, &meta[0]["marginTables"]));
-                if let (Some(m), Some(o)) = (ctx["markPx"].as_str().and_then(|s| raw_px(s, d)), ctx["oraclePx"].as_str().and_then(|s| raw_px(s, d))) {
-                    entries.push(Entry { precompile: hypercore::MARK_PX, calldata: hypercore::word_u(a as u128).to_vec(), result: hypercore::word_u(m as u128).to_vec() });
-                    entries.push(Entry { precompile: hypercore::ORACLE_PX, calldata: hypercore::word_u(a as u128).to_vec(), result: hypercore::word_u(o as u128).to_vec() });
-                }
-            }
-            coresync::store(eng, state, &entries).await?;
-        }
-        let unknown: Vec<u64> = sch["balances"].as_array().map_or(vec![], |b| b.iter().filter_map(|x| x["token"].as_u64()).filter(|t| !state.tokens.contains_key(t)).collect());
-        if !unknown.is_empty() {
-            let spot = eng.info(json!({ "type": "spotMeta" }), &mut calls).await?;
-            add_tokens(state, &spot, unknown.into_iter());
-        }
-        let mut skipped = state.mirror_perps(who, &ch);
-        skipped.extend(state.mirror_spot(who, &sch));
-
-        // Builder-deployed dexes the user has value on, each with its own balance and positions.
-        let mut dexes = Vec::new();
-        let list = eng.info(json!({ "type": "perpDexs" }), &mut calls).await?;
-        for (index, name) in dex_names(&list) {
-            let chd = eng.info(json!({ "type": "clearinghouseState", "user": who.to_string().to_lowercase(), "dex": name }), &mut calls).await?;
-            let positions: Vec<String> = chd["assetPositions"].as_array().map_or(vec![], |a| a.iter().filter_map(|p| p["position"]["coin"].as_str().map(str::to_string)).collect());
-            let value = chd["marginSummary"]["accountValue"].as_str().and_then(|v| hc::parse_dec(v, 6)).unwrap_or(0);
-            if positions.is_empty() && value == 0 {
-                continue;
-            }
-            let raw = self.dex_meta(eng, index, &name, &mut calls).await?;
-            let universe = raw[0]["universe"].as_array().cloned().unwrap_or_default();
-            let mut entries = Vec::new();
-            for coin in &positions {
-                if let Some(local) = universe.iter().position(|u| u["name"] == json!(coin)) {
-                    let perp = index * hc::DEX_SIZE + local as u32;
-                    if !state.perps.contains_key(&perp) {
-                        entries.extend(insert_perp(state, perp, &raw, local, &list[index as usize]).unwrap_or_default());
-                    }
-                }
-            }
-            coresync::store(eng, state, &entries).await?;
-            skipped.extend(state.mirror_dex(who, index, &chd));
-            dexes.push(name);
-        }
-
-        // Borrow and lend positions and the account abstraction.
-        let lend = eng.info(json!({ "type": "borrowLendUserState", "user": who.to_string().to_lowercase() }), &mut calls).await?;
-        let abstraction = eng.info(json!({ "type": "userAbstraction", "user": who.to_string().to_lowercase() }), &mut calls).await?;
-        skipped.extend(state.mirror_lend(who, &lend, &abstraction).into_iter().map(|t| format!("borrow and lend token {t}")));
-        let answers = state.answers(&BTreeSet::from([who]));
-        coresync::store(eng, state, &answers).await?;
+        let f = self.mirror_fetch(handle, eng, who, &mut calls).await?;
 
         // The EVM side: native HYPE and the profile tokens, read from the upstream.
         let addr = who.to_string();
         let mut rpc = 0u32;
-        let mut evm = Vec::new();
         let native = parse_qty(&eng.upstream("eth_getBalance", json!([addr, "latest"])).await?)?;
         rpc += 1;
-        eng.set_balance(&addr, native).await?;
-        let (sym, dec) = profile.native.as_ref().map_or(("HYPE".to_string(), 18), |n| (n.symbol.clone(), n.decimals));
-        evm.push(json!({ "asset": sym, "amount": format_amount(native, dec) }));
+        let mut tokens = Vec::new();
         for t in profile.tokens.iter().filter(|t| !t.native_view) {
             let out = eng.upstream("eth_call", json!([{ "to": t.address, "data": balance_of(who) }, "latest"])).await?;
             rpc += 1;
-            let bal = parse_qty(&out)?;
-            // A zero balance needs no write: the copy reads untouched accounts from the upstream.
-            if bal > U256::ZERO {
-                eng.deal(&t.address, who, bal).await?;
-            }
-            evm.push(json!({ "asset": t.symbol, "amount": format_amount(bal, t.decimals) }));
+            tokens.push((t, parse_qty(&out)?));
         }
+
+        let (state, skipped) = mirror_apply(eng, eng, &f).await?;
+        let lease = self.core_lock(eng).await?;
+        let r = async {
+            eng.set_balance(&addr, native).await?;
+            for (t, bal) in &tokens {
+                // A zero balance needs no write: the copy reads untouched accounts from the upstream.
+                if *bal > U256::ZERO {
+                    eng.deal(&t.address, who, *bal).await?;
+                }
+            }
+            Ok::<(), Error>(())
+        }
+        .await;
+        self.core_unlock(eng, &lease).await;
+        r?;
+
+        let (sym, dec) = profile.native.as_ref().map_or(("HYPE".to_string(), 18), |n| (n.symbol.clone(), n.decimals));
+        let mut evm = vec![json!({ "asset": sym, "amount": format_amount(native, dec) })];
+        evm.extend(tokens.iter().map(|(t, bal)| json!({ "asset": t.symbol, "amount": format_amount(*bal, t.decimals) })));
         let info = state.info(who, 0);
         let positions = info["clearinghouseState"]["assetPositions"].as_array().map_or(0, Vec::len);
         let balances = info["spotClearinghouseState"]["balances"].as_array().map_or(0, |b| b.iter().filter(|x| x["total"] != "0.0").count());
+        let dexes: Vec<&str> = f.dexes.iter().map(|d| d.name.as_str()).collect();
         chainsim_core::log(format_args!("mirrored {addr}: {calls} info API calls, {rpc} upstream RPC calls, {} ms", started.elapsed().as_millis()));
         Ok((
             json!({
                 "kind": "hypercore", "helper": "mirror", "user": addr, "positions": positions, "spotBalances": balances,
                 "accountValue": info["clearinghouseState"]["marginSummary"]["accountValue"], "dexes": dexes,
-                "borrowLend": info["borrowLendUserState"]["tokenToState"].as_array().map_or(0, Vec::len), "abstraction": abstraction,
+                "borrowLend": info["borrowLendUserState"]["tokenToState"].as_array().map_or(0, Vec::len), "abstraction": f.abstraction,
                 "evm": evm, "skipped": skipped,
                 "infoCalls": calls, "upstreamCalls": rpc,
             }),
             json!({ "kind": "set-hypercore", "helper": "mirror", "user": addr, "positions": positions }),
         ))
+    }
+
+    /// The mirror's info API reads, planned from the Core state as it is now
+    /// and made with no lock held.
+    async fn mirror_fetch(&self, handle: &ForkHandle, eng: &Engine<'_>, who: Address, calls: &mut u32) -> Result<MirrorFetch> {
+        let state = coresync::load_state(eng).await?.ok_or_else(|| Error::new(ErrorCode::Internal, "this fork has no HyperCore state").next(format!("chainsim down {0} && chainsim up {1} --name {0}", handle.name, handle.chain)))?;
+        let user = who.to_string().to_lowercase();
+        let ch = eng.info(json!({ "type": "clearinghouseState", "user": user }), calls).await?;
+        let sch = eng.info(json!({ "type": "spotClearinghouseState", "user": user }), calls).await?;
+        let meta = match untracked_coins(&state, &ch).is_empty() {
+            true => None,
+            false => Some(eng.info(json!({ "type": "metaAndAssetCtxs" }), calls).await?),
+        };
+        let spot = match unknown_tokens(&state, &sch).is_empty() {
+            true => None,
+            false => Some(eng.info(json!({ "type": "spotMeta" }), calls).await?),
+        };
+        // Builder-deployed dexes the user has value on, each with its own balance and positions.
+        let list = eng.info(json!({ "type": "perpDexs" }), calls).await?;
+        let mut dexes = Vec::new();
+        for (index, name) in dex_names(&list) {
+            let ch = eng.info(json!({ "type": "clearinghouseState", "user": user, "dex": name }), calls).await?;
+            let value = ch["marginSummary"]["accountValue"].as_str().and_then(|v| hc::parse_dec(v, 6)).unwrap_or(0);
+            if position_coins(&ch).is_empty() && value == 0 {
+                continue;
+            }
+            let meta = eng.info(json!({ "type": "metaAndAssetCtxs", "dex": name }), calls).await?;
+            dexes.push(DexFetch { index, name, ch, meta });
+        }
+        // Borrow and lend positions and the account abstraction.
+        let lend = eng.info(json!({ "type": "borrowLendUserState", "user": user }), calls).await?;
+        let abstraction = eng.info(json!({ "type": "userAbstraction", "user": user }), calls).await?;
+        Ok(MirrorFetch { who, ch, sch, meta, spot, list, dexes, lend, abstraction })
     }
 
     /// `call hypercore_state [<user>]`: one user's Core state in the info API's shapes.
@@ -675,6 +729,125 @@ impl EvmAdapter {
     }
 }
 
+/// What a mirror read from the info API before it took the lock.
+#[derive(Debug, Clone)]
+pub(crate) struct MirrorFetch {
+    who: Address,
+    ch: Value,
+    sch: Value,
+    /// metaAndAssetCtxs, when the user had positions in perps the copy did not track.
+    meta: Option<Value>,
+    /// spotMeta, when the user held tokens the copy did not know.
+    spot: Option<Value>,
+    /// perpDexs.
+    list: Value,
+    dexes: Vec<DexFetch>,
+    lend: Value,
+    abstraction: Value,
+}
+
+/// A builder-deployed dex the user has value on: its clearinghouseState and metaAndAssetCtxs.
+#[derive(Debug, Clone)]
+struct DexFetch {
+    index: u32,
+    name: String,
+    ch: Value,
+    meta: Value,
+}
+
+fn position_coins(ch: &Value) -> Vec<String> {
+    ch["assetPositions"].as_array().map_or(vec![], |a| a.iter().filter_map(|p| p["position"]["coin"].as_str().map(str::to_string)).collect())
+}
+
+/// Coins the user has positions in on the main dex that the state does not track.
+fn untracked_coins(state: &State, ch: &Value) -> Vec<String> {
+    let by_name: BTreeSet<&str> = state.perps.values().map(|p| p.name.as_str()).collect();
+    position_coins(ch).into_iter().filter(|c| !by_name.contains(c.as_str())).collect()
+}
+
+fn unknown_tokens(state: &State, sch: &Value) -> Vec<u64> {
+    sch["balances"].as_array().map_or(vec![], |b| b.iter().filter_map(|x| x["token"].as_u64()).filter(|t| !state.tokens.contains_key(t)).collect())
+}
+
+/// Applies a fetched mirror in two steps, each under a lock of its own and
+/// each from the state on the fork, so blocks other clients land between
+/// them are applied once by the next catch-up. Returns the state after the
+/// last step and what was skipped.
+pub(crate) async fn mirror_apply(rpc: &dyn CoreRpc, lease: &dyn CoreLease, f: &MirrorFetch) -> Result<(State, Vec<String>)> {
+    let token = lease.lock().await?;
+    let t = Instant::now();
+    let r = mirror_track_locked(rpc, f).await;
+    lease.unlock(&token).await;
+    let tracked = t.elapsed().as_millis();
+    r?;
+    let token = lease.lock().await?;
+    let t = Instant::now();
+    let r = mirror_account_locked(rpc, f).await;
+    lease.unlock(&token).await;
+    chainsim_core::log(format_args!("mirror steps under the lock: {tracked} ms and {} ms", t.elapsed().as_millis()));
+    r
+}
+
+fn no_state() -> Error {
+    Error::new(ErrorCode::Internal, "this fork has no HyperCore state")
+}
+
+/// The perps, tokens and dex metas the account needs, with their mark and
+/// oracle answers. A perp still untracked with no meta fetched for it (a
+/// revert between the fetch and the lock) is skipped by the next step.
+async fn mirror_track_locked(rpc: &dyn CoreRpc, f: &MirrorFetch) -> Result<()> {
+    let mut state = coresync::sync_locked(rpc).await?.ok_or_else(no_state)?;
+    let mut entries = Vec::new();
+    if let Some(meta) = &f.meta {
+        let universe = meta[0]["universe"].as_array().cloned().unwrap_or_default();
+        for coin in untracked_coins(&state, &f.ch) {
+            let Some(a) = universe.iter().position(|u| u["name"] == json!(coin)) else { continue };
+            let (u, ctx) = (&universe[a], &meta[1][a]);
+            let d = u["szDecimals"].as_u64().unwrap_or(0) as u8;
+            state.perps.insert(a as u32, perp_from_ctx(u, ctx, &meta[0]["marginTables"]));
+            if let (Some(m), Some(o)) = (ctx["markPx"].as_str().and_then(|s| raw_px(s, d)), ctx["oraclePx"].as_str().and_then(|s| raw_px(s, d))) {
+                entries.push(Entry { precompile: hypercore::MARK_PX, calldata: hypercore::word_u(a as u128).to_vec(), result: hypercore::word_u(m as u128).to_vec() });
+                entries.push(Entry { precompile: hypercore::ORACLE_PX, calldata: hypercore::word_u(a as u128).to_vec(), result: hypercore::word_u(o as u128).to_vec() });
+            }
+        }
+    }
+    if let Some(spot) = &f.spot {
+        let unknown = unknown_tokens(&state, &f.sch);
+        add_tokens(&mut state, spot, unknown.into_iter());
+    }
+    if !f.dexes.is_empty() {
+        let mut snapshot = coresync::load_meta(rpc).await?;
+        for d in &f.dexes {
+            let collateral = d.meta[0]["collateralToken"].as_u64().unwrap_or(0);
+            snapshot.dexes.insert(d.name.clone(), hc::DexMeta { index: d.index, collateral, meta: Box::new(hc::Meta::from_info(&d.meta)) });
+            let universe = d.meta[0]["universe"].as_array().cloned().unwrap_or_default();
+            for coin in position_coins(&d.ch) {
+                let Some(local) = universe.iter().position(|u| u["name"] == json!(coin)) else { continue };
+                let perp = d.index * hc::DEX_SIZE + local as u32;
+                if !state.perps.contains_key(&perp) {
+                    entries.extend(insert_perp(&mut state, perp, &d.meta, local, &f.list[d.index as usize]).unwrap_or_default());
+                }
+            }
+        }
+        coresync::store_meta(rpc, &snapshot).await?;
+    }
+    coresync::store(rpc, &state, &entries).await
+}
+
+/// The account: perps on every dex, spot balances, borrow and lend, and its answers.
+async fn mirror_account_locked(rpc: &dyn CoreRpc, f: &MirrorFetch) -> Result<(State, Vec<String>)> {
+    let mut state = coresync::sync_locked(rpc).await?.ok_or_else(no_state)?;
+    let mut skipped = state.mirror_perps(f.who, &f.ch);
+    skipped.extend(state.mirror_spot(f.who, &f.sch));
+    for d in &f.dexes {
+        skipped.extend(state.mirror_dex(f.who, d.index, &d.ch));
+    }
+    skipped.extend(state.mirror_lend(f.who, &f.lend, &f.abstraction).into_iter().map(|t| format!("borrow and lend token {t}")));
+    let answers = state.answers(&BTreeSet::from([f.who]));
+    coresync::store(rpc, &state, &answers).await?;
+    Ok((state, skipped))
+}
+
 /// Inserts the perp at `local` in a metaAndAssetCtxs answer as perp index
 /// `perp`, with its dex's collateral token, and returns its mark and oracle
 /// answers. None when the meta has no such perp.
@@ -776,6 +949,71 @@ fn sets_json(entries: &[Entry]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::{Perp, Spot, TokenMeta};
+    use crate::coresync::tests::{raw_action, Chain, ALICE, BOB};
+    use crate::hypercore::{encode_action, word_addr, word_u};
+
+    const CAROL: Address = Address::repeat_byte(0xc0);
+
+    /// A BTC and an ETH position and a USDC balance, with ETH untracked so the first step adds it.
+    fn fetched() -> MirrorFetch {
+        let pos = |coin: &str, szi: &str, px: &str| json!({ "position": { "coin": coin, "szi": szi, "entryPx": px, "leverage": { "type": "cross", "value": 5 }, "marginUsed": "10.0", "unrealizedPnl": "0.0" } });
+        MirrorFetch {
+            who: CAROL,
+            ch: json!({ "assetPositions": [pos("BTC", "0.5", "95.0"), pos("ETH", "-2.0", "3.5")], "marginSummary": { "accountValue": "1000.0" } }),
+            sch: json!({ "balances": [{ "coin": "USDC", "token": 0, "total": "12.5", "hold": "0.0", "entryNtl": "0.0" }] }),
+            meta: Some(json!([
+                { "universe": [{ "name": "BTC", "szDecimals": 5, "maxLeverage": 40 }, { "name": "ETH", "szDecimals": 4, "maxLeverage": 25 }], "marginTables": [] },
+                [{ "markPx": "100.0", "oraclePx": "100.0", "funding": "0.0" }, { "markPx": "3.0", "oraclePx": "3.0", "funding": "0.0" }],
+            ])),
+            spot: None,
+            list: json!([null]),
+            dexes: vec![],
+            lend: json!({}),
+            abstraction: json!("default"),
+        }
+    }
+
+    async fn chain_with_core(proxy_applies: bool) -> Chain {
+        let chain = Chain { proxy_applies, ..Default::default() };
+        chain.blocks.lock().unwrap().push((10, 1_793_599_200));
+        let mut s = State::new();
+        s.perps.insert(0, Perp { name: "BTC".into(), sz_decimals: 5, max_leverage: 40, mark_x8: 100 * 100_000_000, oracle_x8: 100 * 100_000_000, ..Default::default() });
+        s.tokens.insert(0, TokenMeta { name: "USDC".into(), wei_decimals: 8, evm: None, sz_decimals: 8 });
+        s.accounts.entry(ALICE).or_default().spot.insert(0, Spot(50 * 100_000_000, 0, 0));
+        s.cursor = Some((10, "0xa".into()));
+        coresync::store(&chain, &s, &[]).await.unwrap();
+        chain
+    }
+
+    #[tokio::test]
+    async fn a_mirror_gives_back_the_lock_between_steps_and_applies_a_send_between_them_once() {
+        // The same mirror with no other client: what every run must end with.
+        let quiet = chain_with_core(false).await;
+        mirror_apply(&quiet, &quiet, &fetched()).await.unwrap();
+        let alone = coresync::load_state(&quiet).await.unwrap().unwrap();
+        assert_eq!(alone.accounts[&CAROL].positions[&0].szi_x8, 50_000_000);
+        assert_eq!(alone.accounts[&CAROL].positions[&1].szi_x8, -200_000_000);
+        assert_eq!(alone.accounts[&CAROL].spot[&0].0, 1_250_000_000);
+        assert_eq!(alone.perps[&1].name, "ETH");
+
+        for proxy_applies in [false, true] {
+            let chain = chain_with_core(proxy_applies).await;
+            // Alice sends Bob 7 USDC between the mirror's two steps.
+            *chain.pending.lock().unwrap() = Some(raw_action(ALICE, &encode_action(6, &[word_addr(BOB), word_u(0), word_u(7 * 100_000_000)].concat())));
+            let (returned, skipped) = mirror_apply(&chain, &chain, &fetched()).await.unwrap();
+            assert!(skipped.is_empty(), "{skipped:?}");
+            assert_eq!(*chain.trace.lock().unwrap(), ["lock", "unlock", "lock", "unlock"], "proxy_applies {proxy_applies}");
+            let s = coresync::load_state(&chain).await.unwrap().unwrap();
+            assert_eq!(s.accounts, returned.accounts);
+            // The send is applied once, whoever applied it.
+            assert_eq!(s.accounts[&BOB].spot[&0].0, 7 * 100_000_000, "proxy_applies {proxy_applies}");
+            assert_eq!(s.accounts[&ALICE].spot[&0].0, 43 * 100_000_000);
+            // The mirrored account and perps are the same as with no other client.
+            assert_eq!(s.accounts[&CAROL], alone.accounts[&CAROL], "proxy_applies {proxy_applies}");
+            assert_eq!(s.perps, alone.perps);
+        }
+    }
 
     #[test]
     fn usdc_has_no_evm_side_and_linked_tokens_do() {
@@ -805,6 +1043,29 @@ mod tests {
     fn candles_become_a_sorted_close_path() {
         let c = json!([{ "t": 2000, "c": "78230.0" }, { "t": 1000, "c": "77932.5" }, { "t": 3000 }]);
         assert_eq!(candle_path(&c), [(1000, 7_793_250_000_000), (2000, 7_823_000_000_000)]);
+    }
+
+    #[test]
+    fn batches_split_by_size_with_ids_from_zero() {
+        let word = format!("0x{}", "ab".repeat(32));
+        let calls: Vec<(&str, Value)> = (0..1000).map(|_| ("anvil_setStorageAt", json!(["0x0000000000000000000000000000000000000800", word, word]))).collect();
+        let bodies = batch_bodies(&calls);
+        assert!(bodies.len() > 1 && bodies.len() < 6, "{} bodies", bodies.len());
+        let mut next = 0;
+        for (range, body) in &bodies {
+            assert!(body.len() <= BATCH_BYTES, "{}", body.len());
+            assert_eq!(range.start, next);
+            next = range.end;
+            let v: Vec<Value> = serde_json::from_str(body).unwrap();
+            assert_eq!(v.len(), range.len());
+            assert!(v.iter().enumerate().all(|(i, c)| c["id"] == json!(i)));
+        }
+        assert_eq!(next, calls.len());
+        // A call over the limit goes alone.
+        let big = json!(["0x9999999999999999999999999999999999999999", format!("0x{}", "00".repeat(60_000))]);
+        let calls = [("eth_blockNumber", json!([])), ("anvil_setCode", big), ("eth_blockNumber", json!([]))];
+        let ranges: Vec<_> = batch_bodies(&calls).into_iter().map(|(r, _)| r).collect();
+        assert_eq!(ranges, [0..1, 1..2, 2..3]);
     }
 
     #[test]
