@@ -1,0 +1,7 @@
+{
+  "name": "stop-loss-vault-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": { "e2e": "node stop-loss.e2e.mjs" },
+  "dependencies": { "viem": "2.21.54" }
+}
