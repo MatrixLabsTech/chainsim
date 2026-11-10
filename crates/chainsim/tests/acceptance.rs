@@ -691,6 +691,65 @@ fn hyperevm_market_scripting() {
     println!("whole run: {:.1} s", started.elapsed().as_secs_f64());
 }
 
+#[test]
+#[ignore]
+fn hyperevm_book_follows_price() {
+    use chainsim_evm::hypercore::limit_order;
+    let name = "acc-bookpx";
+    chainsim(&["down", name]);
+    let fork = ok(&["up", "hyperevm-mainnet", "--name", name]);
+    let (network, rpc) = (fork["network"].as_str().unwrap().to_string(), fork["rpcUrl"].as_str().unwrap().to_string());
+    let levels = |book: &Value, side: usize| -> Vec<(i128, i128)> {
+        book["levels"][side].as_array().unwrap().iter().map(|l| (fixed(l["px"].as_str().unwrap(), 8), fixed(l["sz"].as_str().unwrap(), 8))).collect()
+    };
+    // A level moved by the ratio, on the exchange's tick (BTC has szDecimals 5), with levels that meet merged.
+    let tick = |px: i128, ask: bool| chainsim_evm::core::tick_px(px as u64, 5, ask) as i128;
+    let moved = |side: Vec<(i128, i128)>, ask: bool, to: i128, from: i128| -> Vec<(i128, i128)> {
+        let mut out: Vec<(i128, i128)> = Vec::new();
+        for (p, sz) in side {
+            let px = tick(if ask { (p * to + from - 1) / from } else { p * to / from }, ask);
+            match out.last_mut() {
+                Some(last) if last.0 == px => last.1 += sz,
+                _ => out.push((px, sz)),
+            }
+        }
+        out
+    };
+
+    // A 0.01 BTC long, then the book as it stands before the move.
+    let long = margin_wallet(name, 41);
+    let ask = levels(&info(&network, &rpc, json!({ "type": "l2Book", "coin": "BTC" })), 1)[0].0;
+    let open = send_action(name, &long, &limit_order(0, true, (ask * 101 / 100) as u64, 1_000_000, false, 3, 0));
+    assert!(open["result"].as_str().unwrap().starts_with("filled 0.01 at "), "{open}");
+    let before = info(&network, &rpc, json!({ "type": "l2Book", "coin": "BTC" }));
+    let mark = ok(&["call", name, "eth_call", &json!([{ "to": "0x0000000000000000000000000000000000000806", "data": word(0) }, "latest"]).to_string()]);
+    let mark = i128::from_str_radix(mark.as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
+
+    // Every level the info API gave is on the tick already.
+    assert!(levels(&before, 0).iter().all(|l| tick(l.0, false) == l.0) && levels(&before, 1).iter().all(|l| tick(l.0, true) == l.0), "{before}");
+
+    // 3% down: every level moves by the same ratio and keeps its size.
+    let drop = mark * 97 / 100;
+    ok(&["set", name, "hypercore", "price", "0", &drop.to_string()]);
+    let after = info(&network, &rpc, json!({ "type": "l2Book", "coin": "BTC" }));
+    let (bids, asks) = (levels(&after, 0), levels(&after, 1));
+    let (moved_bids, moved_asks) = (moved(levels(&before, 0), false, drop, mark), moved(levels(&before, 1), true, drop, mark));
+    assert!(!bids.is_empty() && bids == moved_bids, "bids {bids:?} are not {moved_bids:?}");
+    assert!(!asks.is_empty() && asks == moved_asks, "asks {asks:?} are not {moved_asks:?}");
+    println!("mark {mark} to {drop}: best bid {} to {}, best ask {} to {}, {} bid and {} ask levels", before["levels"][0][0]["px"], after["levels"][0][0]["px"], before["levels"][1][0]["px"], after["levels"][1][0]["px"], bids.len(), asks.len());
+
+    // An IOC close 5% under the new mark fills inside the moved book, from its best bid down.
+    let limit = drop * 10_000_000 * 95 / 100;
+    let close = send_action(name, &long, &limit_order(0, false, limit as u64, 1_000_000, true, 3, 0));
+    let r = close["result"].as_str().unwrap();
+    let avg = fixed(r.strip_prefix("filled 0.01 at ").and_then(|s| s.split(',').next()).unwrap_or_else(|| panic!("{close}")), 8);
+    assert!((limit..=bids[0].0).contains(&avg), "average {avg} outside the limit {limit} and the moved best bid {}: {close}", bids[0].0);
+    println!("close: {r}");
+
+    ok(&["down", name]);
+    assert_gone(name);
+}
+
 /// Foundry's image, as the lock pins it, for plain `cast` against the fork.
 const FOUNDRY: &str = "ghcr.io/foundry-rs/foundry:v1.8.5@sha256:32c8ea9ef052a440cb1620175987a3f49eff8b068a0c6a3d09ebf7f5f9a0e043";
 const CURL: &str = "curlimages/curl:8.10.1";

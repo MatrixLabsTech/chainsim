@@ -170,6 +170,21 @@ pub fn impact_notional(name: &str) -> u64 {
     }
 }
 
+/// A perp price (x8) on Hyperliquid's tick: at most 5 significant figures
+/// and 6 minus szDecimals decimals, with integer prices always valid. An ask
+/// rounds up and a bid rounds down.
+pub fn tick_px(px_x8: u64, sz_decimals: u8, ask: bool) -> u64 {
+    let decimals = 10u64.pow(2 + (sz_decimals as u32).min(6));
+    let digits = px_x8.checked_ilog10().map_or(0, |d| d + 1);
+    let figures = 10u64.pow(digits.saturating_sub(5)).min(100_000_000);
+    let step = decimals.max(figures);
+    if ask {
+        px_x8.div_ceil(step) * step
+    } else {
+        px_x8 / step * step
+    }
+}
+
 /// The average price of taking `ntl` (x6) from one side of a book, x8, or
 /// the last level's price when the book is thinner than that.
 pub fn impact_px(levels: &Levels, ntl: u64) -> Option<u64> {
@@ -265,7 +280,8 @@ pub struct TokenMeta {
 /// One side of a book: (price x8, size x8), best first.
 pub type Levels = Vec<(u64, u64)>;
 
-/// An order book snapshot.
+/// A perp's order book: the levels the info API gave, moved with every
+/// price scripted since.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Book {
     #[serde(rename = "b")]
@@ -275,6 +291,32 @@ pub struct Book {
     /// The snapshot time in ms, from the info API.
     #[serde(rename = "t")]
     pub time: u64,
+}
+
+impl Book {
+    /// Moves every level's price by `to / from`, the ratio of a mark price
+    /// move, and keeps the sizes. Bids round down and asks round up, so the
+    /// sides never meet. Levels that land on one price merge.
+    pub fn scale(&mut self, to: u64, from: u64) {
+        if from == 0 || to == from {
+            return;
+        }
+        let moved = |levels: &Levels, up: bool| -> Levels {
+            let mut out: Levels = Vec::with_capacity(levels.len());
+            for &(px, sz) in levels {
+                let n = px as u128 * to as u128;
+                let px = (if up { n.div_ceil(from as u128) } else { n / from as u128 }) as u64;
+                match out.last_mut() {
+                    Some(last) if last.0 == px => last.1 += sz,
+                    _ if px > 0 => out.push((px, sz)),
+                    _ => {}
+                }
+            }
+            out
+        };
+        self.bids = moved(&self.bids, false);
+        self.asks = moved(&self.asks, true);
+    }
 }
 
 /// A spot balance: total, hold and entry notional.
@@ -1021,12 +1063,14 @@ impl State {
             sz = sz.min(pos.unsigned_abs());
         }
         // Makers: book levels then resting orders of other users, best price first.
+        // A level trades at its price on the exchange's tick and is found by its stored price.
         let book = &self.books[&asset];
         let side = if is_buy { &book.asks } else { &book.bids };
         let crosses = |p: u64| if is_buy { p <= px } else { p >= px };
-        let mut makers: Vec<(u64, Option<u64>)> = side.iter().filter(|(p, _)| crosses(*p)).map(|(p, _)| (*p, None)).collect();
-        makers.extend(self.orders.iter().filter(|o| o.asset == asset && o.is_buy != is_buy && o.user != user && crosses(o.px_x8)).map(|o| (o.px_x8, Some(o.oid))));
-        makers.sort_by(|a, b| if is_buy { a.0.cmp(&b.0) } else { b.0.cmp(&a.0) }.then(a.1.is_some().cmp(&b.1.is_some())));
+        let mut makers: Vec<(u64, Option<u64>, u64)> = side.iter().map(|(p, _)| (self.level_px(asset, *p, is_buy), None, *p)).filter(|m| crosses(m.0)).collect();
+        makers.extend(self.orders.iter().filter(|o| o.asset == asset && o.is_buy != is_buy && o.user != user && crosses(o.px_x8)).map(|o| (o.px_x8, Some(o.oid), o.px_x8)));
+        let best_first = |a: u64, b: u64| if is_buy { a.cmp(&b) } else { b.cmp(&a) };
+        makers.sort_by(|a, b| best_first(a.0, b.0).then(a.1.is_some().cmp(&b.1.is_some())).then(best_first(a.2, b.2)));
         makers.dedup();
         if tif == 1 && !makers.is_empty() {
             return "rejected: ALO order would cross the book".into();
@@ -1041,7 +1085,7 @@ impl State {
         self.next_oid = order_oid + 1;
         let mut left = sz;
         let (mut filled, mut cost, mut taker_fee) = (0u64, 0u128, 0u64);
-        for (mpx, oid) in makers {
+        for (mpx, oid, stored) in makers {
             if left == 0 {
                 break;
             }
@@ -1049,7 +1093,7 @@ impl State {
                 None => {
                     let book = self.books.get_mut(&asset).expect("book");
                     let side = if is_buy { &mut book.asks } else { &mut book.bids };
-                    let Some(i) = side.iter().position(|(p, _)| *p == mpx) else { continue };
+                    let Some(i) = side.iter().position(|(p, _)| *p == stored) else { continue };
                     let q = left.min(side[i].1);
                     side[i].1 -= q;
                     if side[i].1 == 0 {
@@ -1259,17 +1303,29 @@ impl State {
             .sum()
     }
 
-    /// Moves a perp's mark and oracle to `px` at block time `time`, then
-    /// fills the resting orders the price crosses (as makers, at their own
-    /// price) and liquidates accounts below maintenance margin.
+    /// Moves a perp's mark and oracle to `px` at block time `time`. The
+    /// perp's book levels move by the same ratio with their sizes kept (the
+    /// stored prices stay exact and leave the model on the tick), then
+    /// the resting orders the price or the moved book crosses fill (as
+    /// makers, at their own price), positions reprice at the new mark and
+    /// accounts below maintenance margin are liquidated.
     pub fn set_price(&mut self, asset: u32, px: u64, time: u64) -> Applied {
         self.now = time;
         let mut applied = Applied::default();
         if let Some(p) = self.perps.get_mut(&asset) {
+            if let Some(book) = self.books.get_mut(&asset) {
+                book.scale(px, p.mark_x8);
+            }
             p.mark_x8 = px;
             p.oracle_x8 = px;
         }
-        let crossed: Vec<Order> = self.orders.iter().filter(|o| o.asset == asset && if o.is_buy { o.px_x8 >= px } else { o.px_x8 <= px }).cloned().collect();
+        let (bid, ask) = self.books.get(&asset).map_or((None, None), |b| (b.bids.first().map(|l| self.level_px(asset, l.0, false)), b.asks.first().map(|l| self.level_px(asset, l.0, true))));
+        let crossed: Vec<Order> = self
+            .orders
+            .iter()
+            .filter(|o| o.asset == asset && if o.is_buy { o.px_x8 >= px || ask.is_some_and(|a| o.px_x8 >= a) } else { o.px_x8 <= px || bid.is_some_and(|b| o.px_x8 <= b) })
+            .cloned()
+            .collect();
         for o in crossed {
             self.orders.retain(|x| x.oid != o.oid);
             let f = fee(notional(o.sz_x8, o.px_x8), true);
@@ -1782,22 +1838,28 @@ impl State {
         })
     }
 
+    /// The price a book level shows and trades at: its stored price on the
+    /// perp's tick, so a level moved by an exact ratio stays a valid price.
+    fn level_px(&self, asset: u32, px: u64, ask: bool) -> u64 {
+        self.perps.get(&asset).map_or(px, |p| tick_px(px, p.sz_decimals, ask))
+    }
+
     /// The best bid and ask of a perp's book on the copy, with its own resting orders.
     fn best(&self, asset: u32) -> (Option<u64>, Option<u64>) {
         let book = self.books.get(&asset);
-        let bid = book.and_then(|b| b.bids.first().map(|l| l.0)).into_iter().chain(self.orders.iter().filter(|o| o.asset == asset && o.is_buy).map(|o| o.px_x8)).max();
-        let ask = book.and_then(|b| b.asks.first().map(|l| l.0)).into_iter().chain(self.orders.iter().filter(|o| o.asset == asset && !o.is_buy).map(|o| o.px_x8)).min();
+        let bid = book.and_then(|b| b.bids.first().map(|l| self.level_px(asset, l.0, false))).into_iter().chain(self.orders.iter().filter(|o| o.asset == asset && o.is_buy).map(|o| o.px_x8)).max();
+        let ask = book.and_then(|b| b.asks.first().map(|l| self.level_px(asset, l.0, true))).into_iter().chain(self.orders.iter().filter(|o| o.asset == asset && !o.is_buy).map(|o| o.px_x8)).min();
         (bid, ask)
     }
 
-    /// The copy's book in the info API's `l2Book` shape: snapshot levels and
-    /// resting orders merged by price, best first.
+    /// The copy's book in the info API's `l2Book` shape: book levels at
+    /// their tick price and resting orders, merged by price, best first.
     fn l2_book(&self, asset: u32, time_ms: u64) -> Value {
         let book = self.books.get(&asset).cloned().unwrap_or_default();
         let side = |levels: &Levels, buy: bool| -> Vec<Value> {
             let mut merged: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
             for (p, sz) in levels {
-                let e = merged.entry(*p).or_default();
+                let e = merged.entry(self.level_px(asset, *p, !buy)).or_default();
                 e.0 += sz;
                 e.1 += 1;
             }
@@ -2325,6 +2387,85 @@ mod tests {
         assert_eq!(s.accounts[&ALICE].usd, usd(10_000.0) - usd(0.01425));
         assert_eq!(s.orders.len(), 1);
         assert!(s.accounts[&ALICE].history.last().unwrap().1.starts_with("oid 1 bought 1.0 BTC at 95.0 as the price moved to 94.0, fee 0.01425 USD"));
+    }
+
+    #[test]
+    fn a_price_move_shifts_the_book_levels_and_keeps_resting_orders() {
+        let mut s = state();
+        run(&mut s, 11, ALICE, limit_order(0, true, x8(95.0), x8(1.0), false, 2, 0));
+        // 3% down: every level moves 3% with its size, the bid at 95 stays where it was placed.
+        assert_eq!(s.set_price(0, x8(97.0), 100).fills, 0);
+        let b = &s.books[&0];
+        assert_eq!(b.bids, vec![(x8(96.03), x8(1.0)), (x8(95.06), x8(3.0))]);
+        assert_eq!(b.asks, vec![(x8(97.97), x8(1.0)), (x8(98.94), x8(2.0))]);
+        assert_eq!((s.orders.len(), s.orders[0].px_x8), (1, x8(95.0)));
+        // A further move through 95 fills it at its own price.
+        let a = s.set_price(0, x8(94.0), 200);
+        assert_eq!(a.fills, 1);
+        assert_eq!(s.accounts[&ALICE].positions[&0].entry_ntl, 95_000_000);
+        assert_eq!(s.books[&0].bids[0], (x8(93.06), x8(1.0)));
+    }
+
+    #[test]
+    fn an_ioc_sell_after_a_price_move_fills_at_the_moved_best_bid() {
+        let mut s = state();
+        run(&mut s, 11, ALICE, limit_order(0, true, x8(101.0), x8(1.0), false, 3, 0));
+        s.set_price(0, x8(97.0), 100);
+        // The moved best bid, 96.03, trades on the 0.1 tick of a perp with szDecimals 5.
+        assert!(run(&mut s, 12, ALICE, limit_order(0, false, x8(90.0), x8(1.0), true, 3, 0)).starts_with("filled 1.0 at 96.0,"));
+        assert_eq!(s.books[&0].bids, vec![(x8(95.06), x8(3.0))]);
+    }
+
+    #[test]
+    fn a_moved_book_that_reaches_a_resting_order_fills_it() {
+        let mut s = state();
+        // A book refreshed under the mark: asks from 95 while the mark is 100.
+        s.books.insert(0, Book { bids: vec![(x8(94.0), x8(1.0))], asks: vec![(x8(95.0), x8(1.0))], time: 2 });
+        run(&mut s, 11, ALICE, limit_order(0, true, x8(93.0), x8(1.0), false, 2, 0));
+        // Mark 97, best ask 92.15 (92.2 on the tick): the bid at 93 is under the mark and inside the moved book.
+        assert_eq!(s.set_price(0, x8(97.0), 100).fills, 1);
+        assert!(s.orders.is_empty());
+    }
+
+    #[test]
+    fn moved_levels_show_on_the_tick_and_merge_while_an_accounts_order_keeps_its_price() {
+        let mut s = state();
+        s.books.insert(0, Book { bids: vec![(x8(99.1), x8(1.0)), (x8(99.0), x8(2.0))], asks: vec![(x8(101.0), x8(1.0)), (x8(102.0), x8(2.0))], time: 1 });
+        run(&mut s, 11, ALICE, limit_order(0, true, x8(45.3), x8(1.0), false, 2, 0));
+        s.set_price(0, x8(50.0), 100);
+        // Stored levels keep the exact ratio.
+        assert_eq!(s.books[&0].bids, vec![(x8(49.55), x8(1.0)), (x8(49.5), x8(2.0))]);
+        let m = meta();
+        let book = s.info_request(&m, &json!({ "type": "l2Book", "coin": "BTC" }), 0).unwrap();
+        // 49.55 and 49.5 are one level at 49.5, and Alice's bid stays at 45.3.
+        assert_eq!(book["levels"][0], json!([{ "px": "49.5", "sz": "3.0", "n": 2 }, { "px": "45.3", "sz": "1.0", "n": 1 }]));
+        assert_eq!(book["levels"][1], json!([{ "px": "50.5", "sz": "1.0", "n": 1 }, { "px": "51.0", "sz": "2.0", "n": 1 }]));
+        assert_eq!(s.orders[0].px_x8, x8(45.3));
+        // A sell through both merged levels fills 3 at 49.5.
+        s.account(BOB).usd = usd(10_000.0);
+        assert!(run(&mut s, 12, BOB, limit_order(0, false, x8(49.0), x8(3.0), false, 3, 0)).starts_with("filled 3.0 at 49.5,"));
+        assert!(s.books[&0].bids.is_empty());
+    }
+
+    #[test]
+    fn tick_prices_follow_the_exchange_rule() {
+        // 5 significant figures, 6 minus szDecimals decimals, integers always valid.
+        assert_eq!((tick_px(x8(72160.17299918), 5, false), tick_px(x8(72160.17299918), 5, true)), (x8(72160.0), x8(72161.0)));
+        assert_eq!((tick_px(x8(1234.56), 2, false), tick_px(x8(1234.56), 2, true)), (x8(1234.5), x8(1234.6)));
+        assert_eq!(tick_px(x8(0.0012345), 0, false), x8(0.001234));
+        assert_eq!(tick_px(x8(0.012345), 1, false), x8(0.01234));
+        assert_eq!(tick_px(x8(123456.0), 0, true), x8(123456.0));
+        assert_eq!(tick_px(x8(123456.7), 0, true), x8(123457.0));
+        for valid in [78258.0, 1234.5, 0.001234, 402.61, 99.0] {
+            assert_eq!((tick_px(x8(valid), 0, false), tick_px(x8(valid), 0, true)), (x8(valid), x8(valid)));
+        }
+    }
+
+    #[test]
+    fn scaled_levels_round_apart_and_merge_on_one_price() {
+        let mut b = Book { bids: vec![(3, 1), (2, 1)], asks: vec![(4, 1), (5, 1), (6, 1)], time: 0 };
+        b.scale(1, 2);
+        assert_eq!((b.bids, b.asks), (vec![(1, 2)], vec![(2, 1), (3, 2)]));
     }
 
     #[test]
@@ -2956,6 +3097,21 @@ mod tests {
         // Premium 0.002 (impact mid 1002 over 1000), clamp -0.0005: 0.5 x 0.0015 / 8 = 0.00009375.
         assert_eq!(s.perps[&10_000].funding_e12, 93_750_000);
         assert_eq!(s.accounts[&ALICE].positions[&10_000].funding_paid, 937_500);
+    }
+
+    #[test]
+    fn hip3_premium_holds_across_a_price_move() {
+        let mut s = hip3();
+        s.books.insert(10_000, Book { bids: vec![(100_100_000_000, 10_000_000_000)], asks: vec![(100_300_000_000, 10_000_000_000)], time: 0 });
+        let p = s.perps.get_mut(&10_000).unwrap();
+        (p.mark_x8, p.oracle_x8, p.hip3_funding) = (100_000_000_000, 100_000_000_000, Some(Hip3Funding { multiplier_e12: 500_000_000_000, rate_e12: FUNDING_RATE_E12, clamp_e12: FUNDING_CLAMP_E12 }));
+        let t0 = 1_793_599_200;
+        s.apply(&[], (20, "0x14".into()), t0);
+        // 3% down: the book follows, so the impact mid stays 0.2% over the oracle.
+        s.set_price(10_000, 97_000_000_000, t0 + 10);
+        assert_eq!(s.books[&10_000].bids[0].0, 97_097_000_000);
+        s.apply(&[], (21, "0x15".into()), t0 + 3600);
+        assert_eq!(s.perps[&10_000].funding_e12, 93_750_000);
     }
 
     #[test]

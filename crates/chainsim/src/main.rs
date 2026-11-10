@@ -227,6 +227,7 @@ enum SetWhat {
 #[derive(Subcommand)]
 enum HyperCoreWhat {
     /// A perp's mark price (0x806) and oracle price (0x807), in the precompile's raw units.
+    /// The perp's order book moves by the same ratio.
     /// With --spot, a spot pair's price (0x808), which also moves the collateral it prices.
     Price {
         /// The perp (dex x 10000 + index for HIP-3), or the spot pair with --spot.
