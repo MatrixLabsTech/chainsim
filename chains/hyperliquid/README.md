@@ -310,16 +310,15 @@ The mirrored account reads back with mainnet's figures:
   over 20 and its maintenance margin the value over 100.
 - `clearinghouseState` gives each position's `liquidationPx` by Hyperliquid's
   [liquidation price formula](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/liquidations),
-  and `null` when no positive price liquidates it.
-- `withdrawable` is the account value less the larger of the margin used and 10% of the total
-  position value, the
-  [transfer margin rule](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/margining).
+  with the margin tier the position is in at that price, and `null` when no positive price
+  liquidates it.
 
-In a run on 2026-11-10 the vault's 177 positions read back with total margin used 163,398.81
-USD against 163,392.01 and 163,435.09 on mainnet just before and after the mirror, maintenance
-margin 32,679.76 against 32,678.40 and 32,687.02, and withdrawable 2,809,610.54 against
-2,809,623.98 and 2,809,297.66. Of the 97 liquidation prices mainnet gave, 96 matched within one
-basis point.
+In a run on 2026-11-10 the vault's 177 positions read back with total margin used 163,713.49
+USD against 163,713.51 and 163,705.34 on mainnet just before and after the mirror, maintenance
+margin 32,742.70 against 32,742.70 and 32,741.07, and withdrawable 2,806,938.39 against
+2,806,938.36 and 2,807,033.42. All 97 liquidation prices mainnet gave matched within one basis
+point, and one hour on the fork's clock added size times oracle price times the rate to each
+position's cumulative funding.
 
 ### Orders
 
@@ -440,6 +439,10 @@ profile limits say:
   rate. Longs pay shorts when the rate is positive, and shorts pay longs when it is negative.
   `up` takes each seeded perp's last settled rate from the info API's `fundingHistory`.
 - Fills pay the base-tier fees: 0.045% of the notional for the taker and 0.015% for the maker.
+- `withdrawable` is the account value less the larger of the margin used and 10% of the total
+  position value, Hyperliquid's transfer margin rule, less the margin open orders hold. It bounds
+  USD class transfers, `sendAsset` and isolated margin added. A new order checks the account
+  value less the margin in use.
 
 ### Move the price
 
