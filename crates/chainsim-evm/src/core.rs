@@ -1899,7 +1899,13 @@ impl State {
             let entry_px = (p.entry_ntl as u128 * X16_TO_X6 / size as u128) as i128 / cut * cut;
             let liquidation_px = if p.isolated { self.liquidation_px(*asset, p, p.isolated_raw_usd as i128 + upnl, self.maintenance_of(*asset, p, value as u64) as i128) } else { self.liquidation_px(*asset, p, m.account_value as i128, maintenance as i128) };
             let liquidation_px = liquidation_px.map(|px| fmt_dec(px as i128, 8));
-            let roe = if p.entry_ntl > 0 { upnl * p.leverage as i128 * 10_000_000_000 / p.entry_ntl as i128 } else { 0 };
+            // Ten decimals, rounded half away from zero as the info API does.
+            let roe = if p.entry_ntl > 0 {
+                let (n, d) = (upnl * p.leverage as i128 * 10_000_000_000, p.entry_ntl as i128);
+                (2 * n + n.signum() * d) / (2 * d)
+            } else {
+                0
+            };
             let mut lev = json!({ "type": if p.isolated { "isolated" } else { "cross" }, "value": p.leverage });
             if p.isolated {
                 lev["rawUsd"] = json!(usd((p.isolated_raw_usd as i128) - sign * p.entry_ntl as i128));
@@ -2620,6 +2626,15 @@ mod tests {
         let alt = &s.clearinghouse(BOB, 0, 0)["assetPositions"][1]["position"];
         // Entry notional 2100.049 from value and PnL. The cut-off entry price alone would give 100.04.
         assert_eq!((&alt["unrealizedPnl"], &alt["entryPx"], &alt["positionValue"]), (&json!("100.049"), &json!("2.10004"), &json!("2000.0")));
+    }
+
+    #[test]
+    fn return_on_equity_rounds_to_ten_decimals() {
+        let s = mirrored();
+        let ch = s.clearinghouse(BOB, 0, 0);
+        // ALT: 100.049 x 20 / 2100.049 = 0.95282538645..., and BTC: -1 x 20 / 101 = -0.19801980198...
+        assert_eq!(ch["assetPositions"][1]["position"]["returnOnEquity"], "0.9528253865");
+        assert_eq!(ch["assetPositions"][0]["position"]["returnOnEquity"], "-0.198019802");
     }
 
     #[test]
