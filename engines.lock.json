@@ -118,21 +118,21 @@
     },
     "hyperevm-proxy": {
       "name": "chainsim HyperEVM proxy",
-      "version": "0.1.10-41e84c92dd5e",
+      "version": "0.1.10-0071a34bf33f",
       "user": "10001:10001",
       "build": {
-        "image": "chainsim/hyperevm-proxy:0.1.10-41e84c92dd5e",
+        "image": "chainsim/hyperevm-proxy:0.1.10-0071a34bf33f",
         "context": "hyperevm-proxy",
         "base": "debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3",
         "tarballs": {
           "amd64": {
-            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.10-41e84c92dd5e/hyperevm-proxy-0.1.10-41e84c92dd5e-linux-amd64.tar.gz",
-            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.10-41e84c92dd5e/hyperevm-proxy-0.1.10-41e84c92dd5e-linux-amd64.tar.gz.sha256",
+            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.10-0071a34bf33f/hyperevm-proxy-0.1.10-0071a34bf33f-linux-amd64.tar.gz",
+            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.10-0071a34bf33f/hyperevm-proxy-0.1.10-0071a34bf33f-linux-amd64.tar.gz.sha256",
             "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
           },
           "arm64": {
-            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.10-41e84c92dd5e/hyperevm-proxy-0.1.10-41e84c92dd5e-linux-arm64.tar.gz",
-            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.10-41e84c92dd5e/hyperevm-proxy-0.1.10-41e84c92dd5e-linux-arm64.tar.gz.sha256",
+            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.10-0071a34bf33f/hyperevm-proxy-0.1.10-0071a34bf33f-linux-arm64.tar.gz",
+            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.10-0071a34bf33f/hyperevm-proxy-0.1.10-0071a34bf33f-linux-arm64.tar.gz.sha256",
             "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
           }
         }
