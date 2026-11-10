@@ -421,7 +421,7 @@ impl EvmAdapter {
                     self.add_perps(eng, &mut state, &[asset], &mut calls).await?;
                 }
                 let szi_x8 = state.sz_from_raw(asset, szi).ok_or_else(|| Error::new(ErrorCode::Usage, format!("szi {szi} is out of range for perp {perp}")))?;
-                state.accounts.entry(who).or_default().positions.insert(asset, hc::Pos { szi_x8, entry_ntl, leverage, isolated, isolated_raw_usd, funding_paid: 0 });
+                state.accounts.entry(who).or_default().positions.insert(asset, hc::Pos { szi_x8, entry_ntl, leverage, isolated, isolated_raw_usd, ..Default::default() });
                 let answers = state.answers(&BTreeSet::from([who]));
                 coresync::store(eng, &state, &answers).await?;
                 let e = hypercore::position(who, perp, hypercore::Position { szi, entry_ntl, isolated_raw_usd, leverage, is_isolated: isolated });

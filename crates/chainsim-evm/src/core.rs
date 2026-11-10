@@ -341,6 +341,20 @@ pub struct Pos {
     /// Funding paid since the position opened, x6 (negative when received).
     #[serde(rename = "f", default, skip_serializing_if = "is_zero")]
     pub funding_paid: i64,
+    /// The position's own max leverage when a mirror found one that differs
+    /// from the perp's (an account with its own margin terms), else 0.
+    #[serde(rename = "m", default, skip_serializing_if = "is_zero_u32")]
+    pub max_leverage: u32,
+    /// Funding paid before the position opened, x6: all-time funding is this plus `funding_paid`.
+    #[serde(rename = "fa", default, skip_serializing_if = "is_zero")]
+    pub funding_before: i64,
+    /// `funding_paid` at the last change of the position's size, x6.
+    #[serde(rename = "fc", default, skip_serializing_if = "is_zero")]
+    pub funding_at_change: i64,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
 }
 
 fn is_false(b: &bool) -> bool {
@@ -865,7 +879,11 @@ pub struct Margin {
     pub margin_used: u64,
     pub ntl_pos: u64,
     pub raw_usd: i64,
+    /// What a transfer out may take: account value less the larger of the
+    /// margin used and 10% of the notional, less the margin of open orders.
     pub withdrawable: u64,
+    /// What a new order may use: account value less margin used and order margin.
+    pub free: u64,
 }
 
 impl State {
@@ -914,6 +932,48 @@ impl State {
         self.perps.get(&perp).map_or_else(|| (p.entry_ntl as u128 * X16_TO_X6 / size as u128) as u64, |x| x.mark_x8)
     }
 
+    /// The max leverage of a position of notional `value` (x6): its own when
+    /// a mirror stored one, else the perp's at that notional.
+    fn max_leverage_of(&self, perp: u32, p: &Pos, value: u64) -> u32 {
+        if p.max_leverage > 0 {
+            return p.max_leverage;
+        }
+        self.perps.get(&perp).map_or(u32::MAX, |x| x.max_leverage_at(value)).max(1)
+    }
+
+    /// The maintenance margin of a position of notional `value` (x6): half
+    /// the initial margin at its max leverage, by the perp's tiers unless the
+    /// position carries its own max leverage.
+    fn maintenance_of(&self, perp: u32, p: &Pos, value: u64) -> u64 {
+        if p.max_leverage > 0 {
+            return value / (2 * p.max_leverage as u64);
+        }
+        self.perps.get(&perp).map_or(value / 2, |x| x.maintenance_at(value))
+    }
+
+    /// The liquidation price of a position (x8) by Hyperliquid's formula,
+    /// price - side x margin available / size / (1 - l x side) with l = 1 /
+    /// (2 x max leverage), or None when no positive price liquidates it.
+    /// `available` is the account value (or the isolated margin) less the
+    /// maintenance margin required, x6.
+    fn liquidation_px(&self, perp: u32, p: &Pos, available: i128) -> Option<u64> {
+        let size = p.szi_x8.unsigned_abs() as i128;
+        let mark = self.mark_of(perp, p);
+        let side: i128 = if p.szi_x8 > 0 { 1 } else { -1 };
+        let at = |max: u32| -> i128 {
+            // x8: available (x6) / size (x8) is x-2, so scale by 10^10. Then divide by (1 - side / (2 max)).
+            let per_unit = available * 10_000_000_000 / size.max(1);
+            let m2 = 2 * max.max(1) as i128;
+            mark as i128 - side * per_unit * m2 / (m2 - side)
+        };
+        let mut px = at(self.max_leverage_of(perp, p, notional(size as u64, mark)));
+        // With margin tiers the maintenance leverage is the one at the liquidation price.
+        if p.max_leverage == 0 && px > 0 {
+            px = at(self.max_leverage_of(perp, p, notional(size as u64, px as u64)));
+        }
+        (px > 0).then_some(px as u64)
+    }
+
     /// A user's main-dex margin figures at the current marks.
     pub fn margin(&self, user: Address) -> Margin {
         self.margin_dex(user, 0)
@@ -929,8 +989,7 @@ impl State {
             let value = notional(p.szi_x8.unsigned_abs(), self.mark_of(*perp, p));
             let sign: i128 = if p.szi_x8 > 0 { 1 } else { -1 };
             m.ntl_pos += value;
-            let tier_max = self.perps.get(perp).map_or(u32::MAX, |x| x.max_leverage_at(value));
-            m.margin_used += value / p.leverage.clamp(1, tier_max.max(1)) as u64;
+            m.margin_used += value / p.leverage.clamp(1, self.max_leverage_of(*perp, p, value)) as u64;
             upnl += sign * (value as i128 - p.entry_ntl as i128);
             signed_entry += sign * p.entry_ntl as i128;
         }
@@ -938,7 +997,9 @@ impl State {
         let usd = acct.usd_of(dex);
         m.account_value = (usd as i128 + upnl) as i64;
         m.raw_usd = (usd as i128 - signed_entry) as i64;
-        m.withdrawable = (m.account_value as i128 - m.margin_used as i128 - order_margin as i128).max(0) as u64;
+        m.free = (m.account_value as i128 - m.margin_used as i128 - order_margin as i128).max(0) as u64;
+        // transfer_margin_required = max(initial_margin_required, 0.1 x total_position_value).
+        m.withdrawable = (m.account_value as i128 - m.margin_used.max(m.ntl_pos / 10) as i128 - order_margin as i128).max(0) as u64;
         m
     }
 
@@ -948,8 +1009,7 @@ impl State {
         let value = notional(p.szi_x8.unsigned_abs(), self.mark_of(perp, p));
         let sign: i128 = if p.szi_x8 > 0 { 1 } else { -1 };
         let upnl = sign * (value as i128 - p.entry_ntl as i128);
-        let mm = self.perps.get(&perp).map_or(value / 2, |x| x.maintenance_at(value));
-        ((p.isolated_raw_usd as i128 + upnl) as i64, mm)
+        ((p.isolated_raw_usd as i128 + upnl) as i64, self.maintenance_of(perp, p, value))
     }
 
     fn leverage_of(&self, user: Address, asset: u32) -> u32 {
@@ -992,6 +1052,7 @@ impl State {
             pos.isolated = isolated;
         }
         let dq: i64 = if is_buy { q as i64 } else { -(q as i64) };
+        pos.funding_at_change = pos.funding_paid;
         if pos.szi_x8 == 0 || (pos.szi_x8 > 0) == is_buy {
             pos.szi_x8 += dq;
             pos.entry_ntl += notional(q, px);
@@ -1021,9 +1082,15 @@ impl State {
                 pos.isolated_raw_usd += reopen;
             }
         }
+        if left > 0 || pos.szi_x8 == 0 {
+            // The position closed (and may have reopened the other way): funding since open starts over.
+            pos.funding_before += pos.funding_paid;
+            pos.funding_paid = 0;
+            pos.funding_at_change = 0;
+            pos.max_leverage = 0;
+        }
         if pos.szi_x8 == 0 {
             pos.entry_ntl = 0;
-            pos.funding_paid = 0;
             pos.isolated_raw_usd = 0;
         }
         *acct.usd_mut(dex) += realized + released - reopen;
@@ -1078,7 +1145,7 @@ impl State {
         // Margin for the part that adds exposure, at the limit price.
         let reducing = if pos != 0 && (pos > 0) != is_buy { sz.min(pos.unsigned_abs()) } else { 0 };
         let need = notional(sz - reducing, px) / self.leverage_of(user, asset) as u64;
-        if need > self.margin_dex(user, dex_of(asset)).withdrawable {
+        if need > self.margin_dex(user, dex_of(asset)).free {
             return format!("rejected: insufficient margin, needs {} USD", fmt_dec(need as i128, 6));
         }
         let order_oid = self.next_oid.max(1);
@@ -1297,8 +1364,7 @@ impl State {
             .iter()
             .filter(|(a, p)| p.szi_x8 != 0 && !p.isolated && dex_of(**a) == dex)
             .map(|(a, p)| {
-                let value = notional(p.szi_x8.unsigned_abs(), self.mark_of(*a, p));
-                self.perps.get(a).map_or(value / 2, |x| x.maintenance_at(value))
+                self.maintenance_of(*a, p, notional(p.szi_x8.unsigned_abs(), self.mark_of(*a, p)))
             })
             .sum()
     }
@@ -1786,6 +1852,7 @@ impl State {
         let m = self.margin_dex(user, dex);
         let usd = |v: i128| fmt_dec(v, 6);
         let acct = self.accounts.get(&user).cloned().unwrap_or_default();
+        let maintenance = self.maintenance_dex(user, dex);
         let mut positions = Vec::new();
         let (mut iso_value, mut iso_margin, mut iso_ntl) = (0i128, 0i128, 0i128);
         for (asset, p) in acct.positions.iter().filter(|(a, p)| p.szi_x8 != 0 && dex_of(**a) == dex) {
@@ -1800,7 +1867,11 @@ impl State {
                 iso_margin += margin;
                 iso_ntl += value;
             }
-            let entry_px = (p.entry_ntl as u128 * X16_TO_X6 / size as u128) as i128;
+            // The info API gives the entry price with 6 minus szDecimals decimals, cut off.
+            let cut = 10i128.pow(2 + perp.map_or(0, |x| (x.sz_decimals as u32).min(6)));
+            let entry_px = (p.entry_ntl as u128 * X16_TO_X6 / size as u128) as i128 / cut * cut;
+            let available = if p.isolated { p.isolated_raw_usd as i128 + upnl - self.maintenance_of(*asset, p, value as u64) as i128 } else { m.account_value as i128 - maintenance as i128 };
+            let liquidation_px = self.liquidation_px(*asset, p, available).map(|px| fmt_dec(px as i128, 8));
             let roe = if p.entry_ntl > 0 { upnl * p.leverage as i128 * 10_000_000_000 / p.entry_ntl as i128 } else { 0 };
             let mut lev = json!({ "type": if p.isolated { "isolated" } else { "cross" }, "value": p.leverage });
             if p.isolated {
@@ -1816,10 +1887,10 @@ impl State {
                     "positionValue": usd(value),
                     "unrealizedPnl": usd(upnl),
                     "returnOnEquity": fmt_dec(roe, 10),
-                    "liquidationPx": null,
+                    "liquidationPx": liquidation_px,
                     "marginUsed": usd(margin),
-                    "maxLeverage": perp.map_or(0, |x| x.max_leverage),
-                    "cumFunding": { "allTime": usd(p.funding_paid as i128), "sinceOpen": usd(p.funding_paid as i128), "sinceChange": usd(p.funding_paid as i128) },
+                    "maxLeverage": if p.max_leverage > 0 { p.max_leverage } else { perp.map_or(0, |x| x.max_leverage) },
+                    "cumFunding": { "allTime": usd(p.funding_before as i128 + p.funding_paid as i128), "sinceOpen": usd(p.funding_paid as i128), "sinceChange": usd(p.funding_paid as i128 - p.funding_at_change as i128) },
                 },
             }));
         }
@@ -1833,7 +1904,7 @@ impl State {
         });
         json!({
             "marginSummary": total, "crossMarginSummary": cross,
-            "crossMaintenanceMarginUsed": usd(self.maintenance_dex(user, dex) as i128),
+            "crossMaintenanceMarginUsed": usd(maintenance as i128),
             "withdrawable": usd(m.withdrawable as i128), "assetPositions": positions, "time": time_ms,
         })
     }
@@ -2040,7 +2111,18 @@ impl State {
             let isolated = p["leverage"]["type"] == "isolated";
             let dec6 = |k: &str| p[k].as_str().and_then(|s| parse_dec(s, 6)).unwrap_or(0) as i64;
             let isolated_raw_usd = if isolated { dec6("marginUsed") - dec6("unrealizedPnl") } else { 0 };
-            positions.insert(asset, Pos { szi_x8: szi as i64, entry_ntl: notional(szi.unsigned_abs() as u64, entry_px as u64), leverage, isolated, isolated_raw_usd, ..Default::default() });
+            // The exact entry notional is the position value less the unrealized PnL. The entry price is cut off.
+            let sign = if szi > 0 { 1 } else { -1 };
+            let entry_ntl = match (p["positionValue"].as_str().and_then(|s| parse_dec(s, 6)), p["unrealizedPnl"].as_str().and_then(|s| parse_dec(s, 6))) {
+                (Some(value), Some(upnl)) if value - sign * upnl > 0 => (value - sign * upnl) as u64,
+                _ => notional(szi.unsigned_abs() as u64, entry_px as u64),
+            };
+            // An account with its own margin terms (an HLP vault at 50x on every perp) keeps them.
+            let own_max = p["maxLeverage"].as_u64().unwrap_or(0) as u32;
+            let max_leverage = if self.perps.get(&asset).is_some_and(|x| x.max_leverage_at(dec6("positionValue").unsigned_abs()) != own_max) { own_max } else { 0 };
+            let funding = |k: &str| p["cumFunding"][k].as_str().and_then(|s| parse_dec(s, 6)).unwrap_or(0) as i64;
+            let funding_paid = funding("sinceOpen");
+            positions.insert(asset, Pos { szi_x8: szi as i64, entry_ntl, leverage, isolated, isolated_raw_usd, funding_paid, max_leverage, funding_before: funding("allTime") - funding_paid, funding_at_change: funding_paid - funding("sinceChange") });
         }
         let summary = if ch["crossMarginSummary"].is_object() { &ch["crossMarginSummary"] } else { &ch["marginSummary"] };
         let account_value = summary["accountValue"].as_str().and_then(|s| parse_dec(s, 6)).unwrap_or(0);
@@ -2048,7 +2130,7 @@ impl State {
         // Old positions on this dex go to zero, so their answers are rewritten.
         for (a, p) in acct.positions.iter_mut() {
             if dex_of(*a) == dex {
-                *p = Pos { leverage: p.leverage, ..Default::default() };
+                *p = Pos { leverage: p.leverage, funding_before: p.funding_before + p.funding_paid, ..Default::default() };
             }
         }
         acct.positions.extend(positions);
@@ -2313,14 +2395,15 @@ mod tests {
         assert_eq!(pos.result, [word_i(100_000), word_u(101_000_000), word_i(0), word_u(20), word_u(0)].concat());
         assert_eq!(find(hypercore::SPOT_BALANCE).result, [word_u(42), word_u(0), word_u(0)].concat());
         // Mark 100: value 100, uPnL -1, margin 5, fee 0.04545, account value 9998.95455.
-        assert_eq!(find(hypercore::WITHDRAWABLE).result, word_u(9_994_000_000 - 45_450).to_vec());
+        // A transfer must leave the larger of the margin used and 10% of the notional, 10 here.
+        assert_eq!(find(hypercore::WITHDRAWABLE).result, word_u(9_989_000_000 - 45_450).to_vec());
         let ams = find(hypercore::ACCOUNT_MARGIN_SUMMARY);
         assert_eq!(ams.calldata, [word_u(0), word_addr(ALICE)].concat());
         assert_eq!(ams.result, [word_i(9_999_000_000 - 45_450), word_u(5_000_000), word_u(100_000_000), word_i(9_899_000_000 - 45_450)].concat());
         let info = s.info(ALICE, 7);
         let p = &info["clearinghouseState"]["assetPositions"][0]["position"];
         assert_eq!((p["coin"].as_str(), p["szi"].as_str(), p["entryPx"].as_str(), p["unrealizedPnl"].as_str()), (Some("BTC"), Some("1.0"), Some("101.0"), Some("-1.0")));
-        assert_eq!(info["clearinghouseState"]["withdrawable"], "9993.95455");
+        assert_eq!(info["clearinghouseState"]["withdrawable"], "9988.95455");
         assert_eq!(info["spotClearinghouseState"]["balances"][0]["total"], "0.00000042");
     }
 
@@ -2466,6 +2549,79 @@ mod tests {
         let mut b = Book { bids: vec![(3, 1), (2, 1)], asks: vec![(4, 1), (5, 1), (6, 1)], time: 0 };
         b.scale(1, 2);
         assert_eq!((b.bids, b.asks), (vec![(1, 2)], vec![(2, 1), (3, 2)]));
+    }
+
+    /// Bob on mainnet: short 1000 ALT (a 3x perp) held at 20x under his own 50x terms, and long 1 BTC.
+    fn mirrored() -> State {
+        let mut s = state();
+        s.perps.insert(1, Perp { name: "ALT".into(), sz_decimals: 1, max_leverage: 3, mark_x8: x8(2.0), ..Default::default() });
+        let ch = json!({
+            "assetPositions": [
+                { "position": { "coin": "ALT", "szi": "-1000.0", "entryPx": "2.10004", "positionValue": "2000.0", "unrealizedPnl": "100.049", "marginUsed": "100.0", "maxLeverage": 50,
+                    "leverage": { "type": "cross", "value": 20 }, "cumFunding": { "allTime": "-50.5", "sinceOpen": "-1.5", "sinceChange": "-0.5" } } },
+                { "position": { "coin": "BTC", "szi": "1.0", "entryPx": "101.0", "positionValue": "100.0", "unrealizedPnl": "-1.0", "marginUsed": "5.0", "maxLeverage": 40,
+                    "leverage": { "type": "cross", "value": 20 }, "cumFunding": { "allTime": "0.0", "sinceOpen": "0.0", "sinceChange": "0.0" } } },
+            ],
+            "marginSummary": { "accountValue": "10000.0" },
+        });
+        assert!(s.mirror_perps(BOB, &ch).is_empty());
+        s
+    }
+
+    #[test]
+    fn a_mirrored_account_keeps_its_own_max_leverage_in_the_summary() {
+        let s = mirrored();
+        let ch = s.clearinghouse(BOB, 0, 0);
+        // Margin at the position's leverage of 20, not the perp's 3: 2000 / 20 + 100 / 20.
+        assert_eq!(ch["marginSummary"]["totalMarginUsed"], "105.0");
+        let listed: i128 = ch["assetPositions"].as_array().unwrap().iter().map(|p| parse_dec(p["position"]["marginUsed"].as_str().unwrap(), 6).unwrap()).sum();
+        assert_eq!(listed, 105_000_000);
+        // Maintenance is half the initial margin at max leverage: 2000 / 100 at Bob's 50x, 100 / 80 at BTC's 40x.
+        assert_eq!(ch["crossMaintenanceMarginUsed"], "21.25");
+        // A transfer leaves max(105, 10% of 2100).
+        assert_eq!((&ch["marginSummary"]["accountValue"], &ch["withdrawable"]), (&json!("10000.0"), &json!("9790.0")));
+        let alt = &ch["assetPositions"][1]["position"];
+        assert_eq!((&alt["coin"], &alt["maxLeverage"], &ch["assetPositions"][0]["position"]["maxLeverage"]), (&json!("ALT"), &json!(50), &json!(40)));
+        assert_eq!(alt["cumFunding"], json!({ "allTime": "-50.5", "sinceOpen": "-1.5", "sinceChange": "-0.5" }));
+        // Only the position whose terms differ from the perp's stores them.
+        assert_eq!((s.accounts[&BOB].positions[&1].max_leverage, s.accounts[&BOB].positions[&0].max_leverage), (50, 0));
+    }
+
+    #[test]
+    fn a_mirrored_position_keeps_its_unrealized_pnl_at_the_mirror_price() {
+        let s = mirrored();
+        let alt = &s.clearinghouse(BOB, 0, 0)["assetPositions"][1]["position"];
+        // Entry notional 2100.049 from value and PnL. The cut-off entry price alone would give 100.04.
+        assert_eq!((&alt["unrealizedPnl"], &alt["entryPx"], &alt["positionValue"]), (&json!("100.049"), &json!("2.10004"), &json!("2000.0")));
+    }
+
+    #[test]
+    fn liquidation_price_follows_the_documented_formula() {
+        let s = mirrored();
+        let ch = s.clearinghouse(BOB, 0, 0);
+        // Short ALT: 2 + (10000 - 21.25) / 1000 / (1 + 1 / 100) = 11.87995049.
+        assert_eq!(ch["assetPositions"][1]["position"]["liquidationPx"], "11.87995049");
+        // Long BTC: 100 - 9978.75 / (1 - 1 / 80) is below zero, so no price liquidates it.
+        assert_eq!(ch["assetPositions"][0]["position"]["liquidationPx"], Value::Null);
+        // A long on thin margin: 1 BTC at 100 with 3 USD, 100 - (2 - 1.25) / (1 - 1 / 80) = 99.24050633.
+        let mut s = state();
+        s.account(BOB).usd = usd(3.0);
+        s.account(BOB).positions.insert(0, Pos { szi_x8: x8(1.0) as i64, entry_ntl: 101_000_000, leverage: 20, ..Default::default() });
+        assert_eq!(s.clearinghouse(BOB, 0, 0)["assetPositions"][0]["position"]["liquidationPx"], "99.24050633");
+    }
+
+    #[test]
+    fn an_account_opened_on_the_fork_keeps_its_summary() {
+        let mut s = state();
+        run(&mut s, 11, ALICE, limit_order(0, true, x8(101.0), x8(1.0), false, 3, 0));
+        let ch = s.clearinghouse(ALICE, 0, 0);
+        assert_eq!(ch["marginSummary"], json!({ "accountValue": "9998.95455", "totalNtlPos": "100.0", "totalRawUsd": "9898.95455", "totalMarginUsed": "5.0" }));
+        assert_eq!(ch["crossMaintenanceMarginUsed"], "1.25");
+        let p = &ch["assetPositions"][0]["position"];
+        assert_eq!((&p["entryPx"], &p["maxLeverage"], &p["marginUsed"], &p["unrealizedPnl"]), (&json!("101.0"), &json!(40), &json!("5.0"), &json!("-1.0")));
+        assert_eq!(s.accounts[&ALICE].positions[&0].max_leverage, 0);
+        // An order may still use everything above the margin in use.
+        assert_eq!(s.margin(ALICE).free, 9_993_954_550);
     }
 
     #[test]
@@ -3120,7 +3276,7 @@ mod tests {
         let x = |v: u64| v * ONE_X8 as u64;
         // An isolated xyz:TSLA long: 10 at 400 with 10x leverage holds 400 USD of margin.
         s.accounts.entry(ALICE).or_default().dex_usd.insert(1, 1_000_000_000);
-        s.accounts.get_mut(&ALICE).unwrap().positions.insert(10_001, Pos { szi_x8: x(10) as i64, entry_ntl: 4_000_000_000, leverage: 10, isolated: true, isolated_raw_usd: 400_000_000, funding_paid: 0 });
+        s.accounts.get_mut(&ALICE).unwrap().positions.insert(10_001, Pos { szi_x8: x(10) as i64, entry_ntl: 4_000_000_000, leverage: 10, isolated: true, isolated_raw_usd: 400_000_000, ..Default::default() });
         assert_eq!(s.update_isolated_margin(ALICE, 10_001, 100_000_000).unwrap(), "added 100.0 USD of isolated margin on xyz:TSLA, margin now 500.0 USD");
         assert_eq!((s.accounts[&ALICE].positions[&10_001].isolated_raw_usd, s.accounts[&ALICE].usd_of(1)), (500_000_000, 900_000_000));
         // More than the dex has withdrawable is refused.
