@@ -1389,6 +1389,13 @@ fn hyperevm_set_hypercore_releases_the_lease_per_step() {
     println!("mirror {whale}: {took:.2} s, {} positions, {} info calls, eth_blockNumber during it: {}", mirror["positions"], mirror["infoCalls"], wait_summary(&ms));
     waits.push(("mirror of an HLP vault", ms[ms.len() - 1]));
 
+    // The mirrored account reads back as the mirror reported it, before a later mirror moves the prices of perps both hold.
+    let state = ok(&["call", name, "hypercore_state", whale]);
+    let positions = state["clearinghouseState"]["assetPositions"].as_array().unwrap();
+    assert_eq!(json!(positions.len()), mirror["positions"], "{state}");
+    assert_eq!(state["clearinghouseState"]["marginSummary"]["accountValue"], mirror["accountValue"]);
+    assert!(fixed(mirror["accountValue"].as_str().unwrap(), 6) > 0, "{mirror}");
+
     // A mirror of an account with spot balances and borrow and lend state.
     let lender = LEND_USERS[0];
     let (lend, _, ms) = measure_set(&network, &rpc, name, &format!("mirror {lender}"), &["set", name, "hypercore", "mirror", lender]);
@@ -1398,12 +1405,6 @@ fn hyperevm_set_hypercore_releases_the_lease_per_step() {
         println!("max wait {label}: {max:.0} ms");
     }
 
-    // The mirrored account reads back as the mirror reported it.
-    let state = ok(&["call", name, "hypercore_state", whale]);
-    let positions = state["clearinghouseState"]["assetPositions"].as_array().unwrap();
-    assert_eq!(json!(positions.len()), mirror["positions"], "{state}");
-    assert_eq!(state["clearinghouseState"]["marginSummary"]["accountValue"], mirror["accountValue"]);
-    assert!(fixed(mirror["accountValue"].as_str().unwrap(), 6) > 0, "{mirror}");
     let state = ok(&["call", name, "hypercore_state", lender]);
     assert_eq!(json!(state["borrowLendUserState"]["tokenToState"].as_array().map_or(0, Vec::len)), lend["borrowLend"], "{state}");
 
