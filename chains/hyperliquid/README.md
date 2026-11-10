@@ -301,6 +301,26 @@ chainsim set hyperevm-mainnet hypercore mirror 0x010461c14e146ac35fe42271bdc1134
 The `evm` list is shortened here. The vault's BTC position then reads back through `0x800` from
 a contract, and `send --as` the vault address acts as it.
 
+The mirrored account reads back with mainnet's figures:
+
+- Each position keeps its size, leverage, entry notional (so unrealized PnL matches to the cent
+  at the mirror's prices) and cumulative funding, which the copy's own funding then adds to.
+- A position keeps its own max leverage when the account has its own margin terms. This vault
+  holds every perp at 20x under a max leverage of 50, so its margin used is the position value
+  over 20 and its maintenance margin the value over 100.
+- `clearinghouseState` gives each position's `liquidationPx` by Hyperliquid's
+  [liquidation price formula](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/liquidations),
+  and `null` when no positive price liquidates it.
+- `withdrawable` is the account value less the larger of the margin used and 10% of the total
+  position value, the
+  [transfer margin rule](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/margining).
+
+In a run on 2026-11-10 the vault's 177 positions read back with total margin used 163,398.81
+USD against 163,392.01 and 163,435.09 on mainnet just before and after the mirror, maintenance
+margin 32,679.76 against 32,678.40 and 32,687.02, and withdrawable 2,809,610.54 against
+2,809,623.98 and 2,809,297.66. Of the 97 liquidation prices mainnet gave, 96 matched within one
+basis point.
+
 ### Orders
 
 A limit order sent through CoreWriter matches against the perp's order book, best price first,
@@ -308,23 +328,24 @@ and against orders resting on the copy. The book is the one `up` or `set hyperco
 took, at the level the prices scripted since have moved it to. Each fill takes depth off the
 book, so a second order fills deeper. A GTC remainder rests, an IOC remainder is dropped, and an ALO order that would
 cross is rejected. A cancel by order id or client order id removes a resting order. Orders check
-the account's withdrawable margin at the order's leverage, 20 or the perp's maximum if lower.
+the account value less the margin in use, at the order's leverage, 20 or the perp's maximum if
+lower.
 
-This run set BTC to 65,000 with `set hypercore price` while the book's best ask stood at 73,744.
+This run set BTC to 65,000 with `set hypercore price` while the book's best ask stood at 73,899.
 It then gave `0x0000…c0ffee` 1,000 USDC on spot, moved 500 USD to perp with a USD class
 transfer, bought 0.001 BTC with an IOC order above the ask, and left a GTC bid at 60,000.
 `call corewriter_actions` shows each action with its `result`:
 
 ```json
 [
-  { "block": 50895034, "action": "usdClassTransfer", "fields": { "ntl": "500000000", "toPerp": true }, "result": "moved 500.0 USD to perp" },
-  { "block": 50895035, "action": "limitOrder", "fields": { "asset": "0", "isBuy": true, "limitPx": "6600000000000", "sz": "100000", "reduceOnly": false, "encodedTif": "3", "cloid": "0" }, "result": "filled 0.001 at 65004.0, fee 0.029251 USD" },
-  { "block": 50895036, "action": "limitOrder", "fields": { "asset": "0", "isBuy": true, "limitPx": "6000000000000", "sz": "100000", "reduceOnly": false, "encodedTif": "2", "cloid": "77" }, "result": "0.001 resting as oid 2" }
+  { "block": 50897074, "action": "usdClassTransfer", "fields": { "ntl": "500000000", "toPerp": true }, "result": "moved 500.0 USD to perp" },
+  { "block": 50897075, "action": "limitOrder", "fields": { "asset": "0", "isBuy": true, "limitPx": "6600000000000", "sz": "100000", "reduceOnly": false, "encodedTif": "3", "cloid": "0" }, "result": "filled 0.001 at 65029.0, fee 0.029263 USD" },
+  { "block": 50897076, "action": "limitOrder", "fields": { "asset": "0", "isBuy": true, "limitPx": "6000000000000", "sz": "100000", "reduceOnly": false, "encodedTif": "2", "cloid": "77" }, "result": "0.001 resting as oid 2" }
 ]
 ```
 
 Each entry also carries `txHash`, `logIndex`, `user`, `version` and `actionId`. The IOC filled at
-65,004, the best ask of the book after it moved with the price.
+65,029, the best ask of the book after it moved with the price.
 
 ### Core state
 
@@ -339,19 +360,19 @@ chainsim call hyperevm-mainnet hypercore_state 0x0000000000000000000000000000000
 {
   "user": "0x0000000000000000000000000000000000C0FFEE",
   "clearinghouseState": {
-    "marginSummary": { "accountValue": "499.966749", "totalNtlPos": "65.0", "totalRawUsd": "434.966749", "totalMarginUsed": "3.25" },
-    "withdrawable": "493.716749",
+    "marginSummary": { "accountValue": "499.941737", "totalNtlPos": "65.0", "totalRawUsd": "434.941737", "totalMarginUsed": "3.25" },
+    "withdrawable": "490.441737",
     "assetPositions": [
       {
         "type": "oneWay",
         "position": {
-          "coin": "BTC", "szi": "0.001", "leverage": { "type": "cross", "value": 20 }, "entryPx": "65004.0",
-          "positionValue": "65.0", "unrealizedPnl": "-0.004", "returnOnEquity": "-0.0012306934", "liquidationPx": null,
+          "coin": "BTC", "szi": "0.001", "leverage": { "type": "cross", "value": 20 }, "entryPx": "65029.0",
+          "positionValue": "65.0", "unrealizedPnl": "-0.029", "returnOnEquity": "-0.0089190976", "liquidationPx": null,
           "marginUsed": "3.25", "maxLeverage": 40, "cumFunding": { "allTime": "0.0", "sinceOpen": "0.0", "sinceChange": "0.0" }
         }
       }
     ],
-    "time": 1794317547000
+    "time": 1794319560000
   },
   "spotClearinghouseState": {
     "balances": [
@@ -365,7 +386,7 @@ chainsim call hyperevm-mainnet hypercore_state 0x0000000000000000000000000000000
 ```
 
 `crossMarginSummary`, `crossMaintenanceMarginUsed` and `userFills` are left out here. The mark is
-65,000, so the position shows a small loss against its 65,004 entry. The same figures answer the `0x800`, `0x801`, `0x803` and `0x80f` precompiles.
+65,000, so the position shows a small loss against its 65,029 entry. The same figures answer the `0x800`, `0x801`, `0x803` and `0x80f` precompiles.
 
 `set hypercore book <coin> --live` takes a fresh book for one perp from the info API, by name or
 index, and replaces the one fills have consumed.

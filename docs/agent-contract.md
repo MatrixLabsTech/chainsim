@@ -18,7 +18,8 @@ error codes from the binary.
   `precompile` or `hypercore`. On HyperEVM, `set precompile <address> <calldata> (--result <hex>
   | --live)` stores a HyperCore read precompile's answer, `set hypercore price|spot-balance|position`
   sets prices and an account's Core state, `set hypercore book <coin> --live` refreshes a perp's
-  order book, `set hypercore mirror <user>` copies a mainnet account onto the copy, and `set
+  order book, `set hypercore mirror <user>` copies a mainnet account onto the copy with its margin summary,
+  liquidation prices and cumulative funding, and `set
   hypercore funding <perp> <rate>` sets a perp's hourly funding rate. `set hypercore book` takes a
   builder-deployed perp as `dex:coin` (xyz:XYZ100), and `price` takes its perp index
   (dex * 10000 + index). CoreWriter orders on such perps use asset 100000 + perp index. `set hypercore price` also
