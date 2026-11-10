@@ -10,5 +10,5 @@ set -euo pipefail
 cd "$(dirname "$0")/../../.."
 docker build -q -f examples/hyperliquid/docker/Dockerfile -t chainsim-hyperliquid-example . >/dev/null
 exec docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD":/repo \
-  -e CHAINSIM_HYPEREVM_MAINNET_RPC -e BENCH_MACHINE -e CHAINSIM_FORK \
+  -e CHAINSIM_HYPEREVM_MAINNET_RPC -e BENCH_MACHINE -e CHAINSIM_FORK -e E2E_RESULTS -e BENCH_UPS \
   chainsim-hyperliquid-example "$@"
