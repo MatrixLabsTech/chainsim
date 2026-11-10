@@ -14,10 +14,13 @@ cleanup(){ [ -z "${CHAINSIM_PUBLISH:-}" ] && docker network disconnect "chainsim
 trap cleanup EXIT
 
 if [ -n "${CHAINSIM_PUBLISH:-}" ]; then
-  chainsim up "$FORK" --publish > /tmp/fork.json; export CHAINSIM_RPC=$(jq -r .data.hostRpcUrl /tmp/fork.json)
+  # The first up of a HyperEVM fork answers with hostRpcUrl null, and status has the published URL.
+  chainsim up "$FORK" --publish > /tmp/fork.json; CHAINSIM_RPC=$(chainsim status "$FORK" | jq -r '.data.hostRpcUrl // empty')
 else
-  chainsim up "$FORK" > /tmp/fork.json; docker network connect "chainsim-$FORK" "$(hostname)"; export CHAINSIM_RPC=$(jq -r .data.rpcUrl /tmp/fork.json)
+  chainsim up "$FORK" > /tmp/fork.json; docker network connect "chainsim-$FORK" "$(hostname)"; CHAINSIM_RPC=$(jq -r '.data.rpcUrl // empty' /tmp/fork.json)
 fi
+[ -n "$CHAINSIM_RPC" ] || { echo "test.sh: chainsim gave no RPC URL for the fork $FORK, so the tests cannot reach it" >&2; exit 1; }
+export CHAINSIM_RPC
 jq -c '{fork: .data.chain, block: .data.forkPoint.number, rpc: env.CHAINSIM_RPC}' /tmp/fork.json
 chainsim selftest "$FORK" | jq -c '{selftest: .ok, parts: (.data.parts | length)}'
 
