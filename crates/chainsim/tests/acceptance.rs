@@ -4,7 +4,7 @@
 //!     cargo test -p chainsim --test acceptance -- --ignored --test-threads=1 --nocapture
 
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -34,7 +34,21 @@ fn chainsim(args: &[&str]) -> Out {
 }
 
 fn ok(args: &[&str]) -> Value {
-    let out = chainsim(args);
+    let mut out = chainsim(args);
+    // A HyperEVM `up` that could not reach the upstream is tried three times in all. The pause
+    // lets the public RPC's budget of 100 requests a minute refill.
+    for _ in 0..2 {
+        let unreachable = out.code != 0 && out.json["error"]["code"] == "upstream_unavailable";
+        if !(unreachable && args.first() == Some(&"up") && args.get(1).is_some_and(|c| c.starts_with("hyperevm"))) {
+            break;
+        }
+        eprintln!("{args:?}: upstream unavailable, trying again in 65 s: {}", out.json);
+        if let Some(name) = args.iter().position(|a| *a == "--name").and_then(|i| args.get(i + 1)) {
+            chainsim(&["down", name]);
+        }
+        std::thread::sleep(Duration::from_secs(65));
+        out = chainsim(args);
+    }
     assert_eq!(out.code, 0, "{args:?}: {}", out.json);
     out.json["data"].clone()
 }
@@ -527,6 +541,9 @@ fn hyperevm_local_hypercore() {
         let t = Instant::now();
         let m = ok(&["set", name, "hypercore", "mirror", user]);
         println!("mirror {user}: {} positions, {:.1} s, {} info and {} upstream calls", m["positions"], t.elapsed().as_secs_f64(), m["infoCalls"], m["upstreamCalls"]);
+        // The mirror brings the account's perps to mainnet's prices and says which. None was scripted.
+        assert!(m["marks"].is_array() && m["liquidated"] == json!([]), "{m}");
+        assert_eq!(m["kept"], json!([]), "{m}");
         let state = ok(&["call", name, "hypercore_state", user]);
         if let Some(p) = btc_position(&state) {
             mirrored = Some((user.to_string(), p, state));
@@ -534,6 +551,9 @@ fn hyperevm_local_hypercore() {
         }
     }
     let (whale, pos, state) = mirrored.expect("an HLP vault with a BTC position");
+    // The BTC book moved with the mark the mirror took: take the book again for the orders below.
+    let btc = ok(&["set", name, "hypercore", "book", "BTC", "--live"])["book"].clone();
+    let best_ask = fixed(btc["bestAsk"].as_str().unwrap(), 8);
     assert!(fixed(state["clearinghouseState"]["marginSummary"]["accountValue"].as_str().unwrap(), 6) > 0);
     // BTC has szDecimals 5: the precompile's szi is the size times 1e5.
     let szi = fixed(pos["szi"].as_str().unwrap(), 5) as i64;
