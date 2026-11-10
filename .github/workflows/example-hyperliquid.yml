@@ -1,0 +1,46 @@
+name: example-hyperliquid
+
+# Runs the HyperEVM example against a fresh mainnet fork: Foundry unit and fuzz tests, then the
+# viem e2e scripts. chainsim is built from this checkout, so the example tests the code beside it.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["examples/hyperliquid/**", ".github/workflows/example-hyperliquid.yml"]
+  pull_request:
+    paths: ["examples/hyperliquid/**", ".github/workflows/example-hyperliquid.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: example-hyperliquid
+  cancel-in-progress: false
+
+jobs:
+  fork-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+      - name: Build chainsim
+        run: |
+          cargo build --release --locked -p chainsim
+          echo "$PWD/target/release" >> "$GITHUB_PATH"
+      - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
+        with:
+          version: v1.8.5
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Fork, test, remove
+        env:
+          CHAINSIM_PUBLISH: "1"
+          # A provider URL from the HYPEREVM_RPC_URL secret. Unset, the fork reads the public RPC,
+          # which allows 100 requests a minute.
+          CHAINSIM_HYPEREVM_MAINNET_RPC: ${{ secrets.HYPEREVM_RPC_URL }}
+        run: examples/hyperliquid/scripts/test.sh
