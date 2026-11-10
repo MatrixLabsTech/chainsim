@@ -5,8 +5,9 @@
 //   CHAINSIM_RPC   the fork's rpcUrl (default http://hyperevm-mainnet:8545)
 //   CHAINSIM_FORK  the fork's name (default hyperevm-mainnet)
 //   E2E_KEY        a test key with no mainnet history (chainsim fund refuses used addresses)
+//   E2E_RESULTS    a JSON file to add this run's numbers to
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createPublicClient, createWalletClient, defineChain, http, decodeAbiParameters, encodeAbiParameters } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 
@@ -73,5 +74,10 @@ check(Math.abs(closedSz - 0.01) < 1e-9 && closes.every((f) => Number(f.px) < Num
 const actions = chainsim('call', FORK, 'corewriter_actions').filter((a) => a.user.toLowerCase() === vault.toLowerCase());
 check(actions.length === 3, `corewriter_actions: ${actions.map((a) => a.result.split(',')[0]).join(', ')}`);
 
+if (process.env.E2E_RESULTS) {
+  const all = existsSync(process.env.E2E_RESULTS) ? JSON.parse(readFileSync(process.env.E2E_RESULTS, 'utf8')) : {};
+  all.stopLoss = { markPx: Number(mark) / 10, movePct: -3, movedMarkPx: Number((mark * 97n) / 100n) / 10, stopPx: Number(stop) / 10, closePx: Number(closes[0]?.px) };
+  writeFileSync(process.env.E2E_RESULTS, `${JSON.stringify(all, null, 1)}\n`);
+}
 console.log(failed ? `${failed} failed` : 'all passed');
 process.exit(failed ? 1 : 0);

@@ -1,6 +1,7 @@
 #!/bin/bash
 # The team's normal test run, with chainsim around it: fork HyperEVM mainnet, run the Foundry unit
-# tests and the viem e2e script against the fork, then remove it.
+# and fuzz tests and the viem e2e scripts against the fork, then remove it.
+#   E2E_RESULTS=<file> also writes the runs' numbers there as JSON.
 #   In a container with the Docker socket: the script joins the fork's network.
 #   On a host or CI runner: CHAINSIM_PUBLISH=1 publishes the proxy on 127.0.0.1.
 set -euo pipefail
@@ -22,7 +23,14 @@ chainsim selftest "$FORK" | jq -c '{selftest: .ok, parts: (.data.parts | length)
 
 # Unit tests read HyperCore through the precompiles. Give their vault a 0.01 BTC long first.
 chainsim set "$FORK" hypercore position "$VAULT" 0 1000 750000000 | jq -c '{seeded: .data.helper, user: .data.user}'
-forge test --fork-url "$CHAINSIM_RPC"
+[ -d lib/forge-std ] || forge install foundry-rs/forge-std --no-git >/dev/null
+forge test --fork-url "$CHAINSIM_RPC" | tee /tmp/forge.txt
 
-# The e2e script sends real transactions. HyperCore follows them through the proxy.
-(cd e2e && yarn install --frozen-lockfile --silent && node stop-loss.e2e.mjs)
+# The e2e scripts send real transactions. HyperCore follows them through the proxy.
+(cd e2e && yarn install --frozen-lockfile --silent && node stop-loss.e2e.mjs && node replay-day.e2e.mjs)
+
+if [ -n "${E2E_RESULTS:-}" ]; then
+  runs=$(grep -o 'runs: [0-9]*' /tmp/forge.txt | head -1 | cut -d' ' -f2)
+  jq --argjson runs "${runs:-0}" --arg chainsim "$(chainsim --version | jq -r .data.help | tr -d '\n')" --arg date "$(date -u +%F)" \
+    '. + {date: $date, chainsim: $chainsim, fuzzRuns: $runs}' "$E2E_RESULTS" > /tmp/results.json && cp /tmp/results.json "$E2E_RESULTS"
+fi

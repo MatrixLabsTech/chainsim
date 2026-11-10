@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity ^0.8.24;
 
-import {Test} from "forge-std/Test.sol";
+import {Test, Vm} from "forge-std/Test.sol";
 import {HyperCore} from "../src/HyperCore.sol";
 import {StopLossVault} from "../src/StopLossVault.sol";
 
@@ -60,5 +60,45 @@ contract StopLossVaultTest is Test {
         vm.expectEmit(true, false, false, true, HyperCore.CORE_WRITER);
         emit RawAction(VAULT, HyperCore.limitOrderAction(BTC, false, limitPx, sz, true, HyperCore.TIF_IOC, 0));
         assertTrue(vault.checkAndClose());
+    }
+
+    /// Over mark prices, stops and position sizes: the keeper call sends nothing while the mark is
+    /// above the stop or there is no long, and otherwise one reduce-only IOC sell of the whole
+    /// position with a limit at or under the stop. Marks run from 100 USD to 1,000,000,000 USD in
+    /// the precompile's units, the range in which the vault's uint64 limit price is exact.
+    function testFuzz_ClosesTheWholeLongOnlyAtOrUnderTheStop(uint64 mark, uint64 stop, int64 szi) public {
+        mark = uint64(bound(mark, 1_000, 1e10));
+        stop = uint64(bound(stop, 1_000, 1e10));
+        szi = int64(bound(szi, -1e12, 1e12));
+        vm.mockCall(HyperCore.MARK_PX, abi.encode(BTC), abi.encode(mark));
+        vm.mockCall(HyperCore.POSITION, abi.encode(VAULT, uint16(BTC)), abi.encode(HyperCore.Position(szi, 0, 0, 20, false)));
+        vault.setStop(stop);
+
+        vm.recordLogs();
+        bool closed = vault.checkAndClose();
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        if (szi <= 0 || mark > stop) {
+            assertFalse(closed);
+            assertEq(logs.length, 0, "an action was sent above the stop");
+            return;
+        }
+        assertTrue(closed);
+        assertEq(logs.length, 2);
+        assertEq(logs[0].emitter, HyperCore.CORE_WRITER);
+        bytes memory action = abi.decode(logs[0].data, (bytes));
+        assertEq(bytes4(action), bytes4(0x01000001), "not a limit order action");
+        bytes memory fields = new bytes(action.length - 4);
+        for (uint256 i = 0; i < fields.length; i++) fields[i] = action[i + 4];
+        (uint32 asset, bool isBuy, uint64 limitPx, uint64 sz, bool reduceOnly, uint8 tif,) =
+            abi.decode(fields, (uint32, bool, uint64, uint64, bool, uint8, uint128));
+        assertEq(asset, BTC);
+        assertFalse(isBuy);
+        assertTrue(reduceOnly);
+        assertEq(tif, HyperCore.TIF_IOC);
+        assertEq(sz, uint64(szi) * 1e3, "not the whole position");
+        assertGt(limitPx, 0);
+        // The precompile's BTC price has one decimal and the order's has eight.
+        assertLe(limitPx, uint256(stop) * 1e7, "limit above the stop");
+        assertLe(limitPx, uint256(mark) * 1e7);
     }
 }
