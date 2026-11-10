@@ -875,6 +875,14 @@ pub fn parse_dec(s: &str, decimals: u32) -> Option<i128> {
     Some(if neg { -v } else { v })
 }
 
+/// A decimal string as a fixed-point integer with `decimals` digits, rounded
+/// half away from zero. The info API prints some sizes and values with float
+/// noise past their own precision (1261712.8999999999 for 1261712.9).
+pub fn parse_rounded(s: &str, decimals: u32) -> Option<i128> {
+    let v = parse_dec(s, decimals + 1)?;
+    Some((v + if v < 0 { -5 } else { 5 }) / 10)
+}
+
 /// A fixed-point integer as a decimal string the way the info API writes
 /// them: trailing zeros cut, at least one decimal digit.
 pub fn fmt_dec(v: i128, decimals: u32) -> String {
@@ -2171,8 +2179,8 @@ impl State {
         for ap in ch["assetPositions"].as_array().map_or(&[][..], Vec::as_slice) {
             let p = &ap["position"];
             let Some(asset) = p["coin"].as_str().and_then(|c| by_name.get(c)).copied() else { continue };
-            let size = p["szi"].as_str().and_then(|s| parse_dec(s, 8)).map_or(0, |s| s.unsigned_abs());
-            let value = p["positionValue"].as_str().and_then(|s| parse_dec(s, 6)).map_or(0, |v| v.unsigned_abs());
+            let size = p["szi"].as_str().and_then(|s| parse_rounded(s, 8)).map_or(0, |s| s.unsigned_abs());
+            let value = p["positionValue"].as_str().and_then(|s| parse_rounded(s, 6)).map_or(0, |v| v.unsigned_abs());
             let mark = (size > 0 && value > 0).then(|| (value * X16_TO_X6 / size) as u64).filter(|m| *m > 0 && notional(size as u64, *m) as u128 == value);
             out.push((asset, mark));
         }
@@ -2201,29 +2209,29 @@ impl State {
                 skipped.push(coin);
                 continue;
             };
-            let (Some(szi), Some(entry_px)) = (p["szi"].as_str().and_then(|s| parse_dec(s, 8)), p["entryPx"].as_str().and_then(|s| parse_dec(s, 8))) else {
+            let (Some(szi), Some(entry_px)) = (p["szi"].as_str().and_then(|s| parse_rounded(s, 8)), p["entryPx"].as_str().and_then(|s| parse_dec(s, 8))) else {
                 skipped.push(coin);
                 continue;
             };
             let leverage = p["leverage"]["value"].as_u64().unwrap_or(DEFAULT_LEVERAGE as u64) as u32;
             let isolated = p["leverage"]["type"] == "isolated";
-            let dec6 = |k: &str| p[k].as_str().and_then(|s| parse_dec(s, 6)).unwrap_or(0) as i64;
+            let dec6 = |k: &str| p[k].as_str().and_then(|s| parse_rounded(s, 6)).unwrap_or(0) as i64;
             let isolated_raw_usd = if isolated { dec6("marginUsed") - dec6("unrealizedPnl") } else { 0 };
             // The exact entry notional is the position value less the unrealized PnL. The entry price is cut off.
             let sign = if szi > 0 { 1 } else { -1 };
-            let entry_ntl = match (p["positionValue"].as_str().and_then(|s| parse_dec(s, 6)), p["unrealizedPnl"].as_str().and_then(|s| parse_dec(s, 6))) {
+            let entry_ntl = match (p["positionValue"].as_str().and_then(|s| parse_rounded(s, 6)), p["unrealizedPnl"].as_str().and_then(|s| parse_rounded(s, 6))) {
                 (Some(value), Some(upnl)) if value - sign * upnl > 0 => (value - sign * upnl) as u64,
                 _ => notional(szi.unsigned_abs() as u64, entry_px as u64),
             };
             // An account with its own margin terms (an HLP vault at 50x on every perp) keeps them.
             let own_max = p["maxLeverage"].as_u64().unwrap_or(0) as u32;
             let max_leverage = if self.perps.get(&asset).is_some_and(|x| x.max_leverage_at(dec6("positionValue").unsigned_abs()) != own_max) { own_max } else { 0 };
-            let funding = |k: &str| p["cumFunding"][k].as_str().and_then(|s| parse_dec(s, 6)).unwrap_or(0) as i64;
+            let funding = |k: &str| p["cumFunding"][k].as_str().and_then(|s| parse_rounded(s, 6)).unwrap_or(0) as i64;
             let funding_paid = funding("sinceOpen");
             positions.insert(asset, Pos { szi_x8: szi as i64, entry_ntl, leverage, isolated, isolated_raw_usd, funding_paid, max_leverage, funding_before: funding("allTime") - funding_paid, funding_at_change: funding_paid - funding("sinceChange") });
         }
         let summary = if ch["crossMarginSummary"].is_object() { &ch["crossMarginSummary"] } else { &ch["marginSummary"] };
-        let account_value = summary["accountValue"].as_str().and_then(|s| parse_dec(s, 6)).unwrap_or(0);
+        let account_value = summary["accountValue"].as_str().and_then(|s| parse_rounded(s, 6)).unwrap_or(0);
         let acct = self.account(user);
         // Old positions on this dex go to zero, so their answers are rewritten.
         for (a, p) in acct.positions.iter_mut() {
@@ -2775,6 +2783,22 @@ mod tests {
         let m = s.margin(ALICE);
         // Value 200 at the mark, entry 203, fee 0.09135: account value 9996.90865, less 10% of 200.
         assert_eq!((m.account_value, m.margin_used, m.withdrawable), (usd(9996.90865), 10_000_000, usd(9976.90865) as u64));
+    }
+
+    #[test]
+    fn a_mirror_rounds_the_float_noise_of_the_info_api() {
+        assert_eq!((parse_rounded("1261712.8999999999", 8), parse_rounded("-0.0000000051", 8), parse_rounded("10320073.7962560002", 6)), (Some(126_171_290_000_000), Some(-1), Some(10_320_073_796_256)));
+        let mut s = state();
+        s.perps.insert(1, Perp { name: "ALT".into(), sz_decimals: 1, max_leverage: 3, mark_x8: x8(2.0), ..Default::default() });
+        // 1000.3 ALT at 2.1 is 2100.63, printed with noise in the size and the value.
+        let ch = json!({ "assetPositions": [{ "position": { "coin": "ALT", "szi": "1000.2999999999", "entryPx": "2.0", "positionValue": "2100.6299999998", "unrealizedPnl": "100.0299999999",
+            "marginUsed": "700.21", "maxLeverage": 3, "leverage": { "type": "cross", "value": 3 }, "cumFunding": { "allTime": "0.0", "sinceOpen": "0.0", "sinceChange": "0.0" } } }], "marginSummary": { "accountValue": "5000.0000000001" } });
+        assert_eq!(s.snapshot_marks(0, &ch), [(1, Some(x8(2.1)))]);
+        s.mirror_prices(BOB, &[(1, x8(2.1), x8(2.1))], 1);
+        s.mirror_perps(BOB, &ch);
+        let p = &s.clearinghouse(BOB, 0, 0)["assetPositions"][0]["position"];
+        assert_eq!((&p["szi"], &p["positionValue"], &p["unrealizedPnl"], &p["marginUsed"]), (&json!("1000.3"), &json!("2100.63"), &json!("100.03"), &json!("700.21")));
+        assert_eq!(s.margin(BOB).account_value, usd(5000.0));
     }
 
     #[test]
