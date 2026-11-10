@@ -229,6 +229,21 @@ impl Perp {
         self.tier_list()[self.tier_at(ntl)].1.max(1)
     }
 
+    /// Each tier as (lower bound x6, max leverage, maintenance deduction x6).
+    fn tier_terms(&self) -> Vec<(u64, u32, i128)> {
+        let tiers = self.tier_list();
+        let mut deduction = 0i128;
+        let mut out = Vec::with_capacity(tiers.len());
+        for (n, (lb, lev)) in tiers.iter().enumerate() {
+            if n > 0 {
+                let (lev, prev) = ((*lev).max(1) as i128, tiers[n - 1].1.max(1) as i128);
+                deduction += *lb as i128 * (prev - lev) / (2 * lev * prev);
+            }
+            out.push((*lb, (*lev).max(1), deduction));
+        }
+        out
+    }
+
     /// The maintenance margin of a position notional, x6:
     /// notional / (2 x tier max leverage) - the tier's maintenance deduction,
     /// where each tier adds lower bound x the step in maintenance rate.
@@ -951,27 +966,39 @@ impl State {
         self.perps.get(&perp).map_or(value / 2, |x| x.maintenance_at(value))
     }
 
-    /// The liquidation price of a position (x8) by Hyperliquid's formula,
-    /// price - side x margin available / size / (1 - l x side) with l = 1 /
-    /// (2 x max leverage), or None when no positive price liquidates it.
-    /// `available` is the account value (or the isolated margin) less the
-    /// maintenance margin required, x6.
-    fn liquidation_px(&self, perp: u32, p: &Pos, available: i128) -> Option<u64> {
+    /// The liquidation price of a position (x8), or None when no positive
+    /// price liquidates it: the price at which `equity` (the account value,
+    /// or an isolated position's margin with its PnL, x6) falls to the
+    /// maintenance margin, `maintenance` being what is required now. Within
+    /// one margin tier this is Hyperliquid's formula, price - side x margin
+    /// available / size / (1 - l x side) with l = 1 / (2 x max leverage). A
+    /// position that reaches a higher tier on the way takes that tier's rate
+    /// and deduction.
+    fn liquidation_px(&self, perp: u32, p: &Pos, equity: i128, maintenance: i128) -> Option<u64> {
         let size = p.szi_x8.unsigned_abs() as i128;
-        let mark = self.mark_of(perp, p);
-        let side: i128 = if p.szi_x8 > 0 { 1 } else { -1 };
-        let at = |max: u32| -> i128 {
-            // x8: available (x6) / size (x8) is x-2, so scale by 10^10. Then divide by (1 - side / (2 max)).
-            let per_unit = available * 10_000_000_000 / size.max(1);
-            let m2 = 2 * max.max(1) as i128;
-            mark as i128 - side * per_unit * m2 / (m2 - side)
-        };
-        let mut px = at(self.max_leverage_of(perp, p, notional(size as u64, mark)));
-        // With margin tiers the maintenance leverage is the one at the liquidation price.
-        if p.max_leverage == 0 && px > 0 {
-            px = at(self.max_leverage_of(perp, p, notional(size as u64, px as u64)));
+        if size == 0 {
+            return None;
         }
-        (px > 0).then_some(px as u64)
+        let side: i128 = if p.szi_x8 > 0 { 1 } else { -1 };
+        let value = notional(size as u64, self.mark_of(perp, p));
+        let others = maintenance - self.maintenance_of(perp, p, value) as i128;
+        let tiers = match (p.max_leverage, self.perps.get(&perp)) {
+            (0, Some(x)) => x.tier_terms(),
+            (0, None) => vec![(0, 1, 0)],
+            (own, _) => vec![(0, own, 0)],
+        };
+        for (n, (lower, max, deduction)) in tiers.iter().enumerate() {
+            // equity + side x (v - value) = others + v / (2 max) - deduction, solved for the notional v.
+            let m2 = 2 * *max as i128;
+            let (num, den) = ((side * value as i128 - (equity - others + deduction)) * m2, m2 * side - 1);
+            let px = num * 10_000_000_000 / (den * size);
+            let v = num / den;
+            let below_next = tiers.get(n + 1).is_none_or(|next| v < next.0 as i128);
+            if px > 0 && v >= *lower as i128 && below_next {
+                return Some(px as u64);
+            }
+        }
+        None
     }
 
     /// A user's main-dex margin figures at the current marks.
@@ -1870,8 +1897,8 @@ impl State {
             // The info API gives the entry price with 6 minus szDecimals decimals, cut off.
             let cut = 10i128.pow(2 + perp.map_or(0, |x| (x.sz_decimals as u32).min(6)));
             let entry_px = (p.entry_ntl as u128 * X16_TO_X6 / size as u128) as i128 / cut * cut;
-            let available = if p.isolated { p.isolated_raw_usd as i128 + upnl - self.maintenance_of(*asset, p, value as u64) as i128 } else { m.account_value as i128 - maintenance as i128 };
-            let liquidation_px = self.liquidation_px(*asset, p, available).map(|px| fmt_dec(px as i128, 8));
+            let liquidation_px = if p.isolated { self.liquidation_px(*asset, p, p.isolated_raw_usd as i128 + upnl, self.maintenance_of(*asset, p, value as u64) as i128) } else { self.liquidation_px(*asset, p, m.account_value as i128, maintenance as i128) };
+            let liquidation_px = liquidation_px.map(|px| fmt_dec(px as i128, 8));
             let roe = if p.entry_ntl > 0 { upnl * p.leverage as i128 * 10_000_000_000 / p.entry_ntl as i128 } else { 0 };
             let mut lev = json!({ "type": if p.isolated { "isolated" } else { "cross" }, "value": p.leverage });
             if p.isolated {
@@ -2603,11 +2630,24 @@ mod tests {
         assert_eq!(ch["assetPositions"][1]["position"]["liquidationPx"], "11.87995049");
         // Long BTC: 100 - 9978.75 / (1 - 1 / 80) is below zero, so no price liquidates it.
         assert_eq!(ch["assetPositions"][0]["position"]["liquidationPx"], Value::Null);
-        // A long on thin margin: 1 BTC at 100 with 3 USD, 100 - (2 - 1.25) / (1 - 1 / 80) = 99.24050633.
+        // A long on thin margin: 1 BTC at 100 with 3 USD, 100 - (2 - 1.25) / (1 - 1 / 80) = 99.24050632.
         let mut s = state();
         s.account(BOB).usd = usd(3.0);
         s.account(BOB).positions.insert(0, Pos { szi_x8: x8(1.0) as i64, entry_ntl: 101_000_000, leverage: 20, ..Default::default() });
-        assert_eq!(s.clearinghouse(BOB, 0, 0)["assetPositions"][0]["position"]["liquidationPx"], "99.24050633");
+        assert_eq!(s.clearinghouse(BOB, 0, 0)["assetPositions"][0]["position"]["liquidationPx"], "99.24050632");
+    }
+
+    #[test]
+    fn liquidation_price_takes_the_tier_it_ends_in() {
+        // A perp at 10x up to 3,000 USD and 5x above, which deducts 3000 x (1 / 10 - 1 / 20) = 150.
+        let mut s = state();
+        s.perps.insert(1, Perp { name: "ALT".into(), sz_decimals: 1, max_leverage: 10, mark_x8: x8(2.0), tiers: vec![(0, 10), (3_000_000_000, 5)], ..Default::default() });
+        s.account(BOB).usd = usd(10_000.0);
+        s.account(BOB).positions.insert(1, Pos { szi_x8: -(x8(1000.0) as i64), entry_ntl: 2_000_000_000, leverage: 10, ..Default::default() });
+        // Short 1000 at 2 with 10,000 USD of account value. The first tier would give a notional of
+        // 11,428, outside it. In the second, v = (2000 + 10000 + 150) x 10 / 11 = 11045.45, so 11.04545454:
+        // there the account value, 10000 - 9045.45, equals the maintenance margin, 11045.45 / 10 - 150.
+        assert_eq!(s.clearinghouse(BOB, 0, 0)["assetPositions"][0]["position"]["liquidationPx"], "11.04545454");
     }
 
     #[test]
