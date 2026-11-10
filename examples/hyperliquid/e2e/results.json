@@ -1,0 +1,21 @@
+{
+  "stopLoss": {
+    "markPx": 72818,
+    "movePct": -3,
+    "movedMarkPx": 70633.4,
+    "stopPx": 71361.6,
+    "closePx": 70671
+  },
+  "replayDay": {
+    "day": "2026-11-05",
+    "entryPx": 80692,
+    "stopPx": 78271.2,
+    "closedAfterCandle": "2026-11-05T15:00Z",
+    "closePx": 76084,
+    "closedPnlUsd": -46.08,
+    "dayLowClose": 75703
+  },
+  "date": "2026-11-10",
+  "chainsim": "chainsim 0.1.11",
+  "fuzzRuns": 1000
+}

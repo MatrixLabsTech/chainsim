@@ -1,0 +1,248 @@
+{
+ "date": "2026-11-10T18:19:52.125Z",
+ "chainsim": "chainsim 0.1.11",
+ "commit": null,
+ "proxy": "0.1.11-839de116a72f",
+ "upstream": "public RPC",
+ "machine": {
+  "name": "Apple M5 Max",
+  "dockerCpus": 18,
+  "dockerMemoryGiB": 7.7,
+  "arch": "arm64"
+ },
+ "up": {
+  "runs": [
+   {
+    "run": 1,
+    "upMs": 17726,
+    "firstTransactionMs": 166,
+    "forkBlock": 50912583
+   },
+   {
+    "run": 2,
+    "upMs": 17769,
+    "firstTransactionMs": 175,
+    "forkBlock": 50912670
+   },
+   {
+    "run": 3,
+    "upMs": 16921,
+    "firstTransactionMs": 149,
+    "forkBlock": 50912755
+   },
+   {
+    "run": 4,
+    "upMs": 17042,
+    "firstTransactionMs": 153,
+    "forkBlock": 50912841
+   },
+   {
+    "run": 5,
+    "upMs": 17452,
+    "firstTransactionMs": 152,
+    "forkBlock": 50912926
+   }
+  ],
+  "p50Ms": 17452,
+  "slowestMs": 17769,
+  "firstTransactionP50Ms": 153
+ },
+ "selftest": {
+  "passed": 9,
+  "parts": 9
+ },
+ "proxyOverhead": {
+  "http": {
+   "request": "eth_chainId",
+   "proxyMs": {
+    "n": 2000,
+    "p50": 0.26,
+    "p95": 0.34,
+    "p99": 0.66,
+    "max": 1.98
+   },
+   "engineMs": {
+    "n": 2000,
+    "p50": 0.11,
+    "p95": 0.15,
+    "p99": 0.22,
+    "max": 1.66
+   },
+   "overheadP50Ms": 0.15
+  },
+  "webSocket": {
+   "request": "eth_chainId",
+   "proxyMs": {
+    "n": 2000,
+    "p50": 0.16,
+    "p95": 0.18,
+    "p99": 0.23,
+    "max": 1.01
+   },
+   "engineMs": {
+    "n": 2000,
+    "p50": 0.05,
+    "p95": 0.07,
+    "p99": 0.1,
+    "max": 0.85
+   },
+   "overheadP50Ms": 0.11
+  }
+ },
+ "throughput": {
+  "request": "eth_call markPx (0x806)",
+  "seconds": 5,
+  "runs": [
+   {
+    "clients": 1,
+    "requestsPerSecond": 3749,
+    "latencyMs": {
+     "n": 18743,
+     "p50": 0.25,
+     "p95": 0.31,
+     "p99": 0.52,
+     "max": 7.84
+    }
+   },
+   {
+    "clients": 4,
+    "requestsPerSecond": 5931,
+    "latencyMs": {
+     "n": 29654,
+     "p50": 0.63,
+     "p95": 0.84,
+     "p99": 1.65,
+     "max": 10.18
+    }
+   },
+   {
+    "clients": 16,
+    "requestsPerSecond": 5726,
+    "latencyMs": {
+     "n": 28629,
+     "p50": 2.68,
+     "p95": 3.62,
+     "p99": 4.47,
+     "max": 10.19
+    }
+   }
+  ]
+ },
+ "orderToFill": {
+  "orders": 200,
+  "size": "0.001 BTC",
+  "receiptMs": {
+   "n": 200,
+   "p50": 3.05,
+   "p95": 4.31,
+   "p99": 6.91,
+   "max": 13.03
+  },
+  "fillVisibleMs": {
+   "n": 200,
+   "p50": 3.32,
+   "p95": 4.65,
+   "p99": 7.35,
+   "max": 13.73
+  }
+ },
+ "sustainedOrders": {
+  "orders": 2000,
+  "size": "0.0002 BTC",
+  "seconds": 4.87,
+  "ordersPerSecond": 410
+ },
+ "ordersFilled": {
+  "sent": 2200,
+  "filled": 2200
+ },
+ "mirror": [
+  {
+   "positions": 5,
+   "ms": 5968,
+   "infoCalls": 16,
+   "upstreamCalls": 6,
+   "clientWaitMs": {
+    "n": 110,
+    "p50": 1.19,
+    "p95": 3.07,
+    "p99": 67.65,
+    "max": 163.5
+   }
+  },
+  {
+   "positions": 23,
+   "ms": 6363,
+   "infoCalls": 18,
+   "upstreamCalls": 6,
+   "clientWaitMs": {
+    "n": 112,
+    "p50": 1.36,
+    "p95": 3.06,
+    "p99": 183.1,
+    "max": 260.5
+   }
+  },
+  {
+   "positions": 177,
+   "ms": 6560,
+   "infoCalls": 16,
+   "upstreamCalls": 6,
+   "clientWaitMs": {
+    "n": 115,
+    "p50": 1.31,
+    "p95": 3.67,
+    "p99": 251.47,
+    "max": 326.66
+   }
+  }
+ ],
+ "replay": [
+  {
+   "candles": 25,
+   "ms": 4728,
+   "msPerCandle": 189.1,
+   "clientWaitMs": {
+    "n": 57,
+    "p50": 1.2,
+    "p95": 158.64,
+    "p99": 161.39,
+    "max": 161.39
+   }
+  },
+  {
+   "candles": 73,
+   "ms": 12986,
+   "msPerCandle": 177.9,
+   "clientWaitMs": {
+    "n": 152,
+    "p50": 1.12,
+    "p95": 162.47,
+    "p99": 196.55,
+    "max": 226.56
+   }
+  },
+  {
+   "candles": 169,
+   "ms": 30281,
+   "msPerCandle": 179.2,
+   "clientWaitMs": {
+    "n": 348,
+    "p50": 1.68,
+    "p95": 164.67,
+    "p99": 226.44,
+    "max": 249.98
+   }
+  }
+ ],
+ "peakMemoryMiB": {
+  "proxy": 5.2,
+  "engine": 647.6,
+  "control": 4.4
+ },
+ "imagesMB": {
+  "proxy": 29.7,
+  "engine": 246.2,
+  "control": 13.7
+ }
+}

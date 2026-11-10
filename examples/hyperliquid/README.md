@@ -22,9 +22,12 @@ to its stop.
   first prices with a stop 3% under its entry, a keeper calls it after every two candles, and
   the script checks the hour of the close, its price and the loss.
 - `scripts/test.sh`: the whole run: `chainsim up`, `selftest`, the unit and fuzz tests, the e2e
-  scripts and `chainsim down`.
+  scripts and `chainsim down`. With `E2E_RESULTS=<file>` it also writes the run's numbers as JSON.
+  The last run's are in [e2e/results.json](e2e/results.json).
 - `scripts/docker.sh`: runs any of these scripts in one container that has chainsim built from
   this repository, Foundry and Node.js, so the host needs only Docker.
+- `bench/`: start time, order to fill, proxy overhead and throughput, mirror and replay
+  scaling. Results: [bench/README.md](bench/README.md).
 - `.github/workflows/chainsim.yml`: a GitHub Actions job that runs the same script. Copy it into
   your own repository's `.github/workflows/`.
 
