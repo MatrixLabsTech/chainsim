@@ -22,7 +22,9 @@ error codes from the binary.
   hypercore funding <perp> <rate>` sets a perp's hourly funding rate. `set hypercore book` takes a
   builder-deployed perp as `dex:coin` (xyz:XYZ100), and `price` takes its perp index
   (dex * 10000 + index). CoreWriter orders on such perps use asset 100000 + perp index. `set hypercore price` also
-  fills crossed resting orders and liquidates, and returns `filled` and `liquidated`. `time <name>
+  moves the perp's order book by the same ratio, fills crossed resting orders and liquidates, and
+  returns `filled` and `liquidated`, so an order sent after it fills at the moved price, on the
+  exchange's tick. `time <name>
   --replay <perp> --from <time> --to <time>` replays hourly mainnet candles as the price path. `call <name>
   corewriter_actions [{"fromBlock": <n>}]` returns every CoreWriter action decoded with its
   `result`, and `call <name> hypercore_state <user>` returns the account's Core state as

@@ -24,8 +24,9 @@ builder-deployed perps, borrow and lend, and testnet.
   and a spot send back credits the EVM balance.
 - `set hypercore mirror`, which copies a mainnet account's positions, margin and balances onto the
   copy, and `call hypercore_state`, which reads an account's Core state in the info API's shapes.
-- Market scripting: `set hypercore price` reprices positions, fills the resting orders a move
-  crosses and liquidates accounts below maintenance margin, `time --replay` plays a past stretch
+- Market scripting: `set hypercore price` moves the perp's order book with the price, fills the
+  resting orders the move crosses, reprices positions and liquidates accounts below maintenance
+  margin, `time --replay` plays a past stretch
   of mainnet candles as the price path, funding accrues every hour of the fork's clock, and every
   fill pays maker or taker fees.
 - A replay steps one candle at a time, so other clients are served while it runs, and a
@@ -302,26 +303,28 @@ a contract, and `send --as` the vault address acts as it.
 
 ### Orders
 
-A limit order sent through CoreWriter matches against the order book snapshot, best price first,
-and against orders resting on the copy. Each fill takes depth off the book, so a second order
-fills deeper. A GTC remainder rests, an IOC remainder is dropped, and an ALO order that would
+A limit order sent through CoreWriter matches against the perp's order book, best price first,
+and against orders resting on the copy. The book is the one `up` or `set hypercore book --live`
+took, at the level the prices scripted since have moved it to. Each fill takes depth off the
+book, so a second order fills deeper. A GTC remainder rests, an IOC remainder is dropped, and an ALO order that would
 cross is rejected. A cancel by order id or client order id removes a resting order. Orders check
 the account's withdrawable margin at the order's leverage, 20 or the perp's maximum if lower.
 
-This run gave `0x0000…c0ffee` 1,000 USDC on spot, moved 500 USD to perp with a USD class
-transfer, bought 0.001 BTC with an IOC order above the ask, and left a GTC bid at 70,000.
+This run set BTC to 65,000 with `set hypercore price` while the book's best ask stood at 73,744.
+It then gave `0x0000…c0ffee` 1,000 USDC on spot, moved 500 USD to perp with a USD class
+transfer, bought 0.001 BTC with an IOC order above the ask, and left a GTC bid at 60,000.
 `call corewriter_actions` shows each action with its `result`:
 
 ```json
 [
-  { "block": 50165643, "action": "usdClassTransfer", "fields": { "ntl": "500000000", "toPerp": true }, "result": "moved 500.0 USD to perp" },
-  { "block": 50165644, "action": "limitOrder", "fields": { "asset": "0", "isBuy": true, "limitPx": "7904058000000", "sz": "100000", "reduceOnly": false, "encodedTif": "3", "cloid": "0" }, "result": "filled 0.001 at 78258.0" },
-  { "block": 50165645, "action": "limitOrder", "fields": { "asset": "0", "isBuy": true, "limitPx": "7000000000000", "sz": "100000", "reduceOnly": false, "encodedTif": "2", "cloid": "77" }, "result": "0.001 resting as oid 1" }
+  { "block": 50895034, "action": "usdClassTransfer", "fields": { "ntl": "500000000", "toPerp": true }, "result": "moved 500.0 USD to perp" },
+  { "block": 50895035, "action": "limitOrder", "fields": { "asset": "0", "isBuy": true, "limitPx": "6600000000000", "sz": "100000", "reduceOnly": false, "encodedTif": "3", "cloid": "0" }, "result": "filled 0.001 at 65004.0, fee 0.029251 USD" },
+  { "block": 50895036, "action": "limitOrder", "fields": { "asset": "0", "isBuy": true, "limitPx": "6000000000000", "sz": "100000", "reduceOnly": false, "encodedTif": "2", "cloid": "77" }, "result": "0.001 resting as oid 2" }
 ]
 ```
 
 Each entry also carries `txHash`, `logIndex`, `user`, `version` and `actionId`. The IOC filled at
-78,258, the best ask in the book `up` took.
+65,004, the best ask of the book after it moved with the price.
 
 ### Core state
 
@@ -336,35 +339,33 @@ chainsim call hyperevm-mainnet hypercore_state 0x0000000000000000000000000000000
 {
   "user": "0x0000000000000000000000000000000000C0FFEE",
   "clearinghouseState": {
-    "marginSummary": { "accountValue": "486.742", "totalNtlPos": "65.0", "totalRawUsd": "421.742", "totalMarginUsed": "3.25" },
-    "withdrawable": "479.992",
+    "marginSummary": { "accountValue": "499.966749", "totalNtlPos": "65.0", "totalRawUsd": "434.966749", "totalMarginUsed": "3.25" },
+    "withdrawable": "493.716749",
     "assetPositions": [
       {
         "type": "oneWay",
         "position": {
-          "coin": "BTC", "szi": "0.001", "leverage": { "type": "cross", "value": 20 }, "entryPx": "78258.0",
-          "positionValue": "65.0", "unrealizedPnl": "-13.258", "returnOnEquity": "-3.3882797924", "liquidationPx": null,
+          "coin": "BTC", "szi": "0.001", "leverage": { "type": "cross", "value": 20 }, "entryPx": "65004.0",
+          "positionValue": "65.0", "unrealizedPnl": "-0.004", "returnOnEquity": "-0.0012306934", "liquidationPx": null,
           "marginUsed": "3.25", "maxLeverage": 40, "cumFunding": { "allTime": "0.0", "sinceOpen": "0.0", "sinceChange": "0.0" }
         }
       }
     ],
-    "time": 1793600069000
+    "time": 1794317547000
   },
   "spotClearinghouseState": {
     "balances": [
-      { "coin": "USDC", "token": 0, "total": "500.0", "hold": "0.0", "entryNtl": "0.0" },
-      { "coin": "HYPE", "token": 150, "total": "2.0", "hold": "0.0", "entryNtl": "0.0" }
+      { "coin": "USDC", "token": 0, "total": "500.0", "hold": "0.0", "entryNtl": "0.0" }
     ]
   },
   "openOrders": [
-    { "coin": "BTC", "asset": 0, "side": "B", "limitPx": "70000.0", "sz": "0.001", "oid": 1, "cloid": "0x0000000000000000000000000000004d", "tif": "Gtc" }
+    { "coin": "BTC", "asset": 0, "side": "B", "limitPx": "60000.0", "sz": "0.001", "oid": 2, "cloid": "0x0000000000000000000000000000004d", "tif": "Gtc" }
   ]
 }
 ```
 
-`crossMarginSummary` and `crossMaintenanceMarginUsed` are left out here. The BTC mark had been
-set to 65,000 earlier in the run with `set hypercore price`, so the position shows a loss against
-its 78,258 entry. The same figures answer the `0x800`, `0x801`, `0x803` and `0x80f` precompiles.
+`crossMarginSummary`, `crossMaintenanceMarginUsed` and `userFills` are left out here. The mark is
+65,000, so the position shows a small loss against its 65,004 entry. The same figures answer the `0x800`, `0x801`, `0x803` and `0x80f` precompiles.
 
 `set hypercore book <coin> --live` takes a fresh book for one perp from the info API, by name or
 index, and replaces the one fills have consumed.
@@ -384,10 +385,17 @@ index, and replaces the one fills have consumed.
 
 A test moves the market on the copy and watches what follows. Each move runs the same steps:
 
-1. The perp's mark and oracle prices take the new value, and every position reprices: unrealized
-   PnL, margin used, withdrawable and the margin summary follow it.
-2. Resting orders the move crosses fill at their own limit price, as makers.
-3. Borrow and lend collateral that follows the perp takes its new price.
+1. The perp's mark and oracle prices take the new value, and the order book moves with them.
+   Every level's price changes by the ratio of the new mark to the old one and keeps its size, so
+   the spread and the depth stay in proportion. A moved level shows and trades at a valid price
+   under Hyperliquid's [tick size](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/tick-and-lot-size)
+   rule, at most 5 significant figures and 6 minus `szDecimals` decimals, with a bid rounded down
+   and an ask rounded up. Levels that meet on one price show as one level with their sizes
+   added. Orders that accounts placed on the copy keep their own prices.
+2. Resting orders that the new price or the moved book crosses fill at their own limit price, as
+   makers.
+3. Every position reprices at the new mark: unrealized PnL, margin used, withdrawable and the
+   margin summary follow it. Borrow and lend collateral that follows the perp takes its new price.
 4. Accounts whose account value falls below their maintenance margin are liquidated, and borrow
    and lend accounts past the portfolio margin ratio are liquidated in steps. The same check runs
    after each funding payment and on every replayed candle.
@@ -627,6 +635,7 @@ dex 1, so xyz:XYZ100 is perp 10000 and asset 110000.
   `clamp(interest rate - premium, -0.0005, 0.0005)`, over 8, capped at 4%. `perpDexs` gives each
   perp's multiplier, interest rate (0.0001 unless set) and clamp at the time the perp is added.
   Measured on mainnet: xyz:TSLA with premium -0.0001887542 and multiplier 0.5 pays 0.00000625.
+  The book moves with a scripted price, so the premium a perp had before a move holds after it.
 - Margin tiers come from the dex's own meta, as on the main dex.
 - `0x800` (uint16 perp) and `0x813` (uint32 perp) answer positions, `0x80f` takes the dex, and
   `/info` takes `"dex": "xyz"` for meta, metaAndAssetCtxs, clearinghouseState, openOrders and
