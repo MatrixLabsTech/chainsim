@@ -11,7 +11,8 @@
 //   CTX_BEFORE     a file with the info API's metaAndAssetCtxs from just before `up`
 //   BEFORE_UP_MS   when that file was read, in ms
 //   node fidelity.mjs render    writes the page again from the JSON
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
+import { promisify } from 'node:util';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { decodeAbiParameters, encodeAbiParameters, parseUnits } from 'viem';
 
@@ -40,6 +41,11 @@ const mainInfo = (body) => post(INFO, body);
 const forkInfo = (body) => post(`${RPC}/info`, body);
 const chainsim = (...args) => {
   const out = JSON.parse(execFileSync('chainsim', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }));
+  if (!out.ok) throw new Error(`chainsim ${args.join(' ')}: ${out.error.code}`);
+  return out.data;
+};
+const chainsimAsync = async (...args) => {
+  const out = JSON.parse((await promisify(execFile)('chainsim', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })).stdout);
   if (!out.ok) throw new Error(`chainsim ${args.join(' ')}: ${out.error.code}`);
   return out.data;
 };
@@ -110,37 +116,62 @@ async function run() {
   for (const [label, user] of [['HLP strategy vault', VAULT], ['Account on standard margin', TRADER]]) {
     if (user === TRADER) await sleep(Math.max(0, afterUpMs + 125_000 - Date.now()));
     if (user === TRADER) result.secondMirrorSecondsAfterUp = round((Date.now() - afterUpMs) / 1000, 1);
-    const before = await mainInfo({ type: 'clearinghouseState', user });
+    // Mainnet keeps trading and repricing. The info API is read before the mirror, every quarter
+    // second while it runs and after it, and the fork must hold what one of those reads gave.
+    const state = () => mainInfo({ type: 'clearinghouseState', user });
+    const reads = [await state()];
     const t0 = Date.now();
-    const mirrored = chainsim('set', FORK, 'hypercore', 'mirror', user);
-    const after = await mainInfo({ type: 'clearinghouseState', user });
+    let running = true;
+    const polling = (async () => {
+      while (running) {
+        await sleep(250);
+        const r = await state().catch(() => null);
+        if (r) reads.push(r);
+      }
+    })();
+    const mirrored = await chainsimAsync('set', FORK, 'hypercore', 'mirror', user);
+    running = false;
+    await polling;
+    reads.push(await state());
     const windowMs = Date.now() - t0;
     const fork = await forkInfo({ type: 'clearinghouseState', user });
     const openOrders = (await mainInfo({ type: 'openOrders', user })).length;
     const byCoin = (s) => new Map(s.assetPositions.map((p) => [p.position.coin, p.position]));
-    const [b, a, f] = [byCoin(before), byCoin(after), byCoin(fork)];
-    const coins = [...f.keys()].filter((c) => b.has(c) && a.has(c));
-    // Mainnet keeps trading: a field is compared with the read before and the read after.
-    const either = (field, get = (p) => JSON.stringify(p[field])) => group(`${label}: position ${field}`, 'equal to the info API read just before or just after the mirror', coins.map((c) => ({ what: c, equal: get(f.get(c)) === get(b.get(c)) || get(f.get(c)) === get(a.get(c)) })));
-    // Values that follow the mark are compared where mainnet's value stood still across both reads.
-    const still = coins.filter((c) => b.get(c).szi === a.get(c).szi && b.get(c).positionValue === a.get(c).positionValue);
-    const quiet = (field) => group(`${label}: position ${field}`, 'equal on the positions whose size and value stood still on mainnet across both reads', still.map((c) => ({ what: c, fork: f.get(c)[field], mainnet: a.get(c)[field], equal: f.get(c)[field] === a.get(c)[field], diffBps: round(bps(f.get(c)[field], a.get(c)[field])) })));
+    const [f, all] = [byCoin(fork), reads.map(byCoin)];
+    const coins = [...f.keys()].filter((c) => all.every((m) => m.has(c)));
+    const seen = (c, get) => all.map((m) => get(m.get(c)));
+    const nearest = (x, values) => values.reduce((m, v) => (Math.abs(v - x) < Math.abs(m - x) ? v : m));
+    const SAME = 'equal to a value the info API gave for the position while the mirror ran';
+    const same = (field, get) => group(`${label}: position ${field}`, SAME, coins.map((c) => ({ what: c, equal: seen(c, get).includes(get(f.get(c))) })));
+    // USD figures are compared to six decimals, the precision the info API prints them at.
+    const usd = (field) => group(`${label}: position ${field}`, `${SAME}, to six decimals`, coins.map((c) => {
+      const x = Number(f.get(c)[field]);
+      const m = nearest(x, seen(c, (p) => Number(p[field])));
+      return { what: c, fork: f.get(c)[field], mainnet: String(m), equal: Math.round(Math.abs(m - x) * 1e6) <= 1, diffBps: round(bps(x, m)) };
+    }));
     // Entry notional, the position value less the unrealized PnL, does not depend on the mark.
     const entryNtl = (p) => Number(p.positionValue) - Math.sign(Number(p.szi)) * Number(p.unrealizedPnl);
-    const entry = group(`${label}: position entry notional`, 'position value less unrealized PnL within 0.01 USD, on the positions whose size and value stood still on mainnet across both reads', still.map((c) => ({ what: c, fork: round(entryNtl(f.get(c)), 6), mainnet: round(entryNtl(a.get(c)), 6), equal: Math.abs(entryNtl(f.get(c)) - entryNtl(a.get(c))) <= 0.01, diffBps: round(bps(entryNtl(f.get(c)), entryNtl(a.get(c)))) })));
-    const set = coins.filter((c) => b.get(c).liquidationPx !== null && a.get(c).liquidationPx !== null);
-    const liquidation = group(`${label}: position liquidationPx`, 'within 1 bp of the read before or after, or between them', set.map((c) => {
-      const [x, lo, hi] = [Number(f.get(c).liquidationPx), ...[Number(b.get(c).liquidationPx), Number(a.get(c).liquidationPx)].sort((m, n) => m - n)];
-      const d = x >= lo && x <= hi ? 0 : Math.min(bps(x, lo), bps(x, hi));
-      return { what: c, fork: f.get(c).liquidationPx, mainnetBefore: b.get(c).liquidationPx, mainnetAfter: a.get(c).liquidationPx, equal: f.get(c).liquidationPx !== null && d <= 1, diffBps: round(d) };
+    const entry = group(`${label}: position entry notional`, 'position value less unrealized PnL, within 0.01 USD of a value the info API gave while the mirror ran', coins.map((c) => {
+      const x = entryNtl(f.get(c));
+      const m = nearest(x, seen(c, entryNtl));
+      return { what: c, fork: round(x, 6), mainnet: round(m, 6), equal: Math.abs(m - x) <= 0.01, diffBps: round(bps(x, m)) };
     }));
-    const unset = coins.filter((c) => b.get(c).liquidationPx === null && a.get(c).liquidationPx === null);
+    // A figure that depends on the whole account moves with every mark: the fork's lies within
+    // the range the reads span, or within 1 bp of one of them.
+    const ranged = (x, values) => {
+      const [lo, hi] = [Math.min(...values), Math.max(...values)];
+      return { lo, hi, d: x >= lo && x <= hi ? 0 : bps(x, nearest(x, values)) };
+    };
+    const set = coins.filter((c) => seen(c, (p) => p.liquidationPx).every((v) => v !== null));
+    const liquidation = group(`${label}: position liquidationPx`, 'within the range the info API gave while the mirror ran, or within 1 bp of it', set.map((c) => {
+      const r = f.get(c).liquidationPx === null ? { lo: null, hi: null, d: Infinity } : ranged(Number(f.get(c).liquidationPx), seen(c, (p) => Number(p.liquidationPx)));
+      return { what: c, fork: f.get(c).liquidationPx, mainnetLow: r.lo, mainnetHigh: r.hi, equal: r.d <= 1, diffBps: round(r.d) };
+    }));
+    const unset = coins.filter((c) => seen(c, (p) => p.liquidationPx).every((v) => v === null));
     const noLiquidation = group(`${label}: positions with no liquidation price`, 'null on the fork where the info API gives null', unset.map((c) => ({ what: c, equal: f.get(c).liquidationPx === null })));
-    // A total is equal when the fork is no further from mainnet than mainnet moved between its two reads.
     const total = (path, get) => {
-      const [x, m, n] = [Number(get(fork)), Number(get(before)), Number(get(after))];
-      const off = x >= Math.min(m, n) && x <= Math.max(m, n) ? 0 : Math.min(Math.abs(x - m), Math.abs(x - n));
-      return { what: path, fork: get(fork), mainnetBefore: get(before), mainnetAfter: get(after), equal: off <= Math.max(0.01, Math.abs(m - n)), diffBps: round((off / Math.abs(m || 1)) * 1e4), movedBps: round((Math.abs(m - n) / Math.abs(m || 1)) * 1e4) };
+      const r = ranged(Number(get(fork)), reads.map((s) => Number(get(s))));
+      return { what: path, fork: get(fork), mainnetLow: r.lo, mainnetHigh: r.hi, equal: r.d <= 1, diffBps: round(r.d) };
     };
     const totals = [
       total('marginSummary.accountValue', (s) => s.marginSummary.accountValue),
@@ -151,14 +182,16 @@ async function run() {
       total('withdrawable', (s) => s.withdrawable),
     ];
     result.groups.push(
-      { ...group(`${label}: positions mirrored`, 'every position the info API lists is on the fork', [{ what: 'count', fork: f.size, mainnet: a.size, equal: f.size === a.size || f.size === b.size }]), positions: mirrored.positions, windowMs, openOrders },
-      either('szi'), either('entryPx'), either('leverage'), either('maxLeverage'), either('cumFunding', (p) => ['allTime', 'sinceOpen', 'sinceChange'].map((k) => Number(p.cumFunding[k]).toFixed(5)).join()),
-      quiet('positionValue'), quiet('marginUsed'), entry, liquidation, noLiquidation,
-      group(`${label}: account summary`, 'no further from the info API than it moved between the reads before and after the mirror', totals),
+      { ...group(`${label}: positions mirrored`, 'every position the info API lists is on the fork', [{ what: 'count', fork: f.size, mainnet: all[all.length - 1].size, equal: all.some((m) => m.size === f.size) }]), positions: mirrored.positions, pricesMoved: mirrored.marks.length, windowMs, mainnetReads: reads.length, openOrders },
+      same('szi', (p) => Number(p.szi)), same('entryPx', (p) => Number(p.entryPx)), same('leverage', (p) => JSON.stringify(p.leverage)), same('maxLeverage', (p) => p.maxLeverage),
+      same('cumFunding', (p) => ['allTime', 'sinceOpen', 'sinceChange'].map((k) => Number(p.cumFunding[k]).toFixed(5)).join()),
+      usd('positionValue'), usd('marginUsed'), usd('unrealizedPnl'), entry, liquidation, noLiquidation,
+      group(`${label}: account summary`, 'within the range the info API gave while the mirror ran, or within 1 bp of it', totals),
     );
     // The position precompile on both sides, for the 20 largest positions (read further down).
-    const largest = coins.filter((c) => perpIndex.has(c)).sort((x, y) => Number(a.get(y).positionValue) - Number(a.get(x).positionValue)).slice(0, 20);
-    positionReads.push({ label, user, before: b, after: a, reads: largest.map((c) => ({ what: c, to: pc(0x800), data: encodeAbiParameters([{ type: 'address' }, { type: 'uint16' }], [user, perpIndex.get(c)]) })) });
+    const last = all[all.length - 1];
+    const largest = coins.filter((c) => perpIndex.has(c)).sort((x, y) => Number(last.get(y).positionValue) - Number(last.get(x).positionValue)).slice(0, 20);
+    positionReads.push({ label, user, all, reads: largest.map((c) => ({ what: c, to: pc(0x800), data: encodeAbiParameters([{ type: 'address' }, { type: 'uint16' }], [user, perpIndex.get(c)]) })) });
   }
 
   // 3. Static precompile answers, byte for byte.
@@ -172,13 +205,13 @@ async function run() {
   result.groups.push(group('Static precompile reads', 'the same eth_call on the fork and on mainnet returns the same bytes', statics.map((s, i) => ({ what: s.what, equal: sf[i] !== null && sf[i] === sm[i], bytes: sf[i] ? (sf[i].length - 2) / 2 : 0 }))));
 
   // 4. The position precompile on both sides for the mirrored accounts. A position mainnet traded
-  // around the mirror or since (its precompile size is not the info API's before and after) is left out.
-  for (const { label, before, after, reads } of positionReads) {
+  // while the mirror ran or since (its precompile size is not the one every info API read gave) is left out.
+  for (const { label, all, reads } of positionReads) {
     const [rm, rf] = [await calls(MAINNET, reads), await calls(RPC, reads)];
     const pos = (hex) => decodeAbiParameters([{ type: 'int64' }, { type: 'uint64' }, { type: 'int64' }, { type: 'uint32' }, { type: 'bool' }], hex);
-    const raw = (s, c) => parseUnits(s.get(c).szi, szDecimals.get(c));
-    const items = reads.map((r, i) => ({ r, x: pos(rf[i]), y: pos(rm[i]) })).filter(({ r, y }) => y[0] === raw(after, r.what) && y[0] === raw(before, r.what));
-    result.groups.push(group(`${label}: position precompile (0x800)`, 'size, leverage and margin mode equal on the fork and on mainnet, for the 20 largest positions, less those mainnet traded around the mirror or since', items.map(({ r, x, y }) => ({ what: r.what, fork: `${x[0]} ${x[3]}x ${x[4] ? 'isolated' : 'cross'}`, mainnet: `${y[0]} ${y[3]}x ${y[4] ? 'isolated' : 'cross'}`, equal: x[0] === y[0] && x[3] === y[3] && x[4] === y[4] }))));
+    const raw = (m, c) => parseUnits(Number(m.get(c).szi).toFixed(szDecimals.get(c)), szDecimals.get(c));
+    const items = reads.map((r, i) => ({ r, x: pos(rf[i]), y: pos(rm[i]) })).filter(({ r, y }) => all.every((m) => y[0] === raw(m, r.what)));
+    result.groups.push(group(`${label}: position precompile (0x800)`, 'size, leverage and margin mode equal on the fork and on mainnet, for the 20 largest positions, less those mainnet traded while the mirror ran or since', items.map(({ r, x, y }) => ({ what: r.what, fork: `${x[0]} ${x[3]}x ${x[4] ? 'isolated' : 'cross'}`, mainnet: `${y[0]} ${y[3]}x ${y[4] ? 'isolated' : 'cross'}`, equal: x[0] === y[0] && x[3] === y[3] && x[4] === y[4] }))));
   }
 
   // 5. Fills: IOC buys at three sizes against the average price the book gives.
