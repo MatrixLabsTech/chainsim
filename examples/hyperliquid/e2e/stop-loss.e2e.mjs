@@ -1,6 +1,7 @@
 // End-to-end test of StopLossVault on a chainsim fork of HyperEVM mainnet, with viem.
 // Real transactions go through the fork's RPC proxy, which applies every CoreWriter action to the
-// fork's HyperCore after each block. Orders fill against the mainnet order book taken at `up`.
+// fork's HyperCore after each block. Orders fill against the mainnet order book taken at `up`,
+// which moves with the prices the test sets.
 //   CHAINSIM_RPC   the fork's rpcUrl (default http://hyperevm-mainnet:8545)
 //   CHAINSIM_FORK  the fork's name (default hyperevm-mainnet)
 //   E2E_KEY        a test key with no mainnet history (chainsim fund refuses used addresses)
@@ -53,11 +54,13 @@ check(fills.length === 1 && fills[0].dir === 'Open Long', `/info userFills: ${fi
 
 // 4. Stop 2% under the mark. The keeper call does nothing while the mark is above it.
 const mark = await markPx();
-await send(vault, 'setStop', [(mark * 98n) / 100n]);
+const stop = (mark * 98n) / 100n;
+await send(vault, 'setStop', [stop]);
 const { result: holds } = await pub.simulateContract({ address: vault, abi, functionName: 'checkAndClose', account });
-check(holds === false, `keeper holds at mark ${mark}, stop ${(mark * 98n) / 100n}`);
+check(holds === false, `keeper holds at mark ${mark}, stop ${stop}`);
 
-// 5. Move BTC 3% down on the fork. The keeper call closes the long with a reduce-only IOC.
+// 5. Move BTC 3% down on the fork. The book moves with the price, and the keeper call closes the
+// long with a reduce-only IOC that fills under the stop.
 chainsim('set', FORK, 'hypercore', 'price', '0', String((mark * 97n) / 100n));
 const rc = await send(vault, 'checkAndClose');
 check(rc.logs.length > 0, `keeper closed at the stop (tx ${rc.transactionHash.slice(0, 10)})`);
@@ -66,7 +69,7 @@ check(closed, 'position reads 0 through the 0x800 precompile');
 const after = await info({ type: 'userFills', user: vault });
 const closes = after.filter((f) => f.dir === 'Close Long');
 const closedSz = closes.reduce((t, f) => t + Number(f.sz), 0);
-check(Math.abs(closedSz - 0.01) < 1e-9, `/info userFills: Close Long ${closedSz.toFixed(2)} BTC in ${closes.length} fill${closes.length === 1 ? '' : 's'}, first at ${closes[0]?.px}`);
+check(Math.abs(closedSz - 0.01) < 1e-9 && closes.every((f) => Number(f.px) < Number(stop) / 10), `/info userFills: Close Long ${closedSz.toFixed(2)} BTC in ${closes.length} fill${closes.length === 1 ? '' : 's'}, first at ${closes[0]?.px}, under the stop ${Number(stop) / 10}`);
 const actions = chainsim('call', FORK, 'corewriter_actions').filter((a) => a.user.toLowerCase() === vault.toLowerCase());
 check(actions.length === 3, `corewriter_actions: ${actions.map((a) => a.result.split(',')[0]).join(', ')}`);
 
