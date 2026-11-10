@@ -50,7 +50,9 @@ await until(async () => Number((await info({ type: 'clearinghouseState', user: v
 const ask = Number((await info({ type: 'l2Book', coin: 'BTC' })).levels[1][0].px);
 await send(vault, 'openLong', [BigInt(Math.round(ask * 1.01)) * 10n ** 8n, 1_000_000n]);
 check(await until(async () => (await szi(vault)) === 1000n), `opened 0.01 BTC long, best ask ${ask}`);
-const entry = Number((await info({ type: 'userFills', user: vault }))[0].px);
+// The open may take more than one book level: the entry is the average over its fills.
+const opens = (await info({ type: 'userFills', user: vault })).filter((f) => f.dir === 'Open Long');
+const entry = opens.reduce((t, f) => t + Number(f.px) * Number(f.sz), 0) / opens.reduce((t, f) => t + Number(f.sz), 0);
 const stop = BigInt(Math.round(entry * 0.97 * 10));
 await send(vault, 'setStop', [stop]);
 check(Math.abs(entry - Number(first.lastClose)) / Number(first.lastClose) < 0.005, `entry ${entry} within 0.5% of the 01:00 close, stop ${Number(stop) / 10}`);

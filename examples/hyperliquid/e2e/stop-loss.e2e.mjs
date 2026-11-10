@@ -51,7 +51,9 @@ await send(vault, 'openLong', [BigInt(Math.round(ask * 1.01)) * 10n ** 8n, 1_000
 const opened = await until(async () => (await szi(vault)) === 1000n);
 check(opened, `position 0.01 BTC read back through the 0x800 precompile (best ask ${ask})`);
 const fills = await info({ type: 'userFills', user: vault });
-check(fills.length === 1 && fills[0].dir === 'Open Long', `/info userFills: ${fills[0]?.dir} ${fills[0]?.sz} at ${fills[0]?.px}`);
+// The open may take more than one book level.
+const openedSz = fills.reduce((t, f) => t + Number(f.sz), 0);
+check(fills.length > 0 && fills.every((f) => f.dir === 'Open Long') && Math.abs(openedSz - 0.01) < 1e-9, `/info userFills: Open Long ${openedSz.toFixed(2)} in ${fills.length} fill${fills.length === 1 ? '' : 's'}, first at ${fills[0]?.px}`);
 
 // 4. Stop 2% under the mark. The keeper call does nothing while the mark is above it.
 const mark = await markPx();
@@ -76,7 +78,7 @@ check(actions.length === 3, `corewriter_actions: ${actions.map((a) => a.result.s
 
 if (process.env.E2E_RESULTS) {
   const all = existsSync(process.env.E2E_RESULTS) ? JSON.parse(readFileSync(process.env.E2E_RESULTS, 'utf8')) : {};
-  all.stopLoss = { markPx: Number(mark) / 10, movePct: -3, movedMarkPx: Number((mark * 97n) / 100n) / 10, stopPx: Number(stop) / 10, closePx: Number(closes[0]?.px) };
+  all.stopLoss = { markPx: Number(mark) / 10, movePct: -3, movedMarkPx: Number((mark * 97n) / 100n) / 10, stopPx: Number(stop) / 10, closePx: closes.reduce((t, f) => t + Number(f.px) * Number(f.sz), 0) / closedSz };
   writeFileSync(process.env.E2E_RESULTS, `${JSON.stringify(all, null, 1)}\n`);
 }
 console.log(failed ? `${failed} failed` : 'all passed');
