@@ -19,7 +19,9 @@ error codes from the binary.
   | --live)` stores a HyperCore read precompile's answer, `set hypercore price|spot-balance|position`
   sets prices and an account's Core state, `set hypercore book <coin> --live` refreshes a perp's
   order book, `set hypercore mirror <user>` copies a mainnet account onto the copy with its margin summary,
-  liquidation prices and cumulative funding, and `set
+  liquidation prices and cumulative funding and brings the perps it holds to mainnet's prices
+  (its `data` lists them in `marks`, the perps kept at a scripted price in `kept`, and `filled`
+  and `liquidated` as `set hypercore price` does), and `set
   hypercore funding <perp> <rate>` sets a perp's hourly funding rate. `set hypercore book` takes a
   builder-deployed perp as `dex:coin` (xyz:XYZ100), and `price` takes its perp index
   (dex * 10000 + index). CoreWriter orders on such perps use asset 100000 + perp index. `set hypercore price` also

@@ -42,7 +42,7 @@ Work through these steps in order. Each ends on a check you can make.
    directly, run `chainsim set <name> balance|token|owner|object|resource|storage|code ...`. On
    HyperEVM, `set <name> hypercore price|spot-balance|position ...` and `set <name> precompile`
    set what contracts read from HyperCore, `set <name> hypercore mirror <user>` copies a mainnet
-   account's Core state onto the copy, `call <name> hypercore_state <user>` reads an account's
+   account's Core state onto the copy at mainnet's prices, `call <name> hypercore_state <user>` reads an account's
    Core state, and `call <name> corewriter_actions` lists the CoreWriter actions contracts sent,
    decoded, with what each did. `set <name> hypercore price` moves a perp (fills and liquidations
    follow), `set <name> hypercore funding` sets a funding rate, and `time <name> --replay <perp>

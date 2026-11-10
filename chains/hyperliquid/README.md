@@ -23,7 +23,7 @@ builder-deployed perps, borrow and lend, and testnet.
 - Bridging both ways: HYPE and linked tokens sent to their system addresses credit Core spot,
   and a spot send back credits the EVM balance.
 - `set hypercore mirror`, which copies a mainnet account's positions, margin and balances onto the
-  copy, and `call hypercore_state`, which reads an account's Core state in the info API's shapes.
+  copy at mainnet's prices of that moment, and `call hypercore_state`, which reads an account's Core state in the info API's shapes.
 - Market scripting: `set hypercore price` moves the perp's order book with the price, fills the
   resting orders the move crosses, reprices positions and liquidates accounts below maintenance
   margin, `time --replay` plays a past stretch
@@ -272,8 +272,9 @@ own, as on mainnet.
 ### Mirror a mainnet account
 
 `set hypercore mirror <user>` copies an account's perp positions, margin and spot balances from
-the info API, and its HYPE and token balances on the EVM side. This mirrors one of HLP's strategy
-vaults:
+the info API, and its HYPE and token balances on the EVM side. It also brings every perp the
+account holds to mainnet's mark and oracle price of that moment, so the account reads back as it
+does on mainnet whenever it is mirrored. This mirrors one of HLP's strategy vaults:
 
 ```sh
 chainsim set hyperevm-mainnet hypercore mirror 0x010461c14e146ac35fe42271bdc1134ee31c703a
@@ -286,20 +287,32 @@ chainsim set hyperevm-mainnet hypercore mirror 0x010461c14e146ac35fe42271bdc1134
   "user": "0x010461C14e146ac35Fe42271BDC1134EE31C703a",
   "positions": 177,
   "spotBalances": 0,
-  "accountValue": "3043939.222041",
+  "accountValue": "3159296.872558",
   "evm": [
     { "asset": "HYPE", "amount": "0.00185249" },
     { "asset": "USDC", "amount": "0" }
   ],
   "skipped": [],
-  "infoCalls": 3,
+  "marks": ["BTC", "ETH", "ATOM", "SOL", "AVAX", "BNB"],
+  "kept": [],
+  "filled": 0,
+  "liquidated": [],
+  "infoCalls": 16,
   "upstreamCalls": 6,
   "note": "This result depends on a chainsim override that does not exist on mainnet (impersonation or a state change). chainsim status <name> lists every modification until down."
 }
 ```
 
-The `evm` list is shortened here. The vault's BTC position then reads back through `0x800` from
-a contract, and `send --as` the vault address acts as it.
+The `evm` and `marks` lists are shortened here. The vault's BTC position then reads back through
+`0x800` from a contract, and `send --as` the vault address acts as it.
+
+`marks` names the perps whose price the mirror moved. Each moves the way `set hypercore price`
+moves a price: the book moves with the mark, resting orders the move crosses fill (`filled`),
+and accounts already on the copy that fall under their maintenance margin are liquidated
+(`liquidated`). The mark is the one the account's own positions were valued at, and the oracle
+price comes from the info API's asset contexts. A perp whose price was scripted with
+`set hypercore price` or `time --replay` keeps that price: it is listed in `kept`, and the
+account is valued at it.
 
 The mirrored account reads back with mainnet's figures:
 
@@ -313,12 +326,15 @@ The mirrored account reads back with mainnet's figures:
   with the margin tier the position is in at that price, and `null` when no positive price
   liquidates it.
 
-In a run on 2026-11-10 the vault's 177 positions read back with total margin used 163,713.49
-USD against 163,713.51 and 163,705.34 on mainnet just before and after the mirror, maintenance
-margin 32,742.70 against 32,742.70 and 32,741.07, and withdrawable 2,806,938.39 against
-2,806,938.36 and 2,807,033.42. All 97 liquidation prices mainnet gave matched within one basis
-point, and one hour on the fork's clock added size times oracle price times the rate to each
-position's cumulative funding.
+In a run on 2026-11-10 the vault's 177 positions read back with total margin used 160,702.71
+USD against 160,695.19 and 160,717.11 on mainnet just before and after the mirror, maintenance
+margin 32,140.54 against 32,139.04 and 32,143.42, and withdrawable 2,837,891.46 against
+2,837,892.85 and 2,837,665.89. All 98 liquidation prices mainnet gave matched within one basis
+point. An account on standard margin with 105 positions, mirrored two minutes later, read back
+with account value 330,314.43 USD, total margin used 283,992.23, maintenance margin 87,130.76
+and withdrawable 46,322.19, each equal to the cent to mainnet's read just before the mirror, and
+all 60 of its liquidation prices matched. One hour on the fork's clock adds size times oracle
+price times the rate to each position's cumulative funding.
 
 ### Orders
 
@@ -439,8 +455,8 @@ profile limits say:
   rate. Longs pay shorts when the rate is positive, and shorts pay longs when it is negative.
   `up` takes each seeded perp's last settled rate from the info API's `fundingHistory`.
 - Fills pay the base-tier fees: 0.045% of the notional for the taker and 0.015% for the maker.
-- `withdrawable` is the account value less the larger of the margin used and 10% of the total
-  position value, Hyperliquid's transfer margin rule, less the margin open orders hold. It bounds
+- `withdrawable` is the account value less, for each position, the larger of its margin used and
+  10% of its value, Hyperliquid's transfer margin rule, less the margin open orders hold. It bounds
   USD class transfers, `sendAsset` and isolated margin added. A new order checks the account
   value less the margin in use.
 
