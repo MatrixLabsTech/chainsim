@@ -487,6 +487,14 @@ fn native_balance(name: &str, who: &str) -> u128 {
     u128::from_str_radix(out.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
 }
 
+/// The average price of a `filled <size> at <price>, ...` result, x8. A fill that takes more than
+/// the best level averages above it, so tests check it between the best ask and the limit.
+fn fill_px(result: &Value, size: &str) -> i128 {
+    let r = result.as_str().unwrap_or_default();
+    let px = r.strip_prefix(&format!("filled {size} at ")).and_then(|s| s.split(',').next()).unwrap_or_else(|| panic!("not a fill of {size}: {result}"));
+    fixed(px, 8)
+}
+
 /// The decimal string a fixed-point value of `d` decimals as an integer.
 fn fixed(s: &str, d: u32) -> i128 {
     chainsim_evm::core::parse_dec(s, d).unwrap()
@@ -547,7 +555,8 @@ fn hyperevm_local_hypercore() {
     let t = Instant::now();
     let ioc = send_action(name, &wallet, &limit_order(0, true, (best_ask * 101 / 100) as u64, 100_000, false, 3, 0));
     println!("IOC buy: {:.1} s, {}", t.elapsed().as_secs_f64(), ioc["result"]);
-    assert!(ioc["result"].as_str().unwrap().starts_with(&format!("filled 0.001 at {}, fee ", btc["bestAsk"].as_str().unwrap())), "{ioc}");
+    assert!(ioc["result"].as_str().unwrap().contains(", fee "), "{ioc}");
+    assert!((best_ask..=best_ask * 101 / 100).contains(&fill_px(&ioc["result"], "0.001")), "fill outside best ask {} and the limit: {ioc}", btc["bestAsk"]);
     assert_eq!(read_btc_szi(name, reader, &wallet), 100);
     let state = ok(&["call", name, "hypercore_state", &wallet]);
     assert_eq!(btc_position(&state).unwrap()["szi"], "0.001");
@@ -918,7 +927,7 @@ fn hyperevm_hip3_and_borrow_lend() {
     let a = cast_action(&network, &rpc, KEY_A, &limit_order(110_000, true, (ask * 101 / 100) as u64, 1_000_000, false, 3, 0));
     let actions = ok(&["call", name, "corewriter_actions"]);
     let filled = actions.as_array().unwrap().iter().find(|x| x["txHash"] == a["transactionHash"]).cloned().unwrap();
-    assert!(filled["result"].as_str().unwrap().starts_with(&format!("filled 0.01 at {}", xyz["book"]["bestAsk"].as_str().unwrap())), "{filled}");
+    assert!((ask..=ask * 101 / 100).contains(&fill_px(&filled["result"], "0.01")), "fill outside best ask {} and the limit: {filled}", xyz["book"]["bestAsk"]);
     // 0x800 (uint16 perp 10000) and 0x813 read it: szi 100 at szDecimals 4.
     assert_eq!(precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000800", &user_word(ADDR_A, 10_000), 0), 100);
     assert_eq!(precompile_word(&network, &rpc, "0x0000000000000000000000000000000000000813", &user_word(ADDR_A, 10_000), 0), 100);
