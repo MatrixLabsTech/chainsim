@@ -89,9 +89,27 @@ async function run() {
   const szDecimals = new Map(meta.universe.map((u) => [u.name, u.szDecimals]));
   const seeded = ['BTC', 'ETH', 'SOL', 'HYPE'].map((coin) => ({ coin, perp: perpIndex.get(coin) }));
 
-  // 1. Mirrors, first so the fork's prices are fresh: the info API before and after, the fork between.
+  // 1. Prices, before any mirror moves them. The fork holds the prices `up` took, so they lie
+  // between the info API's just before and just after `up`.
+  const perps = seeded.flatMap((s) => [{ what: `markPx ${s.coin} (0x806)`, to: pc(0x806), data: u32(s.perp), coin: s.coin, key: 'markPx' }, { what: `oraclePx ${s.coin} (0x807)`, to: pc(0x807), data: u32(s.perp), coin: s.coin, key: 'oraclePx' }]);
+  const forkPx = await calls(RPC, perps);
+  const ctxPx = (ctxs, p) => Number(ctxs[1][perpIndex.get(p.coin)][p.key]);
+  result.groups.push({
+    ...group('Price precompile reads', 'between the info API price read just before up and the one read just after, or within 1 bp of one of them', perps.map((p, i) => {
+      const x = Number(BigInt(forkPx[i])) / 10 ** (6 - szDecimals.get(p.coin));
+      const [lo, hi] = [ctxPx(ctxBefore, p), ctxPx(ctxAfter, p)].sort((m, n) => m - n);
+      const d = x >= lo && x <= hi ? 0 : Math.min(bps(x, lo), bps(x, hi));
+      return { what: p.what, fork: x, mainnetBeforeUp: ctxPx(ctxBefore, p), mainnetAfterUp: ctxPx(ctxAfter, p), equal: d <= 1, diffBps: round(d) };
+    })),
+    secondsOfUp: round((afterUpMs - Number(process.env.BEFORE_UP_MS ?? afterUpMs)) / 1000, 1),
+  });
+  // 2. Mirrors: the info API before and after, the fork between. A mirror brings the account's
+  // perps to mainnet's prices, so the second account is mirrored two minutes after `up`, when
+  // the prices `up` took are old.
   const positionReads = [];
   for (const [label, user] of [['HLP strategy vault', VAULT], ['Account on standard margin', TRADER]]) {
+    if (user === TRADER) await sleep(Math.max(0, afterUpMs + 125_000 - Date.now()));
+    if (user === TRADER) result.secondMirrorSecondsAfterUp = round((Date.now() - afterUpMs) / 1000, 1);
     const before = await mainInfo({ type: 'clearinghouseState', user });
     const t0 = Date.now();
     const mirrored = chainsim('set', FORK, 'hypercore', 'mirror', user);
@@ -118,12 +136,11 @@ async function run() {
     }));
     const unset = coins.filter((c) => b.get(c).liquidationPx === null && a.get(c).liquidationPx === null);
     const noLiquidation = group(`${label}: positions with no liquidation price`, 'null on the fork where the info API gives null', unset.map((c) => ({ what: c, equal: f.get(c).liquidationPx === null })));
-    // A total is equal when the fork is no further from mainnet than mainnet moved between its two
-    // reads, or than prices moved since `up` (decided below, once the prices are read).
+    // A total is equal when the fork is no further from mainnet than mainnet moved between its two reads.
     const total = (path, get) => {
       const [x, m, n] = [Number(get(fork)), Number(get(before)), Number(get(after))];
       const off = x >= Math.min(m, n) && x <= Math.max(m, n) ? 0 : Math.min(Math.abs(x - m), Math.abs(x - n));
-      return { what: path, fork: get(fork), mainnetBefore: get(before), mainnetAfter: get(after), equal: off <= 0.01, diffBps: round((off / Math.abs(m || 1)) * 1e4), movedBps: round((Math.abs(m - n) / Math.abs(m || 1)) * 1e4) };
+      return { what: path, fork: get(fork), mainnetBefore: get(before), mainnetAfter: get(after), equal: off <= Math.max(0.01, Math.abs(m - n)), diffBps: round((off / Math.abs(m || 1)) * 1e4), movedBps: round((Math.abs(m - n) / Math.abs(m || 1)) * 1e4) };
     };
     const totals = [
       total('marginSummary.accountValue', (s) => s.marginSummary.accountValue),
@@ -131,42 +148,17 @@ async function run() {
       total('marginSummary.totalRawUsd', (s) => s.marginSummary.totalRawUsd),
       total('marginSummary.totalMarginUsed', (s) => s.marginSummary.totalMarginUsed),
       total('crossMaintenanceMarginUsed', (s) => s.crossMaintenanceMarginUsed),
+      total('withdrawable', (s) => s.withdrawable),
     ];
-    // Withdrawable is compared on the vault, whose positions all sit at one leverage.
-    if (user === VAULT) totals.push(total('withdrawable', (s) => s.withdrawable));
     result.groups.push(
       { ...group(`${label}: positions mirrored`, 'every position the info API lists is on the fork', [{ what: 'count', fork: f.size, mainnet: a.size, equal: f.size === a.size || f.size === b.size }]), positions: mirrored.positions, windowMs, openOrders },
       either('szi'), either('entryPx'), either('leverage'), either('maxLeverage'), either('cumFunding', (p) => ['allTime', 'sinceOpen', 'sinceChange'].map((k) => Number(p.cumFunding[k]).toFixed(5)).join()),
       quiet('positionValue'), quiet('marginUsed'), entry, liquidation, noLiquidation,
-      group(`${label}: account summary`, 'no further from the info API than it moved between the reads before and after the mirror, or than prices moved since up', totals),
+      group(`${label}: account summary`, 'no further from the info API than it moved between the reads before and after the mirror', totals),
     );
     // The position precompile on both sides, for the 20 largest positions (read further down).
     const largest = coins.filter((c) => perpIndex.has(c)).sort((x, y) => Number(a.get(y).positionValue) - Number(a.get(x).positionValue)).slice(0, 20);
-    positionReads.push({ label, user, after: a, reads: largest.map((c) => ({ what: c, to: pc(0x800), data: encodeAbiParameters([{ type: 'address' }, { type: 'uint16' }], [user, perpIndex.get(c)]) })) });
-  }
-
-  // 2. Prices. The fork holds the prices `up` took, so they lie between the info API's just
-  // before and just after `up`.
-  const perps = seeded.flatMap((s) => [{ what: `markPx ${s.coin} (0x806)`, to: pc(0x806), data: u32(s.perp), coin: s.coin, key: 'markPx' }, { what: `oraclePx ${s.coin} (0x807)`, to: pc(0x807), data: u32(s.perp), coin: s.coin, key: 'oraclePx' }]);
-  const forkPx = await calls(RPC, perps);
-  const ctxPx = (ctxs, p) => Number(ctxs[1][perpIndex.get(p.coin)][p.key]);
-  result.groups.push({
-    ...group('Price precompile reads', 'between the info API price read just before up and the one read just after, or within 1 bp of one of them', perps.map((p, i) => {
-      const x = Number(BigInt(forkPx[i])) / 10 ** (6 - szDecimals.get(p.coin));
-      const [lo, hi] = [ctxPx(ctxBefore, p), ctxPx(ctxAfter, p)].sort((m, n) => m - n);
-      const d = x >= lo && x <= hi ? 0 : Math.min(bps(x, lo), bps(x, hi));
-      return { what: p.what, fork: x, mainnetBeforeUp: ctxPx(ctxBefore, p), mainnetAfterUp: ctxPx(ctxAfter, p), equal: d <= 1, diffBps: round(d) };
-    })),
-    secondsOfUp: round((afterUpMs - Number(process.env.BEFORE_UP_MS ?? afterUpMs)) / 1000, 1),
-  });
-  // The same precompiles on mainnet, read later: how far prices have moved since `up`.
-  const later = [...perps, { what: 'spotPx HYPE/USDC (0x808)', to: pc(0x808), data: u32(107) }];
-  const [laterMain, laterFork] = [await calls(MAINNET, later), await calls(RPC, later)];
-  const drift = round(Math.max(...later.map((_, i) => bps(BigInt(laterFork[i]), BigInt(laterMain[i])))));
-  result.priceDrift = { largestBps: drift, secondsAfterUp: round((Date.now() - afterUpMs) / 1000, 1) };
-  for (const g of result.groups.filter((x) => x.name.endsWith('account summary'))) {
-    for (const i of g.items) i.equal = i.equal || i.diffBps <= Math.max(i.movedBps, drift);
-    g.equal = g.items.filter((i) => i.equal).length;
+    positionReads.push({ label, user, before: b, after: a, reads: largest.map((c) => ({ what: c, to: pc(0x800), data: encodeAbiParameters([{ type: 'address' }, { type: 'uint16' }], [user, perpIndex.get(c)]) })) });
   }
 
   // 3. Static precompile answers, byte for byte.
@@ -179,13 +171,14 @@ async function run() {
   const [sf, sm] = [await calls(RPC, statics), await calls(MAINNET, statics)];
   result.groups.push(group('Static precompile reads', 'the same eth_call on the fork and on mainnet returns the same bytes', statics.map((s, i) => ({ what: s.what, equal: sf[i] !== null && sf[i] === sm[i], bytes: sf[i] ? (sf[i].length - 2) / 2 : 0 }))));
 
-  // 4. The position precompile on both sides for the mirrored accounts. A position mainnet has
-  // traded since the mirror (its precompile size no longer the info API's) is left out.
-  for (const { label, after, reads } of positionReads) {
+  // 4. The position precompile on both sides for the mirrored accounts. A position mainnet traded
+  // around the mirror or since (its precompile size is not the info API's before and after) is left out.
+  for (const { label, before, after, reads } of positionReads) {
     const [rm, rf] = [await calls(MAINNET, reads), await calls(RPC, reads)];
     const pos = (hex) => decodeAbiParameters([{ type: 'int64' }, { type: 'uint64' }, { type: 'int64' }, { type: 'uint32' }, { type: 'bool' }], hex);
-    const items = reads.map((r, i) => ({ r, x: pos(rf[i]), y: pos(rm[i]) })).filter(({ r, y }) => y[0] === parseUnits(after.get(r.what).szi, szDecimals.get(r.what)));
-    result.groups.push(group(`${label}: position precompile (0x800)`, 'size, leverage and margin mode equal on the fork and on mainnet, for the 20 largest positions, less those mainnet traded since the mirror', items.map(({ r, x, y }) => ({ what: r.what, equal: x[0] === y[0] && x[3] === y[3] && x[4] === y[4] }))));
+    const raw = (s, c) => parseUnits(s.get(c).szi, szDecimals.get(c));
+    const items = reads.map((r, i) => ({ r, x: pos(rf[i]), y: pos(rm[i]) })).filter(({ r, y }) => y[0] === raw(after, r.what) && y[0] === raw(before, r.what));
+    result.groups.push(group(`${label}: position precompile (0x800)`, 'size, leverage and margin mode equal on the fork and on mainnet, for the 20 largest positions, less those mainnet traded around the mirror or since', items.map(({ r, x, y }) => ({ what: r.what, fork: `${x[0]} ${x[3]}x ${x[4] ? 'isolated' : 'cross'}`, mainnet: `${y[0]} ${y[3]}x ${y[4] ? 'isolated' : 'cross'}`, equal: x[0] === y[0] && x[3] === y[3] && x[4] === y[4] }))));
   }
 
   // 5. Fills: IOC buys at three sizes against the average price the book gives.
@@ -256,9 +249,8 @@ function render() {
     '| --- | --- | --- | --- |',
     ...r.groups.map((g) => `| ${g.name} | ${g.equal} of ${g.total} | ${g.largestDiffBps === null ? 'n/a' : `${g.largestDiffBps} bp`} | ${g.rule} |`),
     '',
-    `\`up\` took ${r.groups.find((g) => g.secondsOfUp !== undefined).secondsOfUp} s between the two info API price reads. Read again through the same precompiles on mainnet ${r.priceDrift.secondsAfterUp} s after \`up\`, prices had moved by ${r.priceDrift.largestBps} bp at most, which also bounds the account summaries.`,
+    `\`up\` took ${r.groups.find((g) => g.secondsOfUp !== undefined).secondsOfUp} s between the two info API price reads. The second account was mirrored ${r.secondMirrorSecondsAfterUp} s after \`up\`.`,
     '',
-    ...(r.groups.some((g) => / position (positionValue|marginUsed)$/.test(g.name) && g.equal !== g.total) ? ['The fork values a position at the mark it took at `up` or at an earlier mirror, so its value and margin differ from mainnet\'s where that mark has since moved.', ''] : []),
   ];
   writeFileSync(new URL('README.md', OUT), lines.join('\n'));
 }
