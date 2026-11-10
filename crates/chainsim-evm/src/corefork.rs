@@ -580,7 +580,7 @@ impl EvmAdapter {
             tokens.push((t, parse_qty(&out)?));
         }
 
-        let (state, skipped) = mirror_apply(eng, eng, &f).await?;
+        let Mirrored { state, skipped, moved, kept, fills, liquidated } = mirror_apply(eng, eng, &f).await?;
         let lease = self.core_lock(eng).await?;
         let r = async {
             eng.set_balance(&addr, native).await?;
@@ -610,6 +610,7 @@ impl EvmAdapter {
                 "accountValue": info["clearinghouseState"]["marginSummary"]["accountValue"], "dexes": dexes,
                 "borrowLend": info["borrowLendUserState"]["tokenToState"].as_array().map_or(0, Vec::len), "abstraction": f.abstraction,
                 "evm": evm, "skipped": skipped,
+                "marks": moved, "kept": kept, "filled": fills, "liquidated": liquidated.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
                 "infoCalls": calls, "upstreamCalls": rpc,
             }),
             json!({ "kind": "set-hypercore", "helper": "mirror", "user": addr, "positions": positions }),
@@ -623,7 +624,8 @@ impl EvmAdapter {
         let user = who.to_string().to_lowercase();
         let ch = eng.info(json!({ "type": "clearinghouseState", "user": user }), calls).await?;
         let sch = eng.info(json!({ "type": "spotClearinghouseState", "user": user }), calls).await?;
-        let meta = match untracked_coins(&state, &ch).is_empty() {
+        // Mainnet's marks and oracle prices of this moment, and the meta of perps the copy does not track.
+        let meta = match position_coins(&ch).is_empty() {
             true => None,
             false => Some(eng.info(json!({ "type": "metaAndAssetCtxs" }), calls).await?),
         };
@@ -765,7 +767,8 @@ pub(crate) struct MirrorFetch {
     who: Address,
     ch: Value,
     sch: Value,
-    /// metaAndAssetCtxs, when the user had positions in perps the copy did not track.
+    /// metaAndAssetCtxs, when the user has positions on the main dex: their prices, and the
+    /// meta of perps the copy does not track.
     meta: Option<Value>,
     /// spotMeta, when the user held tokens the copy did not know.
     spot: Option<Value>,
@@ -799,11 +802,23 @@ fn unknown_tokens(state: &State, sch: &Value) -> Vec<u64> {
     sch["balances"].as_array().map_or(vec![], |b| b.iter().filter_map(|x| x["token"].as_u64()).filter(|t| !state.tokens.contains_key(t)).collect())
 }
 
+/// What a mirror did: the state after its last step, what it skipped, the
+/// perps it brought to mainnet's prices and the ones it kept at a scripted
+/// price (by name), and the fills and liquidations those moves caused.
+#[derive(Debug)]
+pub(crate) struct Mirrored {
+    pub state: State,
+    pub skipped: Vec<String>,
+    pub moved: Vec<String>,
+    pub kept: Vec<String>,
+    pub fills: usize,
+    pub liquidated: Vec<Address>,
+}
+
 /// Applies a fetched mirror in two steps, each under a lock of its own and
 /// each from the state on the fork, so blocks other clients land between
-/// them are applied once by the next catch-up. Returns the state after the
-/// last step and what was skipped.
-pub(crate) async fn mirror_apply(rpc: &dyn CoreRpc, lease: &dyn CoreLease, f: &MirrorFetch) -> Result<(State, Vec<String>)> {
+/// them are applied once by the next catch-up.
+pub(crate) async fn mirror_apply(rpc: &dyn CoreRpc, lease: &dyn CoreLease, f: &MirrorFetch) -> Result<Mirrored> {
     let token = lease.lock().await?;
     let t = Instant::now();
     let r = mirror_track_locked(rpc, f).await;
@@ -864,18 +879,58 @@ async fn mirror_track_locked(rpc: &dyn CoreRpc, f: &MirrorFetch) -> Result<()> {
     coresync::store(rpc, &state, &entries).await
 }
 
-/// The account: perps on every dex, spot balances, borrow and lend, and its answers.
-async fn mirror_account_locked(rpc: &dyn CoreRpc, f: &MirrorFetch) -> Result<(State, Vec<String>)> {
+/// Mainnet's mark and oracle (x8) of each tracked perp the account holds on
+/// one dex. The mark is the one the account's own read was valued at, and
+/// the asset contexts give the oracle, and the mark where the read does not.
+fn mirror_prices_of(state: &State, dex: u32, ch: &Value, meta: Option<&Value>) -> Vec<(u32, u64, u64)> {
+    let ctx_of = |name: &str| {
+        let m = meta?;
+        let i = m[0]["universe"].as_array()?.iter().position(|u| u["name"] == json!(name))?;
+        m[1].get(i)
+    };
+    let mut out = Vec::new();
+    for (asset, snapshot) in state.snapshot_marks(dex, ch) {
+        let Some(p) = state.perps.get(&asset) else { continue };
+        let px = |k: &str| ctx_of(&p.name).and_then(|c| c[k].as_str()).and_then(|s| hc::parse_dec(s, 8)).map(|v| v as u64).filter(|v| *v > 0);
+        let Some(mark) = snapshot.or_else(|| px("markPx")) else { continue };
+        let oracle = px("oraclePx").unwrap_or(if p.oracle_x8 > 0 { p.oracle_x8 } else { mark });
+        out.push((asset, mark, oracle));
+    }
+    out
+}
+
+/// The account: its perps brought to mainnet's prices (with the fills and
+/// liquidations a price move causes on the accounts already there), then
+/// its positions on every dex, spot balances, borrow and lend, and the answers.
+async fn mirror_account_locked(rpc: &dyn CoreRpc, f: &MirrorFetch) -> Result<Mirrored> {
     let mut state = coresync::sync_locked(rpc).await?.ok_or_else(no_state)?;
+    let mut prices = mirror_prices_of(&state, 0, &f.ch, f.meta.as_ref());
+    for d in &f.dexes {
+        prices.extend(mirror_prices_of(&state, d.index, &d.ch, Some(&d.meta)));
+    }
+    let time = coresync::block_time(&rpc.call("eth_getBlockByNumber", json!(["latest", false])).await?)?;
+    let (applied, moved, kept) = state.mirror_prices(f.who, &prices, time);
     let mut skipped = state.mirror_perps(f.who, &f.ch);
     skipped.extend(state.mirror_spot(f.who, &f.sch));
     for d in &f.dexes {
         skipped.extend(state.mirror_dex(f.who, d.index, &d.ch));
     }
     skipped.extend(state.mirror_lend(f.who, &f.lend, &f.abstraction).into_iter().map(|t| format!("borrow and lend token {t}")));
-    let answers = state.answers(&BTreeSet::from([f.who]));
+    let mut answers = state.answers_for(&applied);
+    answers.extend(state.answers(&BTreeSet::from([f.who])));
+    for asset in &moved {
+        let p = &state.perps[asset];
+        if let (Some(m), Some(o)) = (state.px_to_raw(*asset, p.mark_x8), state.px_to_raw(*asset, p.oracle_x8)) {
+            let calldata = hypercore::word_u(*asset as u128).to_vec();
+            answers.push(Entry { precompile: hypercore::MARK_PX, calldata: calldata.clone(), result: hypercore::word_u(m as u128).to_vec() });
+            answers.push(Entry { precompile: hypercore::ORACLE_PX, calldata, result: hypercore::word_u(o as u128).to_vec() });
+        }
+    }
     coresync::store(rpc, &state, &answers).await?;
-    Ok((state, skipped))
+    coresync::settle_credits(rpc, &mut state).await?;
+    let name = |a: &u32| state.perps[a].name.clone();
+    let (moved, kept) = (moved.iter().map(name).collect(), kept.iter().map(name).collect());
+    Ok(Mirrored { state, skipped, moved, kept, fills: applied.fills, liquidated: applied.liquidated })
 }
 
 /// Inserts the perp at `local` in a metaAndAssetCtxs answer as perp index
@@ -918,6 +973,7 @@ fn perp_from_ctx(u: &Value, ctx: &Value, tables: &Value) -> hc::Perp {
         collateral: 0,
         tiers: hc::tiers_from_meta(u, tables),
         hip3_funding: None,
+        scripted: false,
     }
 }
 
@@ -1031,7 +1087,7 @@ mod tests {
             let chain = chain_with_core(proxy_applies).await;
             // Alice sends Bob 7 USDC between the mirror's two steps.
             *chain.pending.lock().unwrap() = Some(raw_action(ALICE, &encode_action(6, &[word_addr(BOB), word_u(0), word_u(7 * 100_000_000)].concat())));
-            let (returned, skipped) = mirror_apply(&chain, &chain, &fetched()).await.unwrap();
+            let Mirrored { state: returned, skipped, .. } = mirror_apply(&chain, &chain, &fetched()).await.unwrap();
             assert!(skipped.is_empty(), "{skipped:?}");
             assert_eq!(*chain.trace.lock().unwrap(), ["lock", "unlock", "lock", "unlock"], "proxy_applies {proxy_applies}");
             let s = coresync::load_state(&chain).await.unwrap().unwrap();

@@ -122,6 +122,10 @@ pub struct Perp {
     /// HIP-3 funding settings from perpDexs, when the perp's dex sets them.
     #[serde(rename = "hf", default, skip_serializing_if = "Option::is_none")]
     pub hip3_funding: Option<Hip3Funding>,
+    /// A price was scripted on this fork (`set hypercore price` or a replay
+    /// candle), so a mirror leaves the perp's price alone.
+    #[serde(rename = "sc", default, skip_serializing_if = "is_false")]
+    pub scripted: bool,
 }
 
 /// A HIP-3 perp's funding settings, 12 decimals: the deployer's multiplier,
@@ -894,8 +898,9 @@ pub struct Margin {
     pub margin_used: u64,
     pub ntl_pos: u64,
     pub raw_usd: i64,
-    /// What a transfer out may take: account value less the larger of the
-    /// margin used and 10% of the notional, less the margin of open orders.
+    /// What a transfer out may take: account value less, for each position,
+    /// the larger of its margin used and 10% of its value, less the margin of
+    /// open orders.
     pub withdrawable: u64,
     /// What a new order may use: account value less margin used and order margin.
     pub free: u64,
@@ -1011,12 +1016,15 @@ impl State {
     pub fn margin_dex(&self, user: Address, dex: u32) -> Margin {
         let Some(acct) = self.accounts.get(&user) else { return Margin::default() };
         let mut m = Margin::default();
-        let (mut upnl, mut signed_entry) = (0i128, 0i128);
+        let (mut upnl, mut signed_entry, mut transfer_margin) = (0i128, 0i128, 0u64);
         for (perp, p) in acct.positions.iter().filter(|(a, p)| dex_of(**a) == dex && !p.isolated && p.szi_x8 != 0) {
             let value = notional(p.szi_x8.unsigned_abs(), self.mark_of(*perp, p));
             let sign: i128 = if p.szi_x8 > 0 { 1 } else { -1 };
+            let used = value / p.leverage.clamp(1, self.max_leverage_of(*perp, p, value)) as u64;
             m.ntl_pos += value;
-            m.margin_used += value / p.leverage.clamp(1, self.max_leverage_of(*perp, p, value)) as u64;
+            m.margin_used += used;
+            // A transfer out must leave each position max(its initial margin, 10% of its value).
+            transfer_margin += used.max(value / 10);
             upnl += sign * (value as i128 - p.entry_ntl as i128);
             signed_entry += sign * p.entry_ntl as i128;
         }
@@ -1025,8 +1033,7 @@ impl State {
         m.account_value = (usd as i128 + upnl) as i64;
         m.raw_usd = (usd as i128 - signed_entry) as i64;
         m.free = (m.account_value as i128 - m.margin_used as i128 - order_margin as i128).max(0) as u64;
-        // transfer_margin_required = max(initial_margin_required, 0.1 x total_position_value).
-        m.withdrawable = (m.account_value as i128 - m.margin_used.max(m.ntl_pos / 10) as i128 - order_margin as i128).max(0) as u64;
+        m.withdrawable = (m.account_value as i128 - transfer_margin as i128 - order_margin as i128).max(0) as u64;
         m
     }
 
@@ -1401,17 +1408,60 @@ impl State {
     /// stored prices stay exact and leave the model on the tick), then
     /// the resting orders the price or the moved book crosses fill (as
     /// makers, at their own price), positions reprice at the new mark and
-    /// accounts below maintenance margin are liquidated.
+    /// accounts below maintenance margin are liquidated. The perp counts as
+    /// scripted from here on, so a mirror keeps this price.
     pub fn set_price(&mut self, asset: u32, px: u64, time: u64) -> Applied {
         self.now = time;
         let mut applied = Applied::default();
         if let Some(p) = self.perps.get_mut(&asset) {
-            if let Some(book) = self.books.get_mut(&asset) {
-                book.scale(px, p.mark_x8);
-            }
-            p.mark_x8 = px;
-            p.oracle_x8 = px;
+            p.scripted = true;
         }
+        self.reprice(asset, px, px, &mut applied);
+        self.liquidate(&mut applied, None);
+        applied.reserves = self.take_reserves_dirty();
+        applied
+    }
+
+    /// Brings perps to mainnet's prices for a mirror of `who`, at block time
+    /// `time`: each (perp, mark, oracle) moves as a price move does, with its
+    /// book and the fills of the resting orders it crosses, and one
+    /// liquidation pass follows over the accounts already there. `who` is
+    /// left out of that pass: the mirror replaces its positions next. A perp
+    /// with a scripted price keeps it. Returns what was applied, the perps
+    /// moved and the perps kept.
+    pub fn mirror_prices(&mut self, who: Address, prices: &[(u32, u64, u64)], time: u64) -> (Applied, Vec<u32>, Vec<u32>) {
+        self.now = time;
+        let mut applied = Applied::default();
+        let (mut moved, mut kept) = (Vec::new(), Vec::new());
+        for (asset, mark, oracle) in prices {
+            match self.perps.get(asset) {
+                Some(p) if p.scripted => kept.push(*asset),
+                Some(p) if p.mark_x8 != *mark || p.oracle_x8 != *oracle => {
+                    self.reprice(*asset, *mark, *oracle, &mut applied);
+                    moved.push(*asset);
+                }
+                _ => {}
+            }
+        }
+        if !moved.is_empty() {
+            self.liquidate(&mut applied, Some(who));
+            applied.reserves = self.take_reserves_dirty();
+        }
+        (applied, moved, kept)
+    }
+
+    /// One perp's price move without the liquidation pass: mark and oracle,
+    /// the book scaled by new mark over old mark, and the resting orders the
+    /// mark or the moved book crosses filled at their own price.
+    fn reprice(&mut self, asset: u32, mark: u64, oracle: u64, applied: &mut Applied) {
+        if let Some(p) = self.perps.get_mut(&asset) {
+            if let Some(book) = self.books.get_mut(&asset) {
+                book.scale(mark, p.mark_x8);
+            }
+            p.mark_x8 = mark;
+            p.oracle_x8 = oracle;
+        }
+        let px = mark;
         let (bid, ask) = self.books.get(&asset).map_or((None, None), |b| (b.bids.first().map(|l| self.level_px(asset, l.0, false)), b.asks.first().map(|l| self.level_px(asset, l.0, true))));
         let crossed: Vec<Order> = self
             .orders
@@ -1428,11 +1478,8 @@ impl State {
             applied.users.insert(o.user);
             applied.fills += 1;
         }
-        self.liquidate(&mut applied);
         // Everyone holding this perp sees new margin figures.
         applied.margin_users.extend(self.accounts.iter().filter(|(_, a)| a.positions.get(&asset).is_some_and(|p| p.szi_x8 != 0)).map(|(u, _)| *u));
-        applied.reserves = self.take_reserves_dirty();
-        applied
     }
 
     /// Replaces a perp's book (a refresh from the info API) at block time
@@ -1460,7 +1507,7 @@ impl State {
             applied.fills += 1;
         }
         if applied.fills > 0 {
-            self.liquidate(&mut applied);
+            self.liquidate(&mut applied, None);
         }
         applied
     }
@@ -1543,8 +1590,8 @@ impl State {
     /// margin: all positions close at the mark price, its open orders are
     /// canceled, and the remaining collateral stays with the account. A
     /// negative balance is reset to zero, the loss the backstop liquidator takes.
-    fn liquidate(&mut self, applied: &mut Applied) {
-        let users: Vec<Address> = self.accounts.iter().filter(|(_, a)| a.positions.values().any(|p| p.szi_x8 != 0)).map(|(u, _)| *u).collect();
+    fn liquidate(&mut self, applied: &mut Applied, skip: Option<Address>) {
+        let users: Vec<Address> = self.accounts.iter().filter(|(u, a)| Some(**u) != skip && a.positions.values().any(|p| p.szi_x8 != 0)).map(|(u, _)| *u).collect();
         for user in users {
             // Isolated positions, each against its own margin.
             let isolated: Vec<(u32, Pos)> = self.accounts[&user].positions.iter().filter(|(_, p)| p.szi_x8 != 0 && p.isolated).map(|(a, p)| (*a, *p)).collect();
@@ -1719,7 +1766,7 @@ impl State {
         // here, price moves in `set_price`.
         if self.fund_until(time, &mut applied) {
             self.now = time;
-            self.liquidate(&mut applied);
+            self.liquidate(&mut applied, None);
         }
         applied.reserves = self.take_reserves_dirty();
         applied
@@ -2112,6 +2159,24 @@ impl State {
             v["liquidation"] = json!({ "method": "market", "markPx": fmt_dec(f.px_x8 as i128, 8) });
         }
         v
+    }
+
+    /// The mark of each tracked perp a `clearinghouseState` of one dex holds
+    /// a position in, x8: the position value over its size, the mark that
+    /// read was valued at. None for a perp where that quotient does not give
+    /// the value back, so the caller takes the mark from the asset contexts.
+    pub fn snapshot_marks(&self, dex: u32, ch: &Value) -> Vec<(u32, Option<u64>)> {
+        let by_name: BTreeMap<&str, u32> = self.perps.iter().filter(|(a, _)| dex_of(**a) == dex).map(|(a, p)| (p.name.as_str(), *a)).collect();
+        let mut out = Vec::new();
+        for ap in ch["assetPositions"].as_array().map_or(&[][..], Vec::as_slice) {
+            let p = &ap["position"];
+            let Some(asset) = p["coin"].as_str().and_then(|c| by_name.get(c)).copied() else { continue };
+            let size = p["szi"].as_str().and_then(|s| parse_dec(s, 8)).map_or(0, |s| s.unsigned_abs());
+            let value = p["positionValue"].as_str().and_then(|s| parse_dec(s, 6)).map_or(0, |v| v.unsigned_abs());
+            let mark = (size > 0 && value > 0).then(|| (value * X16_TO_X6 / size) as u64).filter(|m| *m > 0 && notional(size as u64, *m) as u128 == value);
+            out.push((asset, mark));
+        }
+        out
     }
 
     /// Sets a user's perp state from the info API's `clearinghouseState`.
@@ -2626,6 +2691,90 @@ mod tests {
         let alt = &s.clearinghouse(BOB, 0, 0)["assetPositions"][1]["position"];
         // Entry notional 2100.049 from value and PnL. The cut-off entry price alone would give 100.04.
         assert_eq!((&alt["unrealizedPnl"], &alt["entryPx"], &alt["positionValue"]), (&json!("100.049"), &json!("2.10004"), &json!("2000.0")));
+    }
+
+    /// Bob on mainnet a moment later: ALT marked 2.1 and BTC 110, where the fork still has 2 and 100.
+    fn later_read() -> Value {
+        json!({
+            "assetPositions": [
+                { "position": { "coin": "ALT", "szi": "-1000.0", "entryPx": "2.10004", "positionValue": "2100.0", "unrealizedPnl": "0.049", "marginUsed": "105.0", "maxLeverage": 50,
+                    "leverage": { "type": "cross", "value": 20 }, "cumFunding": { "allTime": "0.0", "sinceOpen": "0.0", "sinceChange": "0.0" } } },
+                { "position": { "coin": "BTC", "szi": "1.0", "entryPx": "101.0", "positionValue": "110.0", "unrealizedPnl": "9.0", "marginUsed": "5.5", "maxLeverage": 40,
+                    "leverage": { "type": "cross", "value": 20 }, "cumFunding": { "allTime": "0.0", "sinceOpen": "0.0", "sinceChange": "0.0" } } },
+            ],
+            "marginSummary": { "accountValue": "10000.0" },
+        })
+    }
+
+    #[test]
+    fn a_mirror_after_marks_moved_reads_back_the_mirrored_values() {
+        let mut s = state();
+        s.perps.insert(1, Perp { name: "ALT".into(), sz_decimals: 1, max_leverage: 3, mark_x8: x8(2.0), ..Default::default() });
+        let ch = later_read();
+        // The read's own marks: position value over size.
+        assert_eq!(s.snapshot_marks(0, &ch), [(1, Some(x8(2.1))), (0, Some(x8(110.0)))]);
+        let (a, moved, kept) = s.mirror_prices(BOB, &[(1, x8(2.1), x8(2.11)), (0, x8(110.0), x8(109.5))], 500);
+        assert_eq!((moved, kept, a.fills, a.liquidated.len()), (vec![1, 0], vec![], 0, 0));
+        assert!(s.mirror_perps(BOB, &ch).is_empty());
+        // Mark and oracle are mainnet's, each its own, and the book moved with the mark: 101 x 110 / 100.
+        assert_eq!((s.perps[&1].mark_x8, s.perps[&1].oracle_x8, s.perps[&0].mark_x8, s.perps[&0].oracle_x8), (x8(2.1), x8(2.11), x8(110.0), x8(109.5)));
+        assert_eq!(s.books[&0].asks[0].0, x8(111.1));
+        assert!(!s.perps[&0].scripted && !s.perps[&1].scripted);
+        let out = s.clearinghouse(BOB, 0, 0);
+        let (btc, alt) = (&out["assetPositions"][0]["position"], &out["assetPositions"][1]["position"]);
+        assert_eq!((&alt["positionValue"], &alt["marginUsed"], &alt["unrealizedPnl"]), (&json!("2100.0"), &json!("105.0"), &json!("0.049")));
+        assert_eq!((&btc["positionValue"], &btc["marginUsed"], &btc["unrealizedPnl"]), (&json!("110.0"), &json!("5.5"), &json!("9.0")));
+        assert_eq!((&out["marginSummary"]["accountValue"], &out["marginSummary"]["totalNtlPos"], &out["marginSummary"]["totalMarginUsed"]), (&json!("10000.0"), &json!("2210.0"), &json!("110.5")));
+        // Short ALT: maintenance 2100 / 100 + 110 / 80 = 22.375, so 2.1 + (10000 - 22.375) / 1000 / (1 + 1 / 100) = 11.97883663.
+        assert_eq!((&alt["liquidationPx"], &btc["liquidationPx"]), (&json!("11.97883663"), &Value::Null));
+    }
+
+    #[test]
+    fn a_mirror_keeps_a_scripted_price() {
+        let mut s = state();
+        s.set_price(0, x8(90.0), 100);
+        let ch = later_read();
+        let (a, moved, kept) = s.mirror_prices(BOB, &[(0, x8(110.0), x8(109.5))], 500);
+        assert_eq!((moved, kept, a.fills), (vec![], vec![0], 0));
+        s.mirror_perps(BOB, &ch);
+        // Mark, oracle and book stay as scripted (101 x 90 / 100), and the account is valued at them.
+        assert_eq!((s.perps[&0].mark_x8, s.perps[&0].oracle_x8, s.books[&0].asks[0].0), (x8(90.0), x8(90.0), x8(90.9)));
+        assert_eq!(s.clearinghouse(BOB, 0, 0)["assetPositions"][0]["position"]["positionValue"], "90.0");
+    }
+
+    #[test]
+    fn a_mirror_s_price_move_fills_a_crossed_resting_order_of_another_account() {
+        let mut s = state();
+        run(&mut s, 11, ALICE, limit_order(0, true, x8(95.0), x8(1.0), false, 2, 0));
+        let (a, moved, kept) = s.mirror_prices(BOB, &[(0, x8(94.0), x8(94.0))], 200);
+        assert_eq!((moved, kept, a.fills, a.liquidated.len()), (vec![0], vec![], 1, 0));
+        assert!(a.users.contains(&ALICE));
+        let p = s.accounts[&ALICE].positions[&0];
+        assert_eq!((p.szi_x8, p.entry_ntl), (x8(1.0) as i64, 95_000_000));
+        assert!(s.orders.is_empty());
+        // The same prices again move nothing.
+        assert_eq!(s.mirror_prices(BOB, &[(0, x8(94.0), x8(94.0))], 300).1, Vec::<u32>::new());
+    }
+
+    #[test]
+    fn withdrawable_keeps_ten_percent_or_the_margin_of_each_position() {
+        let mut s = state();
+        s.perps.insert(1, Perp { name: "ALT".into(), sz_decimals: 1, max_leverage: 3, mark_x8: x8(2.0), ..Default::default() });
+        s.account(BOB).usd = usd(10_000.0);
+        // 10 BTC at 100 on 20x: margin 50, under 10% of 1000. 1000 ALT at 2 on 3x: margin 666.666666, over 10% of 2000.
+        s.account(BOB).positions.insert(0, Pos { szi_x8: x8(10.0) as i64, entry_ntl: 1_000_000_000, leverage: 20, ..Default::default() });
+        s.account(BOB).positions.insert(1, Pos { szi_x8: x8(1000.0) as i64, entry_ntl: 2_000_000_000, leverage: 3, ..Default::default() });
+        let m = s.margin(BOB);
+        assert_eq!((m.account_value, m.margin_used, m.ntl_pos), (usd(10_000.0), 716_666_666, 3_000_000_000));
+        // 10000 - 100 - 666.666666. The floor on the totals would leave 9283.333334.
+        assert_eq!(m.withdrawable, 9_233_333_334);
+        // New orders still take account value less margin in use.
+        assert_eq!(m.free, 9_283_333_334);
+        // An account opened on the fork: long 2 BTC from the book at 101 and 102 on the default 20x.
+        run(&mut s, 11, ALICE, limit_order(0, true, x8(102.0), x8(2.0), false, 3, 0));
+        let m = s.margin(ALICE);
+        // Value 200 at the mark, entry 203, fee 0.09135: account value 9996.90865, less 10% of 200.
+        assert_eq!((m.account_value, m.margin_used, m.withdrawable), (usd(9996.90865), 10_000_000, usd(9976.90865) as u64));
     }
 
     #[test]
