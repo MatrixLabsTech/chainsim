@@ -1,0 +1,7 @@
+{
+  "name": "hyperliquid-fork-fidelity",
+  "private": true,
+  "type": "module",
+  "scripts": { "fidelity": "node fidelity.mjs" },
+  "dependencies": { "viem": "2.21.54" }
+}
