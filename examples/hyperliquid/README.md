@@ -26,6 +26,8 @@ to its stop.
   The last run's are in [e2e/results.json](e2e/results.json).
 - `scripts/docker.sh`: runs any of these scripts in one container that has chainsim built from
   this repository, Foundry and Node.js, so the host needs only Docker.
+- `fidelity/`: compares the fork with mainnet, value by value. Results:
+  [fidelity/README.md](fidelity/README.md).
 - `bench/`: start time, order to fill, proxy overhead and throughput, mirror and replay
   scaling. Results: [bench/README.md](bench/README.md).
 - `.github/workflows/chainsim.yml`: a GitHub Actions job that runs the same script. Copy it into
