@@ -8,12 +8,14 @@
 //   MAINNET_RPC    HyperEVM mainnet (default https://rpc.hyperliquid.xyz/evm)
 //   FIDELITY_VAULT, FIDELITY_ACCOUNT   the two mainnet accounts to mirror
 //   CHAINSIM_COMMIT the commit chainsim was built from, for the page
-//   CTX_BEFORE     a file with the info API's metaAndAssetCtxs from just before `up`
-//   BEFORE_UP_MS   when that file was read, in ms
-//   node fidelity.mjs render    writes the page again from the JSON
+//   CTX_READS      the file `node fidelity.mjs poll` wrote while `up` ran
+//   BEFORE_UP_MS   when `up` started, in ms
+//   node fidelity.mjs render       writes the page again from the JSON
+//   node fidelity.mjs poll <file>  appends the info API's prices of the seeded perps to the file
+//                                  every 250 ms, one JSON line per read, until it is stopped
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { decodeAbiParameters, encodeAbiParameters, parseUnits } from 'viem';
 
 const OUT = new URL('./', import.meta.url);
@@ -26,6 +28,7 @@ const TRADER = process.env.FIDELITY_ACCOUNT || '0x7a87ac0f820afeb0e1cdb846ef1ab0
 const WALLET = '0x00000000000000000000000000000000f1de1147'; // exists only on the fork
 const CORE_WRITER = '0x3333333333333333333333333333333333333333';
 const TAKER_FEE = 0.00045;
+const SEEDED = ['BTC', 'ETH', 'SOL', 'HYPE']; // the perps `up` seeds
 
 const LOCK = JSON.parse(readFileSync(new URL('../../../engines.lock.json', import.meta.url), 'utf8'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -86,28 +89,31 @@ async function run() {
   const result = { date: new Date().toISOString(), chainsim: chainsim('--version').help.trim(), upstream: process.env.MAINNET_RPC ? 'provider' : 'public RPC', commit: process.env.CHAINSIM_COMMIT || null, proxy: LOCK.engines['hyperevm-proxy'].version, groups: [] };
   const status = chainsim('status', FORK);
   result.forkBlock = status.forkPoint.number;
-  // The info API's prices right after `up`. run.sh saved them just before it.
+  // The info API's prices from before `up`, every quarter second while it ran (run.sh keeps
+  // `poll` going for that time) and once more now that it is done.
   const afterUpMs = Date.now();
-  const ctxAfter = await mainInfo({ type: 'metaAndAssetCtxs' });
-  const ctxBefore = JSON.parse(readFileSync(process.env.CTX_BEFORE, 'utf8'));
+  const priceReads = readFileSync(process.env.CTX_READS, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l).px);
+  priceReads.push(seededPrices(await mainInfo({ type: 'metaAndAssetCtxs' })));
   const meta = await mainInfo({ type: 'meta' });
   const perpIndex = new Map(meta.universe.map((u, i) => [u.name, i]));
   const szDecimals = new Map(meta.universe.map((u) => [u.name, u.szDecimals]));
-  const seeded = ['BTC', 'ETH', 'SOL', 'HYPE'].map((coin) => ({ coin, perp: perpIndex.get(coin) }));
+  const seeded = SEEDED.map((coin) => ({ coin, perp: perpIndex.get(coin) }));
 
-  // 1. Prices, before any mirror moves them. The fork holds the prices `up` took, so they lie
-  // between the info API's just before and just after `up`.
+  // 1. Prices, before any mirror moves them. The fork holds the prices `up` took at some moment
+  // while it ran, so they lie within what the info API gave over that time. Two reads around
+  // `up` would miss a price that moves and returns between them.
   const perps = seeded.flatMap((s) => [{ what: `markPx ${s.coin} (0x806)`, to: pc(0x806), data: u32(s.perp), coin: s.coin, key: 'markPx' }, { what: `oraclePx ${s.coin} (0x807)`, to: pc(0x807), data: u32(s.perp), coin: s.coin, key: 'oraclePx' }]);
   const forkPx = await calls(RPC, perps);
-  const ctxPx = (ctxs, p) => Number(ctxs[1][perpIndex.get(p.coin)][p.key]);
   result.groups.push({
-    ...group('Price precompile reads', 'between the info API price read just before up and the one read just after, or within 1 bp of one of them', perps.map((p, i) => {
+    ...group('Price precompile reads', 'within the range of the info API prices read every 250 ms while up ran, or within 1 bp of it', perps.map((p, i) => {
       const x = Number(BigInt(forkPx[i])) / 10 ** (6 - szDecimals.get(p.coin));
-      const [lo, hi] = [ctxPx(ctxBefore, p), ctxPx(ctxAfter, p)].sort((m, n) => m - n);
+      const seen = priceReads.map((r) => Number(r[p.coin][p.key]));
+      const [lo, hi] = [Math.min(...seen), Math.max(...seen)];
       const d = x >= lo && x <= hi ? 0 : Math.min(bps(x, lo), bps(x, hi));
-      return { what: p.what, fork: x, mainnetBeforeUp: ctxPx(ctxBefore, p), mainnetAfterUp: ctxPx(ctxAfter, p), equal: d <= 1, diffBps: round(d) };
+      return { what: p.what, fork: x, mainnetLow: lo, mainnetHigh: hi, equal: d <= 1, diffBps: round(d) };
     })),
     secondsOfUp: round((afterUpMs - Number(process.env.BEFORE_UP_MS ?? afterUpMs)) / 1000, 1),
+    priceReads: priceReads.length,
   });
   // 2. Mirrors: the info API before and after, the fork between. A mirror brings the account's
   // perps to mainnet's prices, so the second account is mirrored two minutes after `up`, when
@@ -265,6 +271,7 @@ async function run() {
 
 function render() {
   const r = JSON.parse(readFileSync(new URL('fidelity.json', OUT), 'utf8'));
+  const up = r.groups.find((g) => g.secondsOfUp !== undefined);
   const lines = [
     '# Fork against mainnet',
     '',
@@ -282,11 +289,33 @@ function render() {
     '| --- | --- | --- | --- |',
     ...r.groups.map((g) => `| ${g.name} | ${g.equal} of ${g.total} | ${g.largestDiffBps === null ? 'n/a' : `${g.largestDiffBps} bp`} | ${g.rule} |`),
     '',
-    `\`up\` took ${r.groups.find((g) => g.secondsOfUp !== undefined).secondsOfUp} s between the two info API price reads. The second account was mirrored ${r.secondMirrorSecondsAfterUp} s after \`up\`.`,
+    `\`up\` took ${up.secondsOfUp} s${up.priceReads === undefined ? ' between the two info API price reads' : `, with ${up.priceReads} info API price reads over that time`}. The second account was mirrored ${r.secondMirrorSecondsAfterUp} s after \`up\`.`,
     '',
   ];
   writeFileSync(new URL('README.md', OUT), lines.join('\n'));
 }
 
+/// The mark and oracle prices of the seeded perps in one metaAndAssetCtxs answer.
+function seededPrices([meta, ctxs]) {
+  return Object.fromEntries(SEEDED.map((coin) => {
+    const c = ctxs[meta.universe.findIndex((u) => u.name === coin)];
+    return [coin, { markPx: c.markPx, oraclePx: c.oraclePx }];
+  }));
+}
+
+/// Reads the info API every 250 ms until the process is stopped. A read takes longer than that,
+/// so reads overlap, and one that fails is left out.
+function poll(file) {
+  const read = async () => {
+    try {
+      const r = await fetch(INFO, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'metaAndAssetCtxs' }) });
+      if (r.ok) appendFileSync(file, `${JSON.stringify({ t: Date.now(), px: seededPrices(await r.json()) })}\n`);
+    } catch {}
+  };
+  read();
+  setInterval(read, 250);
+}
+
 if (process.argv[2] === 'render') render();
+else if (process.argv[2] === 'poll') poll(process.argv[3]);
 else await run();
