@@ -20,6 +20,9 @@ runs that day.
 - `set balance` and `set token` write an exact balance on any address.
 - `set mirror kamino` copies a Kamino Lend position of Solana Mainnet onto a test wallet, which
   then deposits, borrows and repays on it with its own key.
+- `set scope refresh` and `set scope price` write the Scope prices Kamino Lend reads at the
+  fork's clock, so a position borrows again after `time`, and a lower collateral price makes it
+  unhealthy.
 - `snapshot` and `revert` reset the fork between scenarios, programs included.
 - `time` and `mine` move the Clock sysvar and the slot forward.
 - `set price` sets a Pyth price that programs accept at the fork's clock, and `time --replay`
@@ -270,6 +273,41 @@ chainsim set solana-mainnet mirror kamino 9Z7nH6krHvtEqDDMV5bNj2enPb99qVpu3acB3K
   the owner is refused by Kamino (`InvalidObligationOwner`), as on mainnet.
 - Give the wallet SOL and tokens with `fund` or `set token`.
 
+## Set the prices Kamino Lend reads
+
+Kamino Lend reads its prices from Scope and refuses one older than the reserve allows. After
+`time --advance 86400` a borrow fails with `ReserveStale` (6009). `set scope refresh` stamps the
+Scope entries of an obligation's reserves with the fork's clock and keeps each value:
+
+```sh
+chainsim time solana-mainnet --advance 86400
+chainsim set solana-mainnet scope refresh 6abma3GpqJ3d3Pa1RiQcLPyNh59qAdunXndmPfMeTr2p
+```
+
+```json
+{"kind": "scope-refresh", "reserves": ["2ov3CMqPBYG3jNBmmpXgK9KMW5GmU5GWZNGcwf7w3BC1", "..."], "notScope": [], "entries": [{"prices": "3NJYftD5sjVfxSnUdZ1wVML8f3aC6mp1CXCL6L7TnU8C", "index": 416, "role": "price", "price": "3.98664493870924714", "previousPrice": "3.98664493870924714", "value": "398664493870924714", "exponent": 17, "timestamp": 1794578032, "previousTimestamp": 1794491620, "slot": 468894743}, "..."], "timestamp": 1794578032, "slot": 468894743, "note": "..."}
+```
+
+`set scope price` sets the price of one reserve's token in USD, in its price entry and its TWAP
+entry. This lowers JLP, the collateral of the mirrored position, from 3.99 to 2.84:
+
+```sh
+chainsim set solana-mainnet scope price DdTmCCjv7zHRD1hJv3E8bpnSEQBzdKkzB1j9ApXX5QoP 2.843629
+```
+
+```json
+{"kind": "scope-price", "reserve": "DdTmCCjv7zHRD1hJv3E8bpnSEQBzdKkzB1j9ApXX5QoP", "token": "JLP", "price": "2.843629", "entries": [{"prices": "3NJYftD5sjVfxSnUdZ1wVML8f3aC6mp1CXCL6L7TnU8C", "index": 416, "role": "price", "price": "2.843629", "previousPrice": "3.98664493870924714", "value": "284362900000000000", "exponent": 17, "timestamp": 1794578033, "previousTimestamp": 1794578032, "slot": 468894747}, {"prices": "3NJYftD5sjVfxSnUdZ1wVML8f3aC6mp1CXCL6L7TnU8C", "index": 501, "role": "twap", "price": "2.843629", "previousPrice": "4.00029729", "value": "284362900", "exponent": 8, "timestamp": 1794578033, "previousTimestamp": 1794578032, "slot": 468894747}], "heuristic": {"lower": "2", "upper": "6"}, "withinHeuristic": true, "maxTwapDivergenceBps": 1000, "maxAgeSeconds": {"price": 250, "twap": 300}, "timestamp": 1794578033, "slot": 468894747, "note": "..."}
+```
+
+- Kamino's next `refresh_reserve` and `refresh_obligation` use the new price. In this run the
+  debt was 4601 USD and the value at which Kamino calls the position unhealthy fell from 5803
+  USD to 4139 USD, and a further borrow failed with `BorrowTooLarge` (6013).
+- `heuristic` holds the bounds Kamino accepts for the token. `withinHeuristic` is false for a
+  price outside them, which Kamino refuses.
+- `maxAgeSeconds` is how long Kamino takes the price. Run `set scope refresh` again after that
+  long, and after every `time`.
+- A reserve address comes from `reserves` in the result of `set mirror kamino`.
+
 ## Snapshot and revert
 
 ```sh
@@ -473,6 +511,7 @@ a test report:
 - set price writes a Pyth price account (PriceUpdateV2) on the copy: the price, the confidence, a publish time equal to the Clock, the posted slot, and the EMA price and confidence set to the same values. It knows SOL/USD, BTC/USD, ETH/USD and USDC/USD by symbol and takes any other fully verified price account by address. Nothing signs the price, and Pyth's later updates on Solana Mainnet do not reach an account the copy has read. A program that reads its price elsewhere does not see it: Kamino lending reads Scope, which names none of these four accounts (measured on 2026-11-12).
 - time --replay <feed> plays a range of prices onto the copy: each step moves the clock forward by the time between two prices and writes the price with a publish time equal to the Clock. The clock moves forward only, so a past range plays from the copy's current time on. With --from and --to the prices are the close of Hyperliquid's 1-minute candles for the SOL, BTC and ETH perps, a perp price on that venue and not Pyth's aggregate, read from the fork's control sidecar and not kept. That source keeps about the latest 5,000 minutes, a range is at most one day, and USDC/USD is not in it. With --file <csv> the prices are your own rows of <unix seconds>,<price>, for any feed and any times, at most 10,000 rows.
 - set mirror kamino <obligation> --to <test wallet> copies a Kamino Lend obligation of Solana Mainnet as the copy reads it when the command runs. The copy does not follow the source afterwards. It writes the obligation at the address Kamino derives for the wallet, with the wallet as its owner, and the farm user state of each farmed reserve the obligation holds, with its owner and its obligation rewritten. Every other byte equals the source. Reserve totals and farm stakes are not raised, so a reserve counts the position once while the source and the copy both claim it (inferred): a test that drains a reserve or reads a farm's total stake sees that. The command finds the seeds of the source's address among tags 0 to 3, ids 0 to 7 and the mints the obligation holds now, and exits 3 when none gives it. The wallet's token accounts are not made: fund or set token makes them. Kamino prices the copy from the oracle accounts the copy has read, which keep their age when the clock moves. After time --advance 120 a deposit, a borrow and a repay passed. After time --advance 600, and after 86400, Kamino logged PriceTooOld, a deposit still passed and a borrow failed with ReserveStale (6009). surfnet_resetAccount on the price accounts did not change that, since their mainnet time is then behind the copy's clock (measured on 2026-11-12 on one market).
+- set scope price <kamino reserve> <usd price> and set scope refresh <kamino reserve|obligation>... write the Scope prices account that a Kamino Lend reserve names, through surfnet_setAccount, with the time and the slot of the copy's clock. set scope price writes the one entry of the reserve's price chain and the one entry of its TWAP chain to the same price. It exits 3 for a reserve whose price is a product of several entries (by code, not run). set scope refresh keeps each value and stamps the entries of every reserve named, and of every reserve an obligation named holds. Kamino takes a price for as long as the reserve allows (JLP: 250 s for the price and 300 s for the TWAP), counted on the copy's clock, which also runs in real time. So refresh again after that long and after time --advance, and name the obligation, since a borrow needs every reserve it holds fresh. One Scope entry can price several reserves and markets, and each sees the new value. A price outside the reserve's heuristic bounds is written and reported with withinHeuristic false. Kamino then logs PriceIsLowerThanHeuristic and a borrow fails with ObligationStale (6017) (measured on JLP at 1.5, bounds 2 to 6). A reserve that reads Pyth or Switchboard directly is listed under notScope and not written. Measured on 2026-11-12 on one market: after time --advance 86400 a borrow failed with ReserveStale (6009) and passed after set scope refresh. After set scope price lowered JLP from 3.99 to 2.84, Kamino's refresh reported the debt above the unhealthy value and a further borrow failed with BorrowTooLarge (6013).
 - chainsim call <name> surfnet_cloneProgramAccount copies a program of the upgradeable loader to a new address. A program of an older loader is refused.
 - Solana signatures do not bind to this copy. A transaction signed for the copy is valid on Solana Mainnet while its blockhash is recent there. The copy's blockhashes are local, so use test keys that hold no mainnet assets.
 - The websocket subscriptions rootSubscribe, blockSubscribe and voteSubscribe send nothing.
