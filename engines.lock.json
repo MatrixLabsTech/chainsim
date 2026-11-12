@@ -102,12 +102,12 @@
           "amd64": {
             "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/aptos-rest-0.1.14-e06de7ac5c4b/aptos-rest-0.1.14-e06de7ac5c4b-linux-amd64.tar.gz",
             "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/aptos-rest-0.1.14-e06de7ac5c4b/aptos-rest-0.1.14-e06de7ac5c4b-linux-amd64.tar.gz.sha256",
-            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+            "sha256": "939eb77b69251b9e653666410db6047e4439d101d1453b51b2169c180785f331"
           },
           "arm64": {
             "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/aptos-rest-0.1.14-e06de7ac5c4b/aptos-rest-0.1.14-e06de7ac5c4b-linux-arm64.tar.gz",
             "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/aptos-rest-0.1.14-e06de7ac5c4b/aptos-rest-0.1.14-e06de7ac5c4b-linux-arm64.tar.gz.sha256",
-            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+            "sha256": "06a1f1a40f2494733d90dfb36570b047530152184954030731288ed0ab740bda"
           }
         }
       }
@@ -163,12 +163,12 @@
           "amd64": {
             "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.14-221867dee4bb/hyperevm-proxy-0.1.14-221867dee4bb-linux-amd64.tar.gz",
             "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.14-221867dee4bb/hyperevm-proxy-0.1.14-221867dee4bb-linux-amd64.tar.gz.sha256",
-            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+            "sha256": "40afe81e034d87c877dd30aeec8b9939edbedb4ccde55873bdf0d0e657001d48"
           },
           "arm64": {
             "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.14-221867dee4bb/hyperevm-proxy-0.1.14-221867dee4bb-linux-arm64.tar.gz",
             "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.14-221867dee4bb/hyperevm-proxy-0.1.14-221867dee4bb-linux-arm64.tar.gz.sha256",
-            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+            "sha256": "3670e989b32154a66881abf248e00148f19fe84a71d7834a553dad2a5c80ca14"
           }
         }
       }
