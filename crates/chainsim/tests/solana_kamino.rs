@@ -392,6 +392,7 @@ fn solana_mirror_kamino() {
     assert!(!deposits.is_empty() && !borrows.is_empty(), "{SOURCE} no longer has a deposit and a borrow: put another obligation in SOURCE");
     assert_eq!((m["source"].as_str(), m["owner"].as_str()), (Some(SOURCE), Some(wallet.address().as_str())));
     assert_eq!(copy, find_program_address(&[&[0], &[0], &wallet.public, &market, &[0; 32], &[0; 32]], &k(KLEND)).unwrap().0);
+    assert_eq!(m["seeds"], json!({ "tag": 0, "id": 0, "seed1": "11111111111111111111111111111111", "seed2": "11111111111111111111111111111111" }));
     // Every byte of the copy equals the source, except the owner.
     let (source_bytes, copy_bytes) = (account(name, &source), account(name, &copy));
     assert_eq!(changed_ranges(&source_bytes, &copy_bytes), vec![[64, 96]]);

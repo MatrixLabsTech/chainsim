@@ -31,6 +31,8 @@ const RESERVE_LEN: usize = 8624;
 /// A reserve's farm for collateral and its farm for debt. All zero when it has none.
 const RESERVE_FARM_COLLATERAL: usize = 64;
 const RESERVE_FARM_DEBT: usize = 96;
+/// The mint of the token a reserve lends.
+const RESERVE_MINT: usize = 128;
 const FARM_USER_LEN: usize = 920;
 /// A farm user state's owner, and the obligation it stands for.
 const FARM_USER_OWNER: usize = 48;
@@ -66,11 +68,41 @@ pub fn find_program_address(seeds: &[&[u8]], program: &Key) -> Option<(Key, u8)>
     })
 }
 
-/// The address of an owner's first plain obligation in a market: tag 0, id 0
-/// and two default keys as the remaining seeds.
-pub fn obligation_address(owner: &Key, market: &Key) -> Option<Key> {
+/// The seeds of an obligation's address after its owner and market: a tag for
+/// its kind, an id, and two keys. A plain obligation has tag 0 and two default
+/// keys. The other kinds carry mints, such as collateral and debt.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Seeds {
+    pub tag: u8,
+    pub id: u8,
+    pub seed1: Key,
+    pub seed2: Key,
+}
+
+/// The address of an owner's obligation in a market for the seeds.
+pub fn obligation_address(owner: &Key, market: &Key, seeds: &Seeds) -> Option<Key> {
     let klend = key(KLEND)?;
-    find_program_address(&[&[0], &[0], owner, market, &[0; 32], &[0; 32]], &klend).map(|(address, _)| address)
+    find_program_address(&[&[seeds.tag], &[seeds.id], owner, market, &seeds.seed1, &seeds.seed2], &klend).map(|(address, _)| address)
+}
+
+/// The seeds that give `address`, searched over tags 0 to 3, ids 0 to 7, and
+/// the default key and `mints` as each of the two keys. None when none does.
+pub fn obligation_seeds(address: &Key, owner: &Key, market: &Key, mints: &[Key]) -> Option<Seeds> {
+    let mut keys = vec![[0; 32]];
+    keys.extend(mints);
+    for tag in 0..4 {
+        for id in 0..8 {
+            for seed1 in &keys {
+                for seed2 in &keys {
+                    let seeds = Seeds { tag, id, seed1: *seed1, seed2: *seed2 };
+                    if obligation_address(owner, market, &seeds).as_ref() == Some(address) {
+                        return Some(seeds);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The address of the farm user state that stands for an obligation in a farm.
@@ -183,31 +215,35 @@ pub async fn kamino(adapter: &SolanaAdapter, name: &str, source: &str, to: &str)
     if obligation.owner == wallet_key {
         return Err(Error::new(ErrorCode::Usage, format!("{wallet} already owns {source}")).next("pass a test wallet you hold the key of"));
     }
-    if obligation_address(&obligation.owner, &obligation.market) != Some(source_key) {
-        return Err(not_mirrorable(format!("mirror of {source}, which is not its owner's first plain obligation in the market (tag 0, id 0), the one kind this command derives")));
-    }
-    let copy_key = obligation_address(&wallet_key, &obligation.market).ok_or_else(|| Error::new(ErrorCode::Internal, "no address derives for the wallet"))?;
-    let copy = base58_encode(&copy_key);
-
-    // The farm of each position: a deposit stakes in the reserve's collateral farm, a borrow in its debt farm.
-    let mut farm_users = Vec::new();
+    // Each position's reserve gives a mint, which may be a seed of the address, and a farm:
+    // a deposit stakes in the reserve's collateral farm, a borrow in its debt farm.
+    let (mut mints, mut farms) = (Vec::new(), Vec::new());
     for (reserves, farm_at) in [(&obligation.deposits, RESERVE_FARM_COLLATERAL), (&obligation.borrows, RESERVE_FARM_DEBT)] {
         for reserve in reserves {
             let address = base58_encode(reserve);
             let data = read(&rpc, &address).await?.filter(|r| r.owner == KLEND && r.data.len() == RESERVE_LEN).ok_or_else(|| Error::new(ErrorCode::RpcError, format!("reserve {address} of {source} is not a Kamino Lend reserve on the fork")))?.data;
-            let farm = key_at(&data, farm_at);
-            if farm == [0; 32] {
-                continue;
-            }
-            let from = farm_user_address(&farm, &source_key).map(|k| base58_encode(&k)).unwrap_or_default();
-            // An obligation that never staked in the farm has no state there.
-            let Some(mut state) = read(&rpc, &from).await? else { continue };
-            let data = rewrite_farm_user(&state.data, &source_key, &obligation.owner, &copy_key, &wallet_key).ok_or_else(|| not_mirrorable(format!("mirror of {source}, whose farm account {from} is not a farm user state of it")))?;
-            let rewritten = changed_ranges(&state.data, &data);
-            state.data = data;
-            let to = farm_user_address(&farm, &copy_key).map(|k| base58_encode(&k)).unwrap_or_default();
-            farm_users.push((json!({ "reserve": address, "farm": base58_encode(&farm), "source": from, "copy": to, "rewritten": rewritten }), state));
+            mints.push(key_at(&data, RESERVE_MINT));
+            farms.push((address, key_at(&data, farm_at)));
         }
+    }
+    let seeds = obligation_seeds(&source_key, &obligation.owner, &obligation.market, &mints)
+        .ok_or_else(|| not_mirrorable(format!("set mirror kamino of {source}, whose address no tag from 0 to 3 and id from 0 to 7 gives with the mints it holds now")))?;
+    let copy_key = obligation_address(&wallet_key, &obligation.market, &seeds).ok_or_else(|| Error::new(ErrorCode::Internal, "no address derives for the wallet"))?;
+    let copy = base58_encode(&copy_key);
+
+    let mut farm_users = Vec::new();
+    for (address, farm) in farms {
+        if farm == [0; 32] {
+            continue;
+        }
+        let from = farm_user_address(&farm, &source_key).map(|k| base58_encode(&k)).unwrap_or_default();
+        // An obligation that never staked in the farm has no state there.
+        let Some(mut state) = read(&rpc, &from).await? else { continue };
+        let data = rewrite_farm_user(&state.data, &source_key, &obligation.owner, &copy_key, &wallet_key).ok_or_else(|| not_mirrorable(format!("set mirror kamino of {source}, whose farm account {from} is not a farm user state of it")))?;
+        let rewritten = changed_ranges(&state.data, &data);
+        state.data = data;
+        let to = farm_user_address(&farm, &copy_key).map(|k| base58_encode(&k)).unwrap_or_default();
+        farm_users.push((json!({ "reserve": address, "farm": base58_encode(&farm), "source": from, "copy": to, "rewritten": rewritten }), state));
     }
 
     // Every source account is read and checked, so the writes start here.
@@ -230,6 +266,7 @@ pub async fn kamino(adapter: &SolanaAdapter, name: &str, source: &str, to: &str)
         "obligation": copy,
         "owner": wallet,
         "market": base58_encode(&obligation.market),
+        "seeds": { "tag": seeds.tag, "id": seeds.id, "seed1": base58_encode(&seeds.seed1), "seed2": base58_encode(&seeds.seed2) },
         "reserves": { "deposits": list(&obligation.deposits), "borrows": list(&obligation.borrows) },
         "farmUserStates": states,
         "rewritten": [[OBLIGATION_OWNER, OBLIGATION_OWNER + 32]],
@@ -256,14 +293,35 @@ mod tests {
         let obligation = k("HpcQML7qJ62yXBtbaam94L5HzCnhtEr1qfMqXZTwgS5W");
         // Bump 254: the hash for 255 is a curve point, so a wrong curve test gives another address.
         assert_eq!(find_program_address(&[&[0], &[0], &owner, &market, &[0; 32], &[0; 32]], &klend), Some((obligation, 254)));
-        assert_eq!(obligation_address(&owner, &market), Some(obligation));
+        let plain = Seeds { tag: 0, id: 0, seed1: [0; 32], seed2: [0; 32] };
+        assert_eq!(obligation_address(&owner, &market, &plain), Some(obligation));
+        assert_eq!(obligation_seeds(&obligation, &owner, &market, &[]), Some(plain));
         assert_eq!(find_program_address(&[b"lma", &market], &klend), Some((k("9DrvZvyWh1HuAoZxvYWMvkf2XCzryCpGgHqrMjyDWpmo"), 248)));
         let farm = k("9CinLHLAcMkzs4Ji8pwS2qwyz1LU46A4Ry7BNLGLubxs");
         assert_eq!(find_program_address(&[b"user", &farm, &obligation], &farms), Some((k("96NxMhncGSdMJKqcqdcbAxAXAMdiiNhemNNBUGhVQ3MA"), 254)));
         assert_eq!(farm_user_address(&k("955xWFhSDcDiUgUr4sBRtCpTLiMd4H5uZLAmgtP3R3sX"), &obligation), Some(k("GoL7tAgDtK1tmA7Qyep1rUey4VXSNzUCFdaXWT9ZeHQ7")));
         // A second market and owner, bump 255.
         let jlp_market = k("DxXdAyU3kCjnyggvHmY5nAwg5cRbbmdyX3npfDMjjMek");
-        assert_eq!(obligation_address(&k("Dr91VxPi2dyTFyg5hjpFP3murEpWsXzjKXy6joS9hJZX"), &jlp_market), Some(k("9Z7nH6krHvtEqDDMV5bNj2enPb99qVpu3acB3KeasCxW")));
+        assert_eq!(obligation_address(&k("Dr91VxPi2dyTFyg5hjpFP3murEpWsXzjKXy6joS9hJZX"), &jlp_market, &plain), Some(k("9Z7nH6krHvtEqDDMV5bNj2enPb99qVpu3acB3KeasCxW")));
+    }
+
+    /// Obligations of other kinds, read on Solana Mainnet on 2026-11-12.
+    #[test]
+    fn the_seeds_of_an_obligation_are_found() {
+        // A second plain obligation of one owner: id 2.
+        let (owner, market) = (k("9X51dLtDsbdoBXPNb8nx5j9YW13X9cQkejN9Q3pBZzMJ"), k("7u3HeHxYDLhnCoErrtycNokbQYbWGzLs6JSDqGAv5PfF"));
+        let found = obligation_seeds(&k("5SyVqTUMr11ZdxQJcrWcuVSeRytqD8NeAHZ8egBJRear"), &owner, &market, &[]).unwrap();
+        assert_eq!((found.tag, found.id, found.seed1, found.seed2), (0, 2, [0; 32], [0; 32]));
+        // Tag 1, with the collateral mint and the debt mint as the two keys, whatever order the mints come in.
+        let (owner, market) = (k("3F43GRim9pQLkP3iCCGVdDQwUqu2HFBJLf7Uj1d3hmht"), k("47tfyEG9SsdEnUm9cw5kY9BXngQGqu3LBoop9j5uTAv8"));
+        let (collateral, debt) = (k("5Y8NV33Vv7WbnLfq3zBcKSdYPrk7g2KoiQoe7M2tcxp5"), k("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"));
+        let address = k("CxpYkhDVcgig6SihtqKvh6ystKairVXau6t42qndQxvF");
+        let want = Seeds { tag: 1, id: 0, seed1: collateral, seed2: debt };
+        assert_eq!(obligation_seeds(&address, &owner, &market, &[debt, collateral]), Some(want));
+        assert_eq!(obligation_address(&owner, &market, &want), Some(address));
+        // Without the mints, or for another owner, no seeds give the address.
+        assert_eq!(obligation_seeds(&address, &owner, &market, &[]), None);
+        assert_eq!(obligation_seeds(&address, &market, &owner, &[debt, collateral]), None);
     }
 
     fn obligation_bytes() -> Vec<u8> {
