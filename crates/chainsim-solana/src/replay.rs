@@ -97,19 +97,35 @@ pub async fn replay(adapter: &SolanaAdapter, name: &str, feed: &str, from: u64, 
     let first = prices[0].0;
     let mut applied = Vec::with_capacity(prices.len());
     let mut slot = 0;
+    let mut failed = None;
     for (time, close) in &prices {
-        if *time > first {
-            rpc.call("surfnet_timeTravel", json!([{ "absoluteTimestamp": (started + time - first) * 1000 }])).await?;
+        let step = async {
+            if *time > first {
+                rpc.call("surfnet_timeTravel", json!([{ "absoluteTimestamp": (started + time - first) * 1000 }])).await?;
+            }
+            let (at_slot, now) = clock(&rpc).await?;
+            let raw = i64::try_from(to_raw(close, old.exponent)?).map_err(|_| Error::new(ErrorCode::Internal, format!("the source price {close} is too large")))?;
+            price::write(&mut data, raw, old.conf, now as i64, at_slot);
+            let read = price::store(&rpc, &account, &data).await?;
+            Ok::<_, Error>((at_slot, json!({ "time": time, "price": from_raw(read.price as u64, read.exponent), "clock": read.publish_time })))
+        };
+        match step.await {
+            Ok((at_slot, entry)) => {
+                slot = at_slot;
+                applied.push(entry);
+            }
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
         }
-        let (at_slot, now) = clock(&rpc).await?;
-        let raw = i64::try_from(to_raw(close, old.exponent)?).map_err(|_| Error::new(ErrorCode::Internal, format!("the source price {close} is too large")))?;
-        price::write(&mut data, raw, old.conf, now as i64, at_slot);
-        let read = price::store(&rpc, &account, &data).await?;
-        applied.push(json!({ "time": time, "price": from_raw(read.price as u64, read.exponent), "clock": read.publish_time }));
-        slot = at_slot;
+    }
+    // A replay that stopped midway has still moved the clock and the price, so it is listed too.
+    adapter.record(name, json!({ "kind": "replay", "feed": feed, "account": account, "from": from, "to": to, "steps": applied.len(), "of": prices.len(), "source": SOURCE })).await?;
+    if let Some(e) = failed {
+        return Err(Error::new(e.code, format!("the replay stopped after {} of {} steps: {}", applied.len(), prices.len(), e.message)).next(format!("chainsim status {name} shows the fork's state")));
     }
     let (_, ended) = clock(&rpc).await?;
-    adapter.record(name, json!({ "kind": "replay", "feed": feed, "account": account, "from": from, "to": to, "steps": applied.len(), "source": SOURCE })).await?;
     Ok(json!({
         "kind": "replay", "feed": feed, "account": account, "source": format!("{SOURCE}, {product}"),
         "from": from, "to": to, "steps": applied.len(),

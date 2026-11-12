@@ -5,7 +5,7 @@
 chainsim runs a private copy of Solana Mainnet in Docker as the chain `solana-mainnet`. The
 commands and their JSON output are the same as on every chain, and the [README](../../README.md)
 covers the shared workflow. This page covers what is specific to Solana. Every output below comes
-from one live run against Solana Mainnet on 2026-11-12.
+from a live run against Solana Mainnet on 2026-11-12, the Prices section from a second run that day.
 
 ## What chainsim gives on Solana
 
@@ -357,7 +357,7 @@ chainsim time solana-mainnet --replay SOL/USD --from 2026-11-11T12:00Z --to 2026
   `BTC/USD` and `ETH/USD`. A range is at most one day.
 - The clock moves forward only, so the past range plays from the fork's current time on. `time`
   in each step is the candle's, and `clock` is the fork's when the price was written.
-- An hour of 60 steps took 6 s (measured on 2026-11-12).
+- An hour of 60 steps took 6 s and a day of 1,440 steps took 128 s (measured on 2026-11-12).
 
 ## Programs
 

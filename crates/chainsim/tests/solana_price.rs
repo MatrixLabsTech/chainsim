@@ -201,7 +201,8 @@ fn solana_price_set_and_replay() {
     // What a replay refuses.
     fails(&["time", name, "--replay", "USDC/USD", "--from", &from.to_string(), "--to", &to.to_string()], 3, "unsupported");
     fails(&["time", name, "--replay", "SOL/USD", "--from", &to.to_string(), "--to", &from.to_string()], 2, "usage");
-    fails(&["time", name, "--replay", "SOL/USD", "--from", &from.to_string(), "--to", &(from + 2 * 86400 + 60).to_string()], 2, "usage");
+    // More than a day, wholly in the past.
+    fails(&["time", name, "--replay", "SOL/USD", "--from", &(from - 3 * 86400).to_string(), "--to", &(from - 2 * 86400 + 60).to_string()], 2, "usage");
     fails(&["time", name, "--replay", "SOL/USD", "--from", &host_now.to_string(), "--to", &(host_now + 3600).to_string()], 2, "usage");
     fails(&["time", name, "--replay", "NOPE", "--from", &from.to_string(), "--to", &to.to_string()], 2, "usage");
 
@@ -211,7 +212,7 @@ fn solana_price_set_and_replay() {
     let kinds: Vec<&str> = mods.iter().map(|m| m["kind"].as_str().unwrap()).collect();
     assert_eq!(kinds.iter().filter(|k| **k == "set-price").count(), 3, "{kinds:?}");
     let listed = mods.iter().find(|m| m["kind"] == "replay").expect("a replay entry");
-    assert_eq!((listed["feed"].as_str(), listed["steps"].as_u64(), listed["from"].as_u64()), (Some("SOL/USD"), Some(applied.len() as u64), Some(from)));
+    assert_eq!((listed["feed"].as_str(), listed["steps"].as_u64(), listed["of"].as_u64(), listed["from"].as_u64()), (Some("SOL/USD"), Some(applied.len() as u64), Some(applied.len() as u64), Some(from)));
 
     assert_eq!(ok(&["down", name])["removed"], true);
     assert_gone(name);
