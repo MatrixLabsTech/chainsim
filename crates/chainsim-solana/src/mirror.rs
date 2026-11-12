@@ -27,7 +27,7 @@ const OBLIGATION_OWNER: usize = 64;
 /// Eight deposits of 136 bytes and five borrows of 200 bytes, each starting with its reserve.
 const DEPOSITS: (usize, usize, usize) = (96, 136, 8);
 const BORROWS: (usize, usize, usize) = (1208, 200, 5);
-const RESERVE_LEN: usize = 8624;
+pub(crate) const RESERVE_LEN: usize = 8624;
 /// A reserve's farm for collateral and its farm for debt. All zero when it has none.
 const RESERVE_FARM_COLLATERAL: usize = 64;
 const RESERVE_FARM_DEBT: usize = 96;
@@ -43,7 +43,7 @@ pub fn key(address: &str) -> Option<Key> {
     base58_decode(address)?.try_into().ok()
 }
 
-fn key_at(data: &[u8], offset: usize) -> Key {
+pub(crate) fn key_at(data: &[u8], offset: usize) -> Key {
     data[offset..offset + 32].try_into().expect("32 bytes")
 }
 
@@ -173,14 +173,14 @@ pub fn changed_ranges(a: &[u8], b: &[u8]) -> Vec<[usize; 2]> {
     out
 }
 
-struct Account {
-    lamports: u64,
-    owner: String,
-    data: Vec<u8>,
+pub(crate) struct Account {
+    pub(crate) lamports: u64,
+    pub(crate) owner: String,
+    pub(crate) data: Vec<u8>,
 }
 
 /// An account's raw bytes as the fork has it now, or None when it does not exist.
-async fn read(rpc: &Rpc<'_>, address: &str) -> Result<Option<Account>> {
+pub(crate) async fn read(rpc: &Rpc<'_>, address: &str) -> Result<Option<Account>> {
     let v = rpc.call("getAccountInfo", json!([address, { "encoding": "base64", "commitment": "processed" }])).await?;
     let a = &v["value"];
     if a.is_null() {
@@ -193,7 +193,7 @@ async fn read(rpc: &Rpc<'_>, address: &str) -> Result<Option<Account>> {
 }
 
 /// Writes an account with `surfnet_setAccount` and reads it back.
-async fn write(rpc: &Rpc<'_>, address: &str, account: &Account) -> Result<()> {
+pub(crate) async fn write(rpc: &Rpc<'_>, address: &str, account: &Account) -> Result<()> {
     let hex: String = account.data.iter().map(|b| format!("{b:02x}")).collect();
     rpc.call("surfnet_setAccount", json!([address, { "lamports": account.lamports, "data": hex, "owner": account.owner, "executable": false }])).await?;
     match read(rpc, address).await? {

@@ -240,6 +240,27 @@ enum SetWhat {
         #[command(subcommand)]
         what: MirrorWhat,
     },
+    /// The Scope prices that Kamino Lend reads (Solana), written at the fork's clock.
+    Scope {
+        #[command(subcommand)]
+        what: ScopeWhat,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScopeWhat {
+    /// The price Kamino reads for one reserve, in USD: its Scope price entry and its TWAP entry.
+    Price {
+        /// The Kamino Lend reserve.
+        reserve: String,
+        price: String,
+    },
+    /// Stamp the Scope entries with the fork's clock and keep their values, so prices are fresh after the clock moved.
+    Refresh {
+        /// Kamino Lend reserves, or obligations, which stand for the reserves they hold.
+        #[arg(required = true)]
+        addresses: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -352,7 +373,7 @@ async fn solana_adapter(name: &str) -> Result<SolanaAdapter> {
     let handle = docker.find(name).await?.ok_or_else(|| Error::fork_not_found(name))?;
     let profile = profile::get(&handle.chain)?;
     if profile.family != "solana" {
-        return Err(Error::unsupported(&format!("set mirror on {}", profile.key), "only Solana has set mirror. HyperEVM has chainsim set <name> hypercore mirror <user>"));
+        return Err(Error::unsupported(&format!("set mirror and set scope on {}", profile.key), "only Solana has set mirror and set scope. HyperEVM has chainsim set <name> hypercore mirror <user> and hypercore price"));
     }
     SolanaAdapter::connect().await
 }
@@ -435,7 +456,7 @@ fn describe(chain: Option<&str>) -> Result<Value> {
             "revert <name> <id>",
             "call <name> <method> [<params-json>] [--from <address>]  (HyperEVM: call <name> corewriter_actions [{\"fromBlock\": <n>}])",
             "send <name> --as <address> --to <address> (--sig \"<fn(types)>\" [<arg>...] | --data <hex>) [--value <amount>]  (Solana: send <name> --as <address> (--to <receiver> --value <amount> | --data <base64 transaction>))",
-            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type|symbol|mint> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex> | precompile <address> <calldata hex> (--result <hex> | --live) | price <feed|price account> <usd> [--conf <usd>] | hypercore (price <perp> <px> | price <spot pair> <px> --spot | isolated-margin <user> <perp> <+usd|-usd> | spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>] | position <user> <perp> <szi> <entryNtl> [--leverage <n>] [--isolated-raw-usd <n>] [--isolated] | book <coin> --live | mirror <user> | funding <perp> <rate> | big-blocks <user> on|off) | mirror kamino <obligation> --to <test wallet>  (Solana)",
+            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type|symbol|mint> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex> | precompile <address> <calldata hex> (--result <hex> | --live) | price <feed|price account> <usd> [--conf <usd>] | hypercore (price <perp> <px> | price <spot pair> <px> --spot | isolated-margin <user> <perp> <+usd|-usd> | spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>] | position <user> <perp> <szi> <entryNtl> [--leverage <n>] [--isolated-raw-usd <n>] [--isolated] | book <coin> --live | mirror <user> | funding <perp> <rate> | big-blocks <user> on|off) | mirror kamino <obligation> --to <test wallet>  (Solana) | scope (price <kamino reserve> <usd price> | refresh <kamino reserve|obligation>...)  (Solana)",
             "time <name> (--advance <seconds> | --to <unix seconds> | --replay <perp> --from <time> --to <time>)  (Solana: --replay <feed> (--from <time> --to <time> | --file <csv>), such as SOL/USD)",
             "mine <name> [--blocks <n>]",
             "selftest <name>",
@@ -616,6 +637,8 @@ async fn run(command: Command) -> Result<Value> {
                 SetWhat::Resource { address, struct_tag, bcs } => SetRequest { kind: SetKind::Resource { struct_tag, bcs }, address, value: String::new() },
                 SetWhat::Precompile { address, calldata, result, live: _ } => SetRequest { kind: SetKind::Precompile { calldata, result }, address, value: String::new() },
                 SetWhat::Hypercore { what } => return set_hypercore(&name, what).await,
+                SetWhat::Scope { what: ScopeWhat::Price { reserve, price } } => return chainsim_solana::scope::price(&solana_adapter(&name).await?, &name, &reserve, &price).await,
+                SetWhat::Scope { what: ScopeWhat::Refresh { addresses } } => return chainsim_solana::scope::refresh(&solana_adapter(&name).await?, &name, &addresses).await,
                 SetWhat::Mirror { what: MirrorWhat::Kamino { obligation, to } } => return chainsim_solana::mirror::kamino(&solana_adapter(&name).await?, &name, &obligation, &to).await,
                 SetWhat::Price { feed, price, conf } => return set_price(&name, &feed, &price, conf.as_deref()).await,
             };

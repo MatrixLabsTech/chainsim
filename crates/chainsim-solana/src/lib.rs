@@ -6,6 +6,7 @@ pub mod mirror;
 pub mod price;
 pub mod replay;
 pub mod rpc;
+pub mod scope;
 pub mod send;
 pub mod snapshot;
 pub mod time;

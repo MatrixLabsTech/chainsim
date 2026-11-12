@@ -1,7 +1,8 @@
-//! Solana acceptance test for `set mirror kamino`: a Kamino Lend position of
-//! Solana Mainnet copied onto a test wallet, which then deposits, borrows and
-//! repays on it with its own key. It starts a real Surfpool fork of Solana
-//! Mainnet in Docker against the public upstream, so it is ignored by default:
+//! Solana acceptance tests for `set mirror kamino` and `set scope`: a Kamino
+//! Lend position of Solana Mainnet copied onto a test wallet, which then
+//! deposits, borrows and repays on it with its own key, and the Scope prices
+//! Kamino reads, set after the clock moved. They start a real Surfpool fork of
+//! Solana Mainnet in Docker against the public upstream, so they are ignored by default:
 //!
 //!     cargo test -p chainsim --test solana_kamino -- --ignored --test-threads=1 --nocapture
 
@@ -79,6 +80,16 @@ fn key_at(data: &[u8], offset: usize) -> Key {
 
 fn u64_at(data: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
+}
+
+/// One of Kamino's scaled values (a u128 with 60 fraction bits) as a number.
+fn sf_at(data: &[u8], offset: usize) -> f64 {
+    u128::from_le_bytes(data[offset..offset + 16].try_into().unwrap()) as f64 / (1u128 << 60) as f64
+}
+
+/// An obligation's debt, adjusted by borrow factors, and the debt value at which Kamino calls it unhealthy.
+fn debt_and_unhealthy(obligation: &[u8]) -> (f64, f64) {
+    (sf_at(obligation, 2208), sf_at(obligation, 2256))
 }
 
 /// Two accounts of one length differ, and only inside `ranges`. A new key can
@@ -498,6 +509,121 @@ fn solana_mirror_kamino() {
 
     // The source obligation never moved its owner, and only refreshes touched it.
     assert_eq!(key_at(&account(name, &source), 64), key_at(&source_bytes, 64));
+
+    assert_eq!(ok(&["down", name])["removed"], true);
+    assert_gone(name);
+}
+
+#[test]
+#[ignore]
+fn solana_scope_prices_for_kamino() {
+    let name = "acc-sol-scope";
+    chainsim(&["down", name]);
+    let d = ok(&["describe", "solana-mainnet"]);
+    assert!(d["limits"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().contains("set scope")), "describe states no limit of set scope");
+    ok(&["up", "solana-mainnet", "--name", name]);
+
+    let wallet = Wallet::new();
+    ok(&["fund", name, &wallet.address(), "--native", "10"]);
+    let m = ok(&["set", name, "mirror", "kamino", SOURCE, "--to", &wallet.address()]);
+    let copy = k(m["obligation"].as_str().unwrap());
+    let market = k(m["market"].as_str().unwrap());
+    let keys = |v: &Value| v.as_array().unwrap().iter().map(|x| k(x.as_str().unwrap())).collect::<Vec<Key>>();
+    let (deposits, borrows) = (keys(&m["reserves"]["deposits"]), keys(&m["reserves"]["borrows"]));
+    assert!(deposits.len() == 1 && !borrows.is_empty(), "{SOURCE} no longer has one deposit and a borrow: put another obligation in SOURCE");
+    let deposit_reserves: Vec<Reserve> = deposits.iter().map(|r| reserve(name, r)).collect();
+    let borrow_reserves: Vec<Reserve> = borrows.iter().map(|r| reserve(name, r)).collect();
+    let held: Vec<&Reserve> = deposit_reserves.iter().chain(&borrow_reserves).collect();
+    let d = &deposit_reserves[0];
+    let b = borrow_reserves.iter().filter(|r| r.token_program == k(TOKEN_PROGRAM)).max_by_key(|r| r.farm_debt != [0; 32]).expect("a borrow of a Token program mint");
+    let b_unit = 10u64.pow(b.decimals as u32);
+    let wallet_b = k(ok(&["set", name, "token", &wallet.address(), &b58(&b.mint), "10"])["tokenAccount"].as_str().unwrap());
+    // Every reserve the obligation holds, the borrowed one last, then the obligation, then a borrow of 2 tokens.
+    let borrow_2 = || {
+        let mut ixs: Vec<Instruction> = held.iter().filter(|r| r.address != b.address).map(|r| refresh_reserve(r)).collect();
+        ixs.push(refresh_reserve(b));
+        ixs.push(refresh_obligation(&market, &copy, &held));
+        ixs.push(borrow(&wallet.public, &copy, b, &wallet_b, 2 * b_unit));
+        ixs
+    };
+
+    // What the commands refuse.
+    fails(&["set", name, "scope", "price", &b58(&copy), "1"], 2, "usage");
+    fails(&["set", name, "scope", "price", &b58(&d.address), "0"], 2, "usage");
+    fails(&["set", name, "scope", "refresh", &wallet.address()], 2, "usage");
+
+    // 1. A day later Kamino finds its prices too old, and a borrow fails with ReserveStale (6009).
+    let moved = ok(&["time", name, "--advance", "86400"]);
+    let ixs = borrow_2();
+    let (err, logs) = send(name, &wallet, &ixs);
+    eprintln!("borrow a day later: {err} {:#?}", kamino_logs(&logs).iter().filter(|l| !l.contains("Instruction: Refresh")).collect::<Vec<_>>());
+    assert_eq!(err, json!({ "InstructionError": [ixs.len() - 1, { "Custom": 6009 }] }), "{logs:#?}");
+    assert!(logs.iter().any(|l| l.contains("PriceTooOld")), "{logs:#?}");
+    assert_eq!(token_balance(name, &b58(&wallet_b)), 10 * b_unit);
+
+    // set scope refresh stamps the entries of the obligation's reserves with the clock and keeps each value.
+    let prices_before: Vec<Vec<u8>> = held.iter().map(|r| account(name, &r.oracles[3])).collect();
+    let refreshed = ok(&["set", name, "scope", "refresh", &b58(&copy)]);
+    eprintln!("scope refresh: {refreshed}");
+    let entries = refreshed["entries"].as_array().unwrap();
+    assert_eq!((entries.len(), refreshed["reserves"].as_array().unwrap().len(), refreshed["notScope"].clone()), (2 * held.len(), held.len(), json!([])));
+    let now = refreshed["timestamp"].as_u64().unwrap();
+    assert!(now >= moved["timestamp"].as_u64().unwrap(), "{refreshed}");
+    for e in entries {
+        assert_eq!((e["timestamp"].as_u64(), e["price"].clone()), (Some(now), e["previousPrice"].clone()), "{e}");
+        assert!(e["previousTimestamp"].as_u64().unwrap() + 86400 <= now, "{e}");
+    }
+    // Read back through raw calls: an entry is 56 bytes from byte 40, and only the slot and the time of the named entries changed.
+    for (r, before) in held.iter().zip(&prices_before) {
+        let after = account(name, &r.oracles[3]);
+        let named: Vec<usize> = entries.iter().filter(|e| e["prices"] == b58(&r.oracles[3]).as_str()).map(|e| 40 + 56 * e["index"].as_u64().unwrap() as usize).collect();
+        assert!(!named.is_empty() && changed_ranges(before, &after).iter().all(|c| named.iter().any(|at| at + 16 <= c[0] && c[1] <= at + 32)), "{:?} {named:?}", changed_ranges(before, &after));
+        assert!(named.iter().all(|at| u64_at(&after, at + 24) == now && u64_at(&after, *at) == u64_at(before, *at)));
+    }
+
+    // The same borrow passes now.
+    let (err, logs) = send(name, &wallet, &borrow_2());
+    eprintln!("borrow after scope refresh: {err} {:#?}", kamino_logs(&logs).iter().filter(|l| !l.contains("Instruction: Refresh")).collect::<Vec<_>>());
+    assert!(err.is_null(), "borrow failed after set scope refresh: {err} {logs:#?}");
+    assert!(!logs.iter().any(|l| l.contains("PriceTooOld")), "{logs:#?}");
+    assert_eq!(token_balance(name, &b58(&wallet_b)), 12 * b_unit);
+
+    // 2. The position is healthy: its debt is under the value at which Kamino calls it unhealthy.
+    let (debt, unhealthy) = debt_and_unhealthy(&account(name, &copy));
+    eprintln!("healthy: debt {debt:.4} USD, unhealthy from {unhealthy:.4} USD");
+    assert!(debt > 0.0 && debt < unhealthy);
+    // A lower collateral price moves that value under the debt. The one deposit carries it, so it scales with the price.
+    let d_bytes = account(name, &d.address);
+    let old_price = sf_at(&d_bytes, 248);
+    let new_price = format!("{:.6}", old_price * debt / unhealthy * 0.9);
+    let set = ok(&["set", name, "scope", "price", &b58(&d.address), &new_price]);
+    eprintln!("scope price: {set}");
+    assert_eq!((set["price"].as_str().map(|p| p.parse::<f64>().unwrap()), set["entries"].as_array().unwrap().len()), (Some(new_price.parse::<f64>().unwrap()), 2));
+    assert!(set["withinHeuristic"] == true, "the price {new_price} is outside the reserve's heuristic, so Kamino would refuse it: {set}");
+    assert!(set["entries"].as_array().unwrap().iter().all(|e| e["timestamp"] == set["timestamp"] && e["prices"] == b58(&d.oracles[3]).as_str()), "{set}");
+    // Kamino's own refresh now reports the position as unhealthy, in its account fields and its log.
+    let mut ixs: Vec<Instruction> = held.iter().map(|r| refresh_reserve(r)).collect();
+    ixs.push(refresh_obligation(&market, &copy, &held));
+    let (err, logs) = send(name, &wallet, &ixs);
+    assert!(err.is_null(), "refresh failed at the lower price: {err} {logs:#?}");
+    eprintln!("refresh at the lower price: {:#?}", valuation(&logs));
+    let market_price = sf_at(&account(name, &d.address), 248);
+    assert!((market_price - new_price.parse::<f64>().unwrap()).abs() < 1e-5, "the reserve's market price is {market_price}, not {new_price}");
+    let (debt, unhealthy) = debt_and_unhealthy(&account(name, &copy));
+    eprintln!("unhealthy: debt {debt:.4} USD, unhealthy from {unhealthy:.4} USD, collateral price {old_price:.6} -> {market_price:.6}");
+    assert!(debt > unhealthy && unhealthy > 0.0);
+    // And Kamino refuses a further borrow on it.
+    let ixs = borrow_2();
+    let (err, logs) = send(name, &wallet, &ixs);
+    eprintln!("borrow on the unhealthy position: {err} {:#?}", kamino_logs(&logs).iter().filter(|l| !l.contains("Instruction: Refresh")).collect::<Vec<_>>());
+    assert!(err["InstructionError"][0] == json!(ixs.len() - 1), "the unhealthy position borrowed: {err}");
+    assert_eq!(token_balance(name, &b58(&wallet_b)), 12 * b_unit);
+
+    let status = ok(&["status", name]);
+    let kinds: Vec<&str> = status["modifications"].as_array().unwrap().iter().map(|e| e["kind"].as_str().unwrap()).collect();
+    for kind in ["mirror-kamino", "time", "scope-refresh", "scope-price"] {
+        assert!(kinds.contains(&kind), "no {kind} in {kinds:?}");
+    }
 
     assert_eq!(ok(&["down", name])["removed"], true);
     assert_gone(name);
