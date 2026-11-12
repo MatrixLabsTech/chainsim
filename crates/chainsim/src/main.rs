@@ -129,7 +129,7 @@ enum Command {
         /// The Unix time in seconds to move to, or with --replay the end of the range.
         #[arg(long)]
         to: Option<String>,
-        /// HyperEVM: replay this perp's hourly mainnet candles (BTC, ETH...) as its price path.
+        /// HyperEVM: replay this perp's hourly mainnet candles (BTC, ETH...) as its price path. Solana: replay a Pyth feed's past prices (SOL/USD...), a step a minute.
         #[arg(long, requires_all = ["from", "to"])]
         replay: Option<String>,
         /// With --replay: the start of the range (Unix seconds, YYYY-MM-DD or YYYY-MM-DDTHH:MMZ).
@@ -217,6 +217,15 @@ enum SetWhat {
         /// Copy the upstream's answer to this query.
         #[arg(long)]
         live: bool,
+    },
+    /// A Pyth price feed's price on a Solana fork, in USD, published at the fork's clock.
+    Price {
+        /// The feed, such as SOL/USD, or the address of a Pyth price account.
+        feed: String,
+        price: String,
+        /// The confidence interval in USD (default: the account keeps its own).
+        #[arg(long)]
+        conf: Option<String>,
     },
     /// Common HyperCore answers (HyperEVM), encoded for you.
     Hypercore {
@@ -345,6 +354,17 @@ async fn solana_adapter(name: &str) -> Result<SolanaAdapter> {
     SolanaAdapter::connect().await
 }
 
+/// `set price`: a Pyth price account on a Solana fork.
+async fn set_price(name: &str, feed: &str, price: &str, conf: Option<&str>) -> Result<Value> {
+    let docker = Docker::connect().await?;
+    let handle = docker.find(name).await?.ok_or_else(|| Error::fork_not_found(name))?;
+    let profile = profile::get(&handle.chain)?;
+    if profile.family != "solana" {
+        return Err(Error::unsupported(&format!("set price on {}", profile.key), "set price writes a Pyth price account on a Solana fork"));
+    }
+    chainsim_solana::price::set_price(&SolanaAdapter::connect().await?, name, feed, price, conf).await
+}
+
 /// The adapter for a profile family.
 async fn adapter(family: &str) -> Result<Box<dyn Adapter>> {
     match family {
@@ -412,8 +432,8 @@ fn describe(chain: Option<&str>) -> Result<Value> {
             "revert <name> <id>",
             "call <name> <method> [<params-json>] [--from <address>]  (HyperEVM: call <name> corewriter_actions [{\"fromBlock\": <n>}])",
             "send <name> --as <address> --to <address> (--sig \"<fn(types)>\" [<arg>...] | --data <hex>) [--value <amount>]  (Solana: send <name> --as <address> (--to <receiver> --value <amount> | --data <base64 transaction>))",
-            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type|symbol|mint> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex> | precompile <address> <calldata hex> (--result <hex> | --live) | hypercore (price <perp> <px> | price <spot pair> <px> --spot | isolated-margin <user> <perp> <+usd|-usd> | spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>] | position <user> <perp> <szi> <entryNtl> [--leverage <n>] [--isolated-raw-usd <n>] [--isolated] | book <coin> --live | mirror <user> | funding <perp> <rate> | big-blocks <user> on|off) | mirror kamino <obligation> --to <test wallet>  (Solana)",
-            "time <name> (--advance <seconds> | --to <unix seconds> | --replay <perp> --from <time> --to <time>)",
+            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type|symbol|mint> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex> | precompile <address> <calldata hex> (--result <hex> | --live) | price <feed|price account> <usd> [--conf <usd>] | hypercore (price <perp> <px> | price <spot pair> <px> --spot | isolated-margin <user> <perp> <+usd|-usd> | spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>] | position <user> <perp> <szi> <entryNtl> [--leverage <n>] [--isolated-raw-usd <n>] [--isolated] | book <coin> --live | mirror <user> | funding <perp> <rate> | big-blocks <user> on|off) | mirror kamino <obligation> --to <test wallet>  (Solana)",
+            "time <name> (--advance <seconds> | --to <unix seconds> | --replay <perp> --from <time> --to <time>)  (Solana: --replay <feed> --from <time> --to <time>, such as SOL/USD)",
             "mine <name> [--blocks <n>]",
             "selftest <name>",
             "pull [<engine>]",
@@ -594,6 +614,7 @@ async fn run(command: Command) -> Result<Value> {
                 SetWhat::Precompile { address, calldata, result, live: _ } => SetRequest { kind: SetKind::Precompile { calldata, result }, address, value: String::new() },
                 SetWhat::Hypercore { what } => return set_hypercore(&name, what).await,
                 SetWhat::Mirror { what: MirrorWhat::Kamino { obligation, to } } => return chainsim_solana::mirror::kamino(&solana_adapter(&name).await?, &name, &obligation, &to).await,
+                SetWhat::Price { feed, price, conf } => return set_price(&name, &feed, &price, conf.as_deref()).await,
             };
             adapter_of(&name).await?.set(&name, &req).await
         }
@@ -624,10 +645,12 @@ async fn run(command: Command) -> Result<Value> {
                 use chainsim_evm::parse_time;
                 let docker = Docker::connect().await?;
                 let handle = docker.find(&name).await?.ok_or_else(|| Error::fork_not_found(&name))?;
-                if profile::get(&handle.chain)?.family != "evm" {
-                    return Err(Error::unsupported(&format!("time --replay on {}", handle.chain), "chainsim time <name> --advance <seconds> moves the clock"));
-                }
-                return EvmAdapter::connect().await?.replay(&name, coin, parse_time(from)?, parse_time(to)?).await;
+                return match profile::get(&handle.chain)?.family.as_str() {
+                    "evm" => EvmAdapter::connect().await?.replay(&name, coin, parse_time(from)?, parse_time(to)?).await,
+                    // On Solana the name is a Pyth price feed, such as SOL/USD.
+                    "solana" => chainsim_solana::replay::replay(&SolanaAdapter::connect().await?, &name, coin, parse_time(from)?, parse_time(to)?).await,
+                    _ => Err(Error::unsupported(&format!("time --replay on {}", handle.chain), "chainsim time <name> --advance <seconds> moves the clock")),
+                };
             }
             let req = match (advance, to) {
                 (Some(secs), None) => TimeRequest::Advance(secs),

@@ -82,7 +82,7 @@ fn features(p: &Profile) -> Value {
         "hypercoreState": core && has("call"),
         "snapshotRevert": has("snapshot") && has("revert"),
         "time": has("time"),
-        "timeReplay": core && has("time"),
+        "timeReplay": (core || p.family == "solana") && has("time"),
         "mine": has("mine"),
         "call": has("call"),
         "selftest": has("selftest"),
@@ -166,9 +166,11 @@ mod tests {
             let want = c["chain"] == "hyperevm-mainnet" || c["chain"] == "hyperevm-testnet";
             assert_eq!(c["features"]["set"]["precompile"], json!(want), "{}", c["chain"]);
             assert_eq!(c["features"]["set"]["hypercore"], json!(want), "{}", c["chain"]);
-            for k in ["hypercoreBook", "hypercoreMirror", "hypercoreFunding", "hypercoreBigBlocks", "hypercoreSpotPrice", "hypercoreIsolatedMargin", "hypercoreState", "infoApi", "timeReplay"] {
+            for k in ["hypercoreBook", "hypercoreMirror", "hypercoreFunding", "hypercoreBigBlocks", "hypercoreSpotPrice", "hypercoreIsolatedMargin", "hypercoreState", "infoApi"] {
                 assert_eq!(c["features"][k], json!(want), "{k} on {}", c["chain"]);
             }
+            // A replay plays perp candles on HyperEVM and a Pyth feed's prices on Solana.
+            assert_eq!(c["features"]["timeReplay"], json!(want || c["chain"] == "solana-mainnet"), "timeReplay on {}", c["chain"]);
         }
         assert_eq!(chain(&d, "robinhood-mainnet")["engine"], "Foundry anvil v1.8.5");
     }

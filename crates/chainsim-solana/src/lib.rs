@@ -3,6 +3,8 @@
 
 pub mod fund;
 pub mod mirror;
+pub mod price;
+pub mod replay;
 pub mod rpc;
 pub mod send;
 pub mod snapshot;
