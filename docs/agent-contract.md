@@ -68,7 +68,10 @@ error codes from the binary.
   Token-2022 mint. `send --as <address>` takes `--to <receiver> --value <SOL>` for a transfer, or
   `--data <base64 transaction>` for a transaction built by any SDK, and returns `status`,
   `signature`, `slot`, `err` and `logs`. `time` and `mine` return the slot read at processed
-  commitment. `up --block` exits 3, since the engine has no pinned fork point.
+  commitment. `up --block` exits 3, since the engine has no pinned fork point. `set <name> price
+  <feed> <usd> [--conf <usd>]` writes a Pyth price account with a publish time equal to the
+  fork's Clock, and `time <name> --replay <feed> --from <time> --to <time>` plays a past range
+  of real prices, one step a minute, and returns each step under `applied`.
 - On HyperEVM, the `fork` object carries a `hypercore` field: the HyperCore answers `up` seeded
   and, under `core`, the order books it took. In `status` it adds `coreWriterActions`, the count
   of captured CoreWriter actions, and `coreState`. Other chains' fork objects have no such field.

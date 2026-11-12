@@ -41,7 +41,9 @@ Work through these steps in order. Each ends on a check you can make.
    `address::module::function<T...>` with `<type>:<value>` arguments on Aptos. On Solana, `send
    <name> --as <address> --to <receiver> --value <SOL>` transfers SOL, and `send <name> --as
    <address> --data <base64 transaction>` sends a transaction built by any SDK, unsigned, with
-   that address as a required signer. To change state
+   that address as a required signer. After `time` moves a Solana fork's clock, `set <name> price
+   SOL/USD <usd>` gives a Pyth price feed a price that programs accept at the new time, and `time
+   <name> --replay SOL/USD --from <time> --to <time>` plays a past range of real prices. To change state
    directly, run `chainsim set <name> balance|token|owner|object|resource|storage|code ...`. On
    HyperEVM, `set <name> hypercore price|spot-balance|position ...` and `set <name> precompile`
    set what contracts read from HyperCore, `set <name> hypercore mirror <user>` copies a mainnet
