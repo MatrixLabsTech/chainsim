@@ -90,6 +90,28 @@
         }
       }
     },
+    "aptos-rest": {
+      "name": "chainsim Aptos REST endpoint",
+      "version": "0.1.12-5871e5aacfcb",
+      "user": "10001:10001",
+      "build": {
+        "image": "chainsim/aptos-rest:0.1.12-5871e5aacfcb",
+        "context": "aptos-rest",
+        "base": "debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3",
+        "tarballs": {
+          "amd64": {
+            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/aptos-rest-0.1.12-5871e5aacfcb/aptos-rest-0.1.12-5871e5aacfcb-linux-amd64.tar.gz",
+            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/aptos-rest-0.1.12-5871e5aacfcb/aptos-rest-0.1.12-5871e5aacfcb-linux-amd64.tar.gz.sha256",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          },
+          "arm64": {
+            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/aptos-rest-0.1.12-5871e5aacfcb/aptos-rest-0.1.12-5871e5aacfcb-linux-arm64.tar.gz",
+            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/aptos-rest-0.1.12-5871e5aacfcb/aptos-rest-0.1.12-5871e5aacfcb-linux-arm64.tar.gz.sha256",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        }
+      }
+    },
     "control-grpcurl": {
       "name": "grpcurl",
       "version": "1.9.3",

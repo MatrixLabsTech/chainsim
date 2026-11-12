@@ -402,6 +402,8 @@ async fn ls() -> Result<Value> {
     let mut out = Vec::new();
     for h in docker.forks().await? {
         let mut v = match profile::get(&h.chain) {
+            // An Aptos fork's rpcUrl is its REST endpoint, which the adapter adds.
+            Ok(p) if p.family == "aptos" => serde_json::to_value(chainsim_aptos::with_endpoint(h.fork(&p, None))).unwrap_or(Value::Null),
             Ok(p) => serde_json::to_value(h.fork(&p, None)).unwrap_or(Value::Null),
             Err(_) => json!({ "name": h.name, "chain": h.chain }),
         };
@@ -418,6 +420,10 @@ async fn pull(only: Option<&str>) -> Result<Value> {
         return Err(Error::new(ErrorCode::Usage, format!("no engine {id} in the lock")).next("chainsim engines"));
     }
     let docker = Docker::connect().await?;
+    if only == Some(chainsim_aptos::REST_ENGINE) {
+        // Its image copies the CLI from the Aptos CLI engine's image, so that one comes first.
+        docker.pull_engine(chainsim_aptos::CLI_ENGINE, lock.engine(chainsim_aptos::CLI_ENGINE)?).await?;
+    }
     let mut done = Vec::new();
     let mut failed = Vec::new();
     for (id, engine) in lock.engines.iter().filter(|(id, _)| only.is_none_or(|o| o == id.as_str())) {

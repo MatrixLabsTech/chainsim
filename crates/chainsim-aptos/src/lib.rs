@@ -1,10 +1,13 @@
 //! The Aptos adapter (experimental): Aptos CLI transaction simulation
 //! sessions (`aptos move sim`), driven from outside through Docker exec
-//! (design addendum 2026-11-01). The engine container idles; every operation
-//! is one CLI call on the session directory in the fork volume, serialized
-//! with `flock`, because each call loads and rewrites the session files. The
-//! session serves no RPC, so the fork object's `rpcUrl` is null.
+//! (design addendum 2026-11-01). Every operation is one CLI call on the
+//! session directory in the fork volume, serialized with `flock`, because
+//! each call loads and rewrites the session files. The engine container's
+//! main process is the REST endpoint ([`rest`]), which answers the fullnode
+//! REST paths from the same session, so the fork object's `rpcUrl` is the
+//! endpoint.
 
+pub mod rest;
 pub mod state;
 pub mod units;
 
@@ -40,16 +43,32 @@ pub const OPERATIONS: &[&str] = &["describe", "up", "down", "ls", "status", "fun
 /// passed to the CLI as `--api-key` and never printed.
 pub const API_KEY_ENV: &str = "CHAINSIM_APTOS_API_KEY";
 /// The same key inside the engine and sidecar environments.
-const KEY_ENV: &str = "CHAINSIM_API_KEY";
+pub(crate) const KEY_ENV: &str = "CHAINSIM_API_KEY";
+
+/// The engine of the REST endpoint. Its image is the profile engine's image,
+/// the Aptos CLI, with the endpoint's binary and curl. Both of a fork's
+/// containers run it: the engine container serves the endpoint, and the
+/// profile names it as the control sidecar's image for its curl.
+pub const REST_ENGINE: &str = "aptos-rest";
+/// The engine that pins the Aptos CLI: the profile's engine.
+pub const CLI_ENGINE: &str = "aptos-cli";
+/// The endpoint's port in the engine container.
+pub const REST_PORT: u16 = 8080;
+
+/// The fork object with the REST endpoint as its `rpcUrl`.
+pub fn with_endpoint(mut fork: Fork) -> Fork {
+    fork.rpc_url = Some(format!("http://{}:{REST_PORT}", fork.alias));
+    fork
+}
 
 /// The fork volume: the session, its snapshots, the lock and the control key.
 const DATA: &str = "/data";
-const SESSION: &str = "/data/session";
+pub(crate) const SESSION: &str = "/data/session";
 const SNAP: &str = "/data/snap";
-const LOCK: &str = "/data/lock";
-const PATCH: &str = "/data/patch";
+pub(crate) const LOCK: &str = "/data/lock";
+pub(crate) const PATCH: &str = "/data/patch";
 /// The fork's control key: a fresh test key, written to the fork volume at `up`.
-const KEY: &str = "/data/key";
+pub(crate) const KEY: &str = "/data/key";
 
 const APT_DECIMALS: u8 = 8;
 const OCTAS: u64 = 100_000_000;
@@ -57,9 +76,9 @@ const OCTAS: u64 = 100_000_000;
 const GAS_FLOOR: u64 = OCTAS / 10;
 const GAS_TOP_UP: u64 = OCTAS;
 const MAX_MINE: u64 = 100;
-const ACCOUNT: &str = "0x1::account::Account";
+pub(crate) const ACCOUNT: &str = "0x1::account::Account";
 const FA_METADATA: &str = "0x1::fungible_asset::Metadata";
-const OBJECT_GROUP: &str = "0x1::object::ObjectGroup";
+pub(crate) const OBJECT_GROUP: &str = "0x1::object::ObjectGroup";
 
 /// A throwaway receiver for the selftest transfer, never active on mainnet.
 const ST_RECEIVER: &str = "0xc5e2";
@@ -189,7 +208,7 @@ pub fn init_script() -> String {
 
 /// One GET to the upstream REST API from the control sidecar, with the API
 /// key as a bearer token when set. The URL and key never leave the sidecar.
-fn upstream_get_script() -> String {
+pub(crate) fn upstream_get_script() -> String {
     format!("exec curl -sS --max-time 30 -w '\\n@@chainsim-http-status@@%{{http_code}}' ${{{KEY_ENV}:+-H \"Authorization: Bearer ${KEY_ENV}\"}} \"${{{UPSTREAM_ENV}%/}}$1\"")
 }
 
@@ -390,6 +409,16 @@ impl Session<'_> {
         Ok(tx)
     }
 
+    /// One GET to the fork's REST endpoint from the control sidecar, on the fork network.
+    async fn rest_get(&self, path: &str) -> Result<Value> {
+        let argv = ["curl", "-sS", "--max-time", "30", &format!("http://{}:{REST_PORT}/v1{path}", self.engine)].map(String::from).to_vec();
+        let out = self.docker.exec(&self.control.container, &argv).await?;
+        if out.exit_code != 0 {
+            return Err(Error::new(ErrorCode::EngineFailed, format!("the REST endpoint did not answer (curl exit {})", out.exit_code)));
+        }
+        serde_json::from_str(&out.stdout).map_err(|_| Error::new(ErrorCode::EngineFailed, "the REST endpoint answered something that is not JSON"))
+    }
+
     /// One GET to the upstream REST API through the control sidecar: the HTTP status and body.
     async fn upstream_get(&self, path: &str) -> Result<(u16, Value)> {
         const MARK: &str = "\n@@chainsim-http-status@@";
@@ -474,6 +503,14 @@ impl AptosAdapter {
         };
         let alias = req.alias.clone().unwrap_or_else(|| name.clone());
 
+        let engine = self.lock.engine(&profile.engine)?;
+        let rest = self.lock.engine(REST_ENGINE)?;
+        if !self.docker.image_exists(&rest.reference()).await? {
+            // The endpoint's image copies the CLI from the CLI engine's image.
+            self.docker.ensure_engine(&profile.engine, engine).await?;
+        }
+        let image = self.docker.ensure_engine(REST_ENGINE, rest).await?;
+
         // The control sidecar: curl with the upstream URL and API key in its
         // environment only. It reads the ledger head and keeps the modification log.
         let control_engine = self.lock.engine(profile.control_engine())?;
@@ -514,8 +551,6 @@ impl AptosAdapter {
             return Err(Error::new(ErrorCode::UpstreamUnavailable, format!("the upstream keeps versions from {oldest} only, so version {version} is pruned")).next(archive_next(&profile.upstream.env)));
         }
 
-        let engine = self.lock.engine(&profile.engine)?;
-        let image = self.docker.ensure_engine(&profile.engine, engine).await?;
         let owner = engine.user.clone().ok_or_else(|| Error::new(ErrorCode::Internal, format!("{} names no uid:gid user in the lock", profile.engine)))?;
         self.docker.ensure_volume_owned(&self.lock, &data_volume(name), name, &owner).await?;
         let labels = HashMap::from([
@@ -533,15 +568,16 @@ impl AptosAdapter {
                 name: docker::engine_container(name),
                 image,
                 user: Some(owner),
-                entrypoint: Some(vec!["sleep".into()]),
-                cmd: vec!["infinity".into()],
-                env: engine_env(&upstream, api_key.as_deref()),
+                // The image's entrypoint is the REST endpoint.
+                entrypoint: None,
+                cmd: vec![],
+                env: [engine_env(&upstream, api_key.as_deref()), vec![format!("{}=0.0.0.0:{REST_PORT}", rest::LISTEN_ENV)]].concat(),
                 labels,
                 network: network.clone(),
                 aliases: vec![alias.clone()],
                 tmpfs: vec![("/tmp".into(), "rw,nosuid,size=64m".into())],
                 memory: docker::ENGINE_MEMORY,
-                publish: None,
+                publish: req.publish.then_some(REST_PORT),
                 mounts: vec![(data_volume(name), DATA.into())],
             })
             .await?;
@@ -555,8 +591,13 @@ impl AptosAdapter {
         if u64_value(&chain["id"]) != chain_number(&profile.id) {
             return Err(Error::new(ErrorCode::EngineFailed, format!("the session reads chain id {} instead of {}", chain["id"], profile.id)));
         }
+        // The endpoint answers from the session, so it is ready once the session is.
+        let ledger = s.rest_get("").await?;
+        if u64_value(&ledger["chain_id"]) != chain_number(&profile.id) {
+            return Err(Error::new(ErrorCode::EngineFailed, "the REST endpoint did not return the fork's ledger info"));
+        }
         let handle = self.docker.find(name).await?.ok_or_else(|| Error::new(ErrorCode::EngineFailed, "the engine container vanished after start"))?;
-        Ok(handle.fork(profile, None))
+        Ok(with_endpoint(handle.fork(profile, None)))
     }
 
     async fn checks(&self, handle: &ForkHandle, profile: &Profile, s: &Session<'_>) -> Vec<Check> {
@@ -566,7 +607,11 @@ impl AptosAdapter {
         let chain = s.resource("0x1", "0x1::chain_id::ChainId").await;
         let ok = chain.as_ref().is_ok_and(|c| u64_value(&c["id"]) == chain_number(&profile.id));
         parts.push(Check { part: "chain-id", ok, reason: if ok { "0x1::chain_id::ChainId reads the profile's chain id at the fork version" } else { "0x1::chain_id::ChainId did not read the profile's chain id" }, ms: ms(t) });
-        let _ = handle;
+
+        let t = Instant::now();
+        let ledger = s.rest_get("").await;
+        let ok = ledger.as_ref().is_ok_and(|l| u64_value(&l["chain_id"]) == chain_number(&profile.id) && u64_value(&l["oldest_ledger_version"]) == Some(handle.fork_point.number));
+        parts.push(Check { part: "rest", ok, reason: if ok { "the REST endpoint returned ledger info with the profile's chain id and the fork version" } else { "the REST endpoint did not return ledger info with the profile's chain id and the fork version" }, ms: ms(t) });
 
         let control = s.control_address().await.ok();
         let t = Instant::now();
@@ -629,9 +674,6 @@ impl Adapter for AptosAdapter {
 
     async fn up(&self, profile: &Profile, req: &UpRequest) -> Result<Fork> {
         docker::check_name(&req.name)?;
-        if req.publish {
-            return Err(Error::unsupported("up --publish on Aptos", "the session engine serves no RPC to publish: read the copy with chainsim call <name> view|resource|ledger"));
-        }
         if let Some(h) = self.docker.find(&req.name).await? {
             let taken = |why: String| Error::new(ErrorCode::NameConflict, format!("fork {} already runs {why}", req.name)).next(format!("chainsim down {} first, or pick another --name", req.name));
             if h.chain != profile.key {
@@ -644,7 +686,7 @@ impl Adapter for AptosAdapter {
                 return Err(taken(format!("on network {} as {}", h.network, h.alias)));
             }
             if h.running && self.docker.is_running(&h.control_container).await {
-                return Ok(h.fork(profile, None));
+                return Ok(with_endpoint(h.fork(profile, None)));
             }
             self.docker.remove_fork(&req.name).await?;
         }
@@ -666,7 +708,7 @@ impl Adapter for AptosAdapter {
     async fn status(&self, name: &str) -> Result<Status> {
         let (handle, profile) = self.open(name).await?;
         let head = self.session(name, &profile).block_height().await?;
-        Ok(Status { fork: handle.fork(&profile, None), head, uptime_secs: handle.uptime_secs })
+        Ok(Status { fork: with_endpoint(handle.fork(&profile, None)), head, uptime_secs: handle.uptime_secs })
     }
 
     async fn fund(&self, name: &str, req: &FundRequest) -> Result<Funded> {
@@ -1030,11 +1072,20 @@ mod tests {
     #[test]
     fn the_profile_matches_the_lock_and_the_design() {
         let p = profile::get("aptos-mainnet").unwrap();
-        assert_eq!((p.id.as_str(), p.family.as_str(), p.engine.as_str()), ("aptos:1", "aptos", "aptos-cli"));
+        assert_eq!((p.id.as_str(), p.family.as_str(), p.engine.as_str()), ("aptos:1", "aptos", CLI_ENGINE));
+        // The endpoint's port is the adapter's, and the control sidecar runs the endpoint's image.
         assert!(p.ports.rpc.is_none());
+        assert_eq!(p.control_engine(), REST_ENGINE);
         let lock = EngineLock::embedded().unwrap();
-        let e = lock.engine("aptos-cli").unwrap();
+        let e = lock.engine(CLI_ENGINE).unwrap();
         assert_eq!(e.version, "9.6.0");
+        // The endpoint's Dockerfiles copy the CLI from the image the lock builds for it.
+        let cli_image = &e.build.as_ref().unwrap().image;
+        assert!(lock.engine(REST_ENGINE).unwrap().build.as_ref().is_some_and(|b| b.context == REST_ENGINE));
+        for file in ["Dockerfile", "build.Dockerfile"] {
+            let text = std::fs::read_to_string(format!("{}/../../engines/{REST_ENGINE}/{file}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+            assert!(text.contains(&format!("ARG CLI={cli_image}\n")), "engines/{REST_ENGINE}/{file} does not copy the CLI from {cli_image}");
+        }
         let user = e.user.as_deref().unwrap();
         assert!(user.split_once(':').is_some_and(|(u, g)| u.parse::<u32>().is_ok() && g.parse::<u32>().is_ok()), "the volume owner needs uid:gid");
         let usdc = p.token("USDC").unwrap();
