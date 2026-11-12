@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use chainsim_core::control::{Control, Target};
+use chainsim_core::control::{classify_rpc_error, Control, Target};
 use chainsim_core::{Error, ErrorCode, Result};
 use serde_json::{json, Value};
 
@@ -23,12 +23,24 @@ pub struct Rpc<'a> {
 impl Rpc<'_> {
     /// One call to the engine.
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
-        self.control.rpc(&self.url, method, params, CALL_TIMEOUT).await
+        self.call_timeout(method, params, CALL_TIMEOUT).await
     }
 
     /// One call to the engine with its own timeout, for readiness probes.
     pub async fn call_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
-        self.control.rpc(&self.url, method, params, timeout).await
+        self.control.rpc(&self.url, method, params, timeout).await.map_err(|e| self.engine_error(method, e))
+    }
+
+    /// Removes a provider URL from the error data the engine sent, then
+    /// gives an upstream failure its own code.
+    fn engine_error(&self, method: &str, mut e: Error) -> Error {
+        let Some(data) = e.data.as_ref().and_then(|d| d.get("rpcData")).cloned() else { return e };
+        let data = match data {
+            Value::String(s) => Value::String(self.control.scrub(&s)),
+            other => serde_json::from_str(&self.control.scrub_secret(&other.to_string())).unwrap_or(Value::Null),
+        };
+        e.data = Some(json!({ "rpcData": data }));
+        reclassify(method, e, self.control.env.as_deref())
     }
 
     /// One call to the upstream RPC.
@@ -70,4 +82,49 @@ pub fn processed() -> Value {
 
 fn unexpected(method: &str, v: &Value) -> Error {
     Error::new(ErrorCode::RpcError, format!("{method} answered {v}"))
+}
+
+/// The engine answers a failed upstream read with "Internal error" and the
+/// cause as text in the error data, so the cause decides the code: a
+/// throttled or unreachable upstream is exit 5, anything else stays an RPC error.
+pub fn reclassify(method: &str, e: Error, env: Option<&str>) -> Error {
+    if e.code != ErrorCode::RpcError {
+        return e;
+    }
+    match e.data.as_ref().and_then(|d| d["rpcData"].as_str()) {
+        Some(cause) => {
+            let by_cause = classify_rpc_error(method, cause, None, env);
+            if by_cause.code == ErrorCode::RpcError {
+                e
+            } else {
+                by_cause
+            }
+        }
+        None => e,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn internal(data: Value) -> Error {
+        Error::new(ErrorCode::RpcError, "m: Internal error (-32603)").data(json!({ "rpcData": data }))
+    }
+
+    #[test]
+    fn an_upstream_failure_behind_an_internal_error_is_exit_5() {
+        let env = Some("CHAINSIM_SOLANA_MAINNET_RPC");
+        let throttled = reclassify("m", internal(json!("Failed to get largest token accounts for mint X: HTTP status client error (429 Too Many Requests)")), env);
+        assert_eq!((throttled.code, throttled.code.exit_code()), (ErrorCode::RateLimited, 5));
+        assert!(throttled.next.as_deref().is_some_and(|n| n.contains("CHAINSIM_SOLANA_MAINNET_RPC")));
+        // The engine's own refusals stay RPC errors with their data.
+        let past = reclassify("m", internal(json!("Cannot travel to past slot: target=1, current=2")), env);
+        assert_eq!(past.code, ErrorCode::RpcError);
+        assert_eq!(past.data, Some(json!({ "rpcData": "Cannot travel to past slot: target=1, current=2" })));
+        let structured = reclassify("m", internal(json!({ "err": "AccountNotFound", "logs": [] })), env);
+        assert_eq!(structured.code, ErrorCode::RpcError);
+        let plain = reclassify("m", Error::new(ErrorCode::RpcError, "m: Method not found (-32601)"), env);
+        assert!(plain.code == ErrorCode::RpcError && plain.data.is_none());
+    }
 }
