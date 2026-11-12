@@ -3,7 +3,8 @@
 ## One engine per chain family
 
 EVM chains run Foundry's anvil, and Arc runs Circle's arc-foundry build of it. Sui runs
-chainsim's build of Mysten's `sui-fork`, with one patch (see [chains/sui](../chains/sui/README.md)). Each engine is a container.
+chainsim's build of Mysten's `sui-fork`, with one patch (see [chains/sui](../chains/sui/README.md)). Solana runs
+Surfpool (see [chains/solana](../chains/solana/README.md)). Each engine is a container.
 No engine is linked into the binary: chainsim drives Docker through its API.
 
 ## Two containers per fork

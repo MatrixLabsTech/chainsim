@@ -24,13 +24,15 @@ on every supported chain.
   <a href="chains/aptos/README.md"><img src="assets/chains/aptos.svg" height="48" alt="Aptos"></a>
   &nbsp;&nbsp;&nbsp;
   <a href="chains/hyperliquid/README.md"><img src="assets/chains/hyperliquid.svg" height="48" alt="Hyperliquid"></a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="chains/solana/README.md"><img src="assets/chains/solana.svg" height="48" alt="Solana"></a>
 </p>
 
 ## What it solves
 
 - Every chain family forks with a different engine: anvil for Ethereum, Arbitrum chains and
   HyperEVM, Circle's arc-foundry tarballs for Arc, Mysten's gRPC-only `sui-fork` for Sui, the
-  Aptos CLI's simulation sessions for Aptos. Each has its own flags, readiness signal and funding
+  Aptos CLI's simulation sessions for Aptos, Surfpool for Solana. Each has its own flags, readiness signal and funding
   method. chainsim pins each engine, pulls or builds it on first use, and puts all of them
   behind the same commands.
 - Testing admin-only paths of a deployed protocol normally needs keys nobody on the test team
@@ -48,7 +50,7 @@ on every supported chain.
 
 ## Features
 
-- One command set for Ethereum, Arc, Robinhood Chain, HyperEVM, Sui and Aptos mainnet forks,
+- One command set for Ethereum, Arc, Robinhood Chain, HyperEVM, Sui, Aptos and Solana mainnet forks,
   each running in Docker, with the same JSON envelope and exit codes on every chain.
 - `send --as` sends as any account without its key, including a protocol's admin. On Sui and
   Aptos, chainsim handles the Move authentication for you.
@@ -138,7 +140,7 @@ The full contract, with every error code, is in [docs/agent-contract.md](docs/ag
 | <img src="assets/chains/robinhood-chain.png" height="32" alt="Robinhood Chain"> &nbsp;**Robinhood Chain mainnet** `robinhood-mainnet` | Foundry anvil v1.8.5 with an ArbGasInfo mock | [chains/robinhood](chains/robinhood/README.md) |
 | <img src="assets/chains/sui.svg" height="32" alt="Sui"> &nbsp;**Sui mainnet** `sui-mainnet` | Mysten sui-fork mainnet-v1.82.3-de683df9e4e0, built with chainsim's SetObject patch | [chains/sui](chains/sui/README.md) |
 | <img src="assets/chains/aptos.svg" height="32" alt="Aptos"> &nbsp;**Aptos mainnet** `aptos-mainnet` | Aptos CLI 9.6.0 simulation sessions | [chains/aptos](chains/aptos/README.md) |
-| <img src="assets/chains/solana.svg" height="32" alt="Solana"> &nbsp;**Solana mainnet** `solana-mainnet` | Surfpool 1.7.0 | Experimental |
+| <img src="assets/chains/solana.svg" height="32" alt="Solana"> &nbsp;**Solana mainnet** `solana-mainnet` | Surfpool 1.7.0 | [chains/solana](chains/solana/README.md) |
 | <img src="assets/chains/hyperliquid.svg" height="32" alt="Hyperliquid"> &nbsp;**HyperEVM mainnet** `hyperevm-mainnet` | Foundry anvil v1.8.5 with HyperCore modeled on the copy | [chains/hyperliquid](chains/hyperliquid/README.md) |
 
 The chain logos are trademarks of their owners and identify the chains only.
@@ -150,6 +152,7 @@ What each chain adds:
 - [Robinhood Chain](chains/robinhood/README.md): Arbitrum's ArbSys and ArbGasInfo precompiles answer on the copy.
 - [Sui](chains/sui/README.md): `set object` changes any Move object's fields, and SUI and USDC funding takes seconds.
 - [Aptos](chains/aptos/README.md): a fullnode REST endpoint for the Aptos SDKs, entry functions as any account, APT and native USDC funding, and `set resource` for any Move resource.
+- [Solana](chains/solana/README.md): SOL, USDC and any SPL or Token-2022 token funded by mint, SOL transfers and SDK-built transactions sent as any account, and Surfpool's cheatcodes through `call`.
 - [HyperEVM](chains/hyperliquid/README.md): a local HyperCore, so CoreWriter orders fill against the mainnet book, prices, funding and liquidations can be scripted or replayed, and an RPC proxy serves any client and the `/info` API.
 
 Each chain page covers its engine, tokens, funding, `send` and `set` support, and selftest

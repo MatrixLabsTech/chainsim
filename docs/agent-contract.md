@@ -63,7 +63,12 @@ error codes from the binary.
   differs from the real chain, to copy into a report word for word.
 - The `fork` object's `rpcUrl` is the engine's in-network RPC URL. On Aptos it is the fork's
   REST endpoint, and `rpcUrl` plus `/v1` is the fullnode URL for an Aptos SDK. `forkPoint.kind`
-  is `block`, `checkpoint` (Sui) or `version` (Aptos).
+  is `block`, `checkpoint` (Sui), `version` (Aptos) or `slot` (Solana).
+- On Solana, `fund` and `set token` take a profile symbol or the address of a Token or
+  Token-2022 mint. `send --as <address>` takes `--to <receiver> --value <SOL>` for a transfer, or
+  `--data <base64 transaction>` for a transaction built by any SDK, and returns `status`,
+  `signature`, `slot`, `err` and `logs`. `time` and `mine` return the slot read at processed
+  commitment. `up --block` exits 3, since the engine has no pinned fork point.
 - On HyperEVM, the `fork` object carries a `hypercore` field: the HyperCore answers `up` seeded
   and, under `core`, the order books it took. In `status` it adds `coreWriterActions`, the count
   of captured CoreWriter actions, and `coreState`. Other chains' fork objects have no such field.
