@@ -81,6 +81,13 @@ fn u64_at(data: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
 }
 
+/// Two accounts of one length differ, and only inside `ranges`. A new key can
+/// share a byte with the key it replaced, so the differing bytes need not fill a range.
+fn differ_only_in(a: &[u8], b: &[u8], ranges: &[[usize; 2]]) -> bool {
+    let changed = changed_ranges(a, b);
+    a.len() == b.len() && !changed.is_empty() && changed.iter().all(|c| ranges.iter().any(|r| r[0] <= c[0] && c[1] <= r[1]))
+}
+
 /// An account's bytes on the fork, read through a raw call.
 fn account(name: &str, address: &Key) -> Vec<u8> {
     let v = call(name, "getAccountInfo", json!([b58(address), { "encoding": "base64", "commitment": "processed" }]));
@@ -395,7 +402,7 @@ fn solana_mirror_kamino() {
     assert_eq!(m["seeds"], json!({ "tag": 0, "id": 0, "seed1": "11111111111111111111111111111111", "seed2": "11111111111111111111111111111111" }));
     // Every byte of the copy equals the source, except the owner.
     let (source_bytes, copy_bytes) = (account(name, &source), account(name, &copy));
-    assert_eq!(changed_ranges(&source_bytes, &copy_bytes), vec![[64, 96]]);
+    assert!(differ_only_in(&source_bytes, &copy_bytes, &[[64, 96]]), "{:?}", changed_ranges(&source_bytes, &copy_bytes));
     assert_eq!(m["rewritten"], json!([[64, 96]]));
     assert_eq!(key_at(&copy_bytes, 64), wallet.public);
     let info = |address: &Key| call(name, "getAccountInfo", json!([b58(address), { "encoding": "base64", "dataSlice": { "offset": 0, "length": 0 }, "commitment": "processed" }]))["value"].clone();
@@ -407,7 +414,7 @@ fn solana_mirror_kamino() {
         let (from, to) = (k(state["source"].as_str().unwrap()), k(state["copy"].as_str().unwrap()));
         assert_eq!(to, farm_user_address(&k(state["farm"].as_str().unwrap()), &copy).unwrap());
         let (a, b) = (account(name, &from), account(name, &to));
-        assert_eq!(changed_ranges(&a, &b), vec![[48, 80], [480, 512]], "{state}");
+        assert!(differ_only_in(&a, &b, &[[48, 80], [480, 512]]), "{state} {:?}", changed_ranges(&a, &b));
         assert_eq!(state["rewritten"], json!([[48, 80], [480, 512]]));
         assert_eq!((key_at(&b, 48), key_at(&b, 480)), (wallet.public, copy));
         assert_eq!((info(&to)["owner"].as_str(), info(&to)["lamports"].clone()), (Some(FARMS), info(&from)["lamports"].clone()));
@@ -437,7 +444,7 @@ fn solana_mirror_kamino() {
     eprintln!("refresh of the source, then of the copy: {values:#?}");
     assert!(values.len() == 2 * held.len() && values[..held.len()] == values[held.len()..], "{values:?}");
     let (source_after, copy_after) = (account(name, &source), account(name, &copy));
-    assert_eq!(changed_ranges(&source_after, &copy_after), vec![[64, 96]], "the refreshed copy differs from the refreshed source");
+    assert!(differ_only_in(&source_after, &copy_after, &[[64, 96]]), "the refreshed copy differs from the refreshed source: {:?}", changed_ranges(&source_after, &copy_after));
     assert_ne!(source_after, source_bytes, "the refresh changed nothing");
     assert!(u64_at(&copy_after, 16) > m["slot"].as_u64().unwrap(), "the copy's last update is not this refresh");
 

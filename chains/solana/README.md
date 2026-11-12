@@ -258,8 +258,8 @@ chainsim set solana-mainnet mirror kamino 9Z7nH6krHvtEqDDMV5bNj2enPb99qVpu3acB3K
 ```
 
 - `obligation` is the copy, at the address Kamino derives for the wallet. `rewritten` lists the
-  byte ranges that differ from the source: the owner, and in a farm user state also the
-  obligation it stands for.
+  byte ranges the command rewrote: the owner, and in a farm user state also the obligation it
+  stands for. Every byte outside them equals the source.
 - `reserves` are what `refresh_obligation` takes after the obligation, deposits first.
 - `seeds` are the tag, the id and the two keys that give the source's address after its owner
   and market. The copy's address has the same seeds with the wallet as the owner.

@@ -142,20 +142,26 @@ pub fn rewrite_obligation(data: &[u8], wallet: &Key) -> Vec<u8> {
 
 /// A farm user state's bytes for the copy: the obligation it stands for
 /// replaced by `copy`, and its owner by `wallet` when the source's owner holds
-/// it. None when the account is not the state of `source`.
-pub fn rewrite_farm_user(data: &[u8], source: &Key, owner: &Key, copy: &Key, wallet: &Key) -> Option<Vec<u8>> {
+/// it. Returns the bytes and the ranges it rewrote, as [start, end). None when
+/// the account is not the state of `source`.
+pub fn rewrite_farm_user(data: &[u8], source: &Key, owner: &Key, copy: &Key, wallet: &Key) -> Option<(Vec<u8>, Vec<[usize; 2]>)> {
     if data.len() != FARM_USER_LEN || data[..8] != account_discriminator("UserState") || &key_at(data, FARM_USER_OBLIGATION) != source {
         return None;
     }
     let mut out = data.to_vec();
-    out[FARM_USER_OBLIGATION..FARM_USER_OBLIGATION + 32].copy_from_slice(copy);
+    let mut ranges = Vec::new();
     if &key_at(data, FARM_USER_OWNER) == owner {
         out[FARM_USER_OWNER..FARM_USER_OWNER + 32].copy_from_slice(wallet);
+        ranges.push([FARM_USER_OWNER, FARM_USER_OWNER + 32]);
     }
-    Some(out)
+    out[FARM_USER_OBLIGATION..FARM_USER_OBLIGATION + 32].copy_from_slice(copy);
+    ranges.push([FARM_USER_OBLIGATION, FARM_USER_OBLIGATION + 32]);
+    Some((out, ranges))
 }
 
 /// The byte ranges, as [start, end), where two accounts of one length differ.
+/// A rewritten key can share a byte with the key it replaced, so a rewritten
+/// range may show here as two or more shorter ones.
 pub fn changed_ranges(a: &[u8], b: &[u8]) -> Vec<[usize; 2]> {
     let mut out: Vec<[usize; 2]> = Vec::new();
     for i in (0..a.len().min(b.len())).filter(|&i| a[i] != b[i]) {
@@ -239,8 +245,7 @@ pub async fn kamino(adapter: &SolanaAdapter, name: &str, source: &str, to: &str)
         let from = farm_user_address(&farm, &source_key).map(|k| base58_encode(&k)).unwrap_or_default();
         // An obligation that never staked in the farm has no state there.
         let Some(mut state) = read(&rpc, &from).await? else { continue };
-        let data = rewrite_farm_user(&state.data, &source_key, &obligation.owner, &copy_key, &wallet_key).ok_or_else(|| not_mirrorable(format!("set mirror kamino of {source}, whose farm account {from} is not a farm user state of it")))?;
-        let rewritten = changed_ranges(&state.data, &data);
+        let (data, rewritten) = rewrite_farm_user(&state.data, &source_key, &obligation.owner, &copy_key, &wallet_key).ok_or_else(|| not_mirrorable(format!("set mirror kamino of {source}, whose farm account {from} is not a farm user state of it")))?;
         state.data = data;
         let to = farm_user_address(&farm, &copy_key).map(|k| base58_encode(&k)).unwrap_or_default();
         farm_users.push((json!({ "reserve": address, "farm": base58_encode(&farm), "source": from, "copy": to, "rewritten": rewritten }), state));
@@ -366,13 +371,13 @@ mod tests {
         data[..8].copy_from_slice(&account_discriminator("UserState"));
         data[48..80].copy_from_slice(&owner);
         data[480..512].copy_from_slice(&source);
-        let out = rewrite_farm_user(&data, &source, &owner, &copy, &wallet).unwrap();
-        assert_eq!(changed_ranges(&data, &out), vec![[48, 80], [480, 512]]);
+        let (out, ranges) = rewrite_farm_user(&data, &source, &owner, &copy, &wallet).unwrap();
+        assert_eq!((changed_ranges(&data, &out), ranges), (vec![[48, 80], [480, 512]], vec![[48, 80], [480, 512]]));
         assert_eq!((key_at(&out, 48), key_at(&out, 480)), (wallet, copy));
 
         // An owner that is not the source's owner stays.
-        let kept = rewrite_farm_user(&data, &source, &[9; 32], &copy, &wallet).unwrap();
-        assert_eq!(changed_ranges(&data, &kept), vec![[480, 512]]);
+        let (kept, ranges) = rewrite_farm_user(&data, &source, &[9; 32], &copy, &wallet).unwrap();
+        assert_eq!((changed_ranges(&data, &kept), ranges), (vec![[480, 512]], vec![[480, 512]]));
         // The state of another obligation, or another account, is refused.
         assert!(rewrite_farm_user(&data, &[8; 32], &owner, &copy, &wallet).is_none());
         assert!(rewrite_farm_user(&data[..900], &source, &owner, &copy, &wallet).is_none());
