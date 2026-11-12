@@ -500,8 +500,10 @@ dependencies = [
  "chainsim-solana",
  "chainsim-sui",
  "clap",
+ "curve25519-dalek",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 

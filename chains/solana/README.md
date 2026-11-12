@@ -17,6 +17,8 @@ from one live run against Solana Mainnet on 2026-11-12.
 - `send --as` sends a SOL transfer, or a transaction built by any SDK, as any account without
   its key, including a protocol's admin or a large holder.
 - `set balance` and `set token` write an exact balance on any address.
+- `set mirror kamino` copies a Kamino Lend position of Solana Mainnet onto a test wallet, which
+  then deposits, borrows and repays on it with its own key.
 - `snapshot` and `revert` reset the fork between scenarios, programs included.
 - `time` and `mine` move the Clock sysvar and the slot forward.
 - `selftest` checks the fork before a test relies on it.
@@ -241,6 +243,28 @@ chainsim call solana-mainnet getAccountInfo \
 {"data": ["AQI=", "base64"], "executable": false, "lamports": 1000000, "owner": "noopb9bkMVfRPU8AsbpTUg8AQkHtKwMYZiFUjNRtMmV", "rentEpoch": 0, "space": 2}
 ```
 
+## Mirror a Kamino Lend position
+
+`set mirror kamino` copies an obligation of Solana Mainnet onto a test wallet, so the wallet
+acts on a real position with its own key:
+
+```sh
+chainsim set solana-mainnet mirror kamino 9Z7nH6krHvtEqDDMV5bNj2enPb99qVpu3acB3KeasCxW \
+  --to 2ZiEkjiyHVnUPXfLxpT5o3dgZBfqS6FLVCFgLvzGYFic
+```
+
+```json
+{"kind": "mirror", "protocol": "kamino", "program": "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD", "source": "9Z7nH6krHvtEqDDMV5bNj2enPb99qVpu3acB3KeasCxW", "sourceOwner": "Dr91VxPi2dyTFyg5hjpFP3murEpWsXzjKXy6joS9hJZX", "obligation": "6abma3GpqJ3d3Pa1RiQcLPyNh59qAdunXndmPfMeTr2p", "owner": "2ZiEkjiyHVnUPXfLxpT5o3dgZBfqS6FLVCFgLvzGYFic", "market": "DxXdAyU3kCjnyggvHmY5nAwg5cRbbmdyX3npfDMjjMek", "reserves": {"deposits": ["DdTmCCjv7zHRD1hJv3E8bpnSEQBzdKkzB1j9ApXX5QoP"], "borrows": ["8rM1AY8M4YP4xNVmxhKnEUnj5CRWrcbcHpcgMoDfgqVi", "2ov3CMqPBYG3jNBmmpXgK9KMW5GmU5GWZNGcwf7w3BC1", "Ga4rZytCpq1unD4DbEJ5bkHeUz9g3oh9AAFEi6vSauXp"]}, "farmUserStates": [{"reserve": "DdTmCCjv7zHRD1hJv3E8bpnSEQBzdKkzB1j9ApXX5QoP", "farm": "Db5fLNHRbUfvQ71XK62APWGTbSTTKhDTAnknsYyZPLy4", "source": "7gH24ecGThxw4M7NNgccBPcJ1DayZVbSKsSvCATpV4GE", "copy": "EgkJZK2wQEFEYCgk987c3fq9DhiiYHqCP24vwB5jD7x7", "rewritten": [[48, 80], [480, 512]]}, "..."], "rewritten": [[64, 96]], "bytes": 3344, "slot": 468542195, "note": "..."}
+```
+
+- `obligation` is the copy, at the address Kamino derives for the wallet. `rewritten` lists the
+  byte ranges that differ from the source: the owner, and in a farm user state also the
+  obligation it stands for.
+- `reserves` are what `refresh_obligation` takes after the obligation, deposits first.
+- The wallet signs its own Kamino transactions and sends them to `rpcUrl`. A wallet that is not
+  the owner is refused by Kamino (`InvalidObligationOwner`), as on mainnet.
+- Give the wallet SOL and tokens with `fund` or `set token`.
+
 ## Snapshot and revert
 
 ```sh
@@ -368,6 +392,7 @@ a test report:
 - time and mine move the clock and the slot forward only. A target in the past exits 3: revert goes back. After a jump, reads at the default (finalized) commitment show the old slot for about 15 s.
 - snapshot writes the engine's account export, program accounts included, to the fork volume: about 2 MB on a fresh fork, and more with every account and program the copy has touched. revert restarts the engine inside its container, which takes about 1 s, restores the accounts, and moves the clock forward to the snapshot's. The slot and the clock after a revert are never earlier than the snapshot's and can be later. A transaction sent before the revert is no longer known to the engine by its signature.
 - An account the copy has read keeps its data when the clock moves. A Pyth price account read before time --advance 86400 kept its publish time (measured on 2026-11-12). A program that checks the age of a price may then refuse it (inferred, untested). chainsim call <name> surfnet_setAccount writes the account again.
+- set mirror kamino <obligation> --to <test wallet> copies a Kamino Lend obligation of Solana Mainnet as the copy reads it when the command runs. The copy does not follow the source afterwards. It writes the obligation at the address Kamino derives for the wallet, with the wallet as its owner, and the farm user state of each farmed reserve the obligation holds, with its owner and its obligation rewritten. Every other byte equals the source. Reserve totals and farm stakes are not raised, so a reserve counts the position once while the source and the copy both claim it (inferred): a test that drains a reserve or reads a farm's total stake sees that. The command derives an owner's first plain obligation in a market (tag 0, id 0) and exits 3 for any other. The wallet's token accounts are not made: fund or set token makes them. Kamino values the copy from the oracle accounts the copy has read, which keep their age when the clock moves.
 - chainsim call <name> surfnet_cloneProgramAccount copies a program of the upgradeable loader to a new address. A program of an older loader is refused.
 - Solana signatures do not bind to this copy. A transaction signed for the copy is valid on Solana Mainnet while its blockhash is recent there. The copy's blockhashes are local, so use test keys that hold no mainnet assets.
 - The websocket subscriptions rootSubscribe, blockSubscribe and voteSubscribe send nothing.
