@@ -92,22 +92,22 @@
     },
     "aptos-rest": {
       "name": "chainsim Aptos REST endpoint",
-      "version": "0.1.13-7e18dc8f1550",
+      "version": "0.1.13-29c949053fe3",
       "user": "10001:10001",
       "build": {
-        "image": "chainsim/aptos-rest:0.1.13-7e18dc8f1550",
+        "image": "chainsim/aptos-rest:0.1.13-29c949053fe3",
         "context": "aptos-rest",
         "base": "debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3",
         "tarballs": {
           "amd64": {
-            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/aptos-rest-0.1.13-7e18dc8f1550/aptos-rest-0.1.13-7e18dc8f1550-linux-amd64.tar.gz",
-            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/aptos-rest-0.1.13-7e18dc8f1550/aptos-rest-0.1.13-7e18dc8f1550-linux-amd64.tar.gz.sha256",
-            "sha256": "f2d5d0610deab0fcea36991820fdf39e0fd85f1065089e7584a18930d7cb3874"
+            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/aptos-rest-0.1.13-29c949053fe3/aptos-rest-0.1.13-29c949053fe3-linux-amd64.tar.gz",
+            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/aptos-rest-0.1.13-29c949053fe3/aptos-rest-0.1.13-29c949053fe3-linux-amd64.tar.gz.sha256",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
           },
           "arm64": {
-            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/aptos-rest-0.1.13-7e18dc8f1550/aptos-rest-0.1.13-7e18dc8f1550-linux-arm64.tar.gz",
-            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/aptos-rest-0.1.13-7e18dc8f1550/aptos-rest-0.1.13-7e18dc8f1550-linux-arm64.tar.gz.sha256",
-            "sha256": "b81dfe9e8581be56c96aa56cd57906209b2a169154343f2fb23fc1d73015faa9"
+            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/aptos-rest-0.1.13-29c949053fe3/aptos-rest-0.1.13-29c949053fe3-linux-arm64.tar.gz",
+            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/aptos-rest-0.1.13-29c949053fe3/aptos-rest-0.1.13-29c949053fe3-linux-arm64.tar.gz.sha256",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
           }
         }
       }
@@ -153,22 +153,22 @@
     },
     "hyperevm-proxy": {
       "name": "chainsim HyperEVM proxy",
-      "version": "0.1.13-cfecca827ca2",
+      "version": "0.1.13-d2f2d4b834f3",
       "user": "10001:10001",
       "build": {
-        "image": "chainsim/hyperevm-proxy:0.1.13-cfecca827ca2",
+        "image": "chainsim/hyperevm-proxy:0.1.13-d2f2d4b834f3",
         "context": "hyperevm-proxy",
         "base": "debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3",
         "tarballs": {
           "amd64": {
-            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.13-cfecca827ca2/hyperevm-proxy-0.1.13-cfecca827ca2-linux-amd64.tar.gz",
-            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.13-cfecca827ca2/hyperevm-proxy-0.1.13-cfecca827ca2-linux-amd64.tar.gz.sha256",
-            "sha256": "ecd011f29469265fad53133975ec44eeaa35bc8fc26ad2cfcafe29de3312a2f2"
+            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.13-d2f2d4b834f3/hyperevm-proxy-0.1.13-d2f2d4b834f3-linux-amd64.tar.gz",
+            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.13-d2f2d4b834f3/hyperevm-proxy-0.1.13-d2f2d4b834f3-linux-amd64.tar.gz.sha256",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
           },
           "arm64": {
-            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.13-cfecca827ca2/hyperevm-proxy-0.1.13-cfecca827ca2-linux-arm64.tar.gz",
-            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.13-cfecca827ca2/hyperevm-proxy-0.1.13-cfecca827ca2-linux-arm64.tar.gz.sha256",
-            "sha256": "3fbcef343e688f00ae4088fd27bf4fdf268d2f22189059bfa4d0e15d12b61913"
+            "url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.13-d2f2d4b834f3/hyperevm-proxy-0.1.13-d2f2d4b834f3-linux-arm64.tar.gz",
+            "sha256_url": "https://github.com/MatrixLabsTech/chainsim/releases/download/hyperevm-proxy-0.1.13-d2f2d4b834f3/hyperevm-proxy-0.1.13-d2f2d4b834f3-linux-arm64.tar.gz.sha256",
+            "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
           }
         }
       }
