@@ -46,7 +46,9 @@ Work through these steps in order. Each ends on a check you can make.
    <name> --replay SOL/USD --from <time> --to <time>` plays a past range of prices (`--file <csv>`
    plays your own). `set <name>
    mirror kamino <obligation> --to <test wallet>` copies a mainnet Kamino Lend position onto a test
-   wallet that signs for it. To change state
+   wallet that signs for it. Kamino reads its prices from Scope: after `time`, `set <name> scope
+   refresh <obligation>` makes them fresh again, and `set <name> scope price <reserve> <usd>` sets
+   one. To change state
    directly, run `chainsim set <name> balance|token|owner|object|resource|storage|code ...`. On
    HyperEVM, `set <name> hypercore price|spot-balance|position ...` and `set <name> precompile`
    set what contracts read from HyperCore, `set <name> hypercore mirror <user>` copies a mainnet

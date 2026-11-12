@@ -74,7 +74,10 @@ error codes from the binary.
   plays a past range of prices, or the rows of your own file, and returns each step under
   `applied`. `set <name> mirror
   kamino <obligation> --to <test wallet>` copies a Kamino Lend obligation of Solana Mainnet onto
-  a wallet that then signs for it, and returns the copy's address under `obligation`.
+  a wallet that then signs for it, and returns the copy's address under `obligation`. `set <name>
+  scope refresh <kamino reserve|obligation>...` stamps the Scope prices Kamino Lend reads with the
+  fork's Clock and keeps their values, and `set <name> scope price <kamino reserve> <usd>` sets
+  one, with `withinHeuristic` false when Kamino would refuse it.
 - On HyperEVM, the `fork` object carries a `hypercore` field: the HyperCore answers `up` seeded
   and, under `core`, the order books it took. In `status` it adds `coreWriterActions`, the count
   of captured CoreWriter actions, and `coreState`. Other chains' fork objects have no such field.
