@@ -84,15 +84,21 @@ fn clock(name: &str) -> (u64, u64) {
 
 /// A transaction built here, byte by byte, with no chainsim code: `payer`
 /// calls `program` with the data "hi" and no accounts. Its signature slot and
-/// blockhash are zero.
-fn program_call(payer: &str, program: &str) -> String {
+/// blockhash are zero. `v0` gives a version 0 message with no lookup table.
+fn program_call(payer: &str, program: &str, v0: bool) -> String {
     let mut tx = vec![1u8];
     tx.extend([0u8; 64]);
+    if v0 {
+        tx.push(0x80);
+    }
     tx.extend([1, 0, 1, 2]);
     tx.extend(base58_decode(payer).unwrap());
     tx.extend(base58_decode(program).unwrap());
     tx.extend([0u8; 32]);
     tx.extend([1, 1, 0, 2, b'h', b'i']);
+    if v0 {
+        tx.push(0);
+    }
     base64_encode(&tx)
 }
 
@@ -136,11 +142,14 @@ fn solana_send_time_snapshot_revert() {
     let program = fresh_address(9);
     call(name, "surfnet_cloneProgramAccount", json!([NOOP, program]));
     // A transaction built outside chainsim lands through --data, and calls that program.
-    let tx = program_call(MAINNET_WALLET, &program);
+    let tx = program_call(MAINNET_WALLET, &program, false);
     let sent = ok(&["send", name, "--as", MAINNET_WALLET, "--data", &tx]);
     assert_eq!((sent["status"].as_str(), sent["signers"].clone()), (Some("success"), json!([MAINNET_WALLET])));
     assert!(sent["logs"].as_array().is_some_and(|l| l.iter().any(|x| x.as_str().unwrap() == format!("Program {program} success"))), "{sent}");
     assert!(sent["signature"].as_str().unwrap() != sig1);
+    // The same call as a version 0 transaction.
+    let v0 = ok(&["send", name, "--as", MAINNET_WALLET, "--data", &program_call(MAINNET_WALLET, &program, true)]);
+    assert!(v0["logs"].as_array().is_some_and(|l| l.iter().any(|x| x.as_str().unwrap() == format!("Program {program} success"))), "{v0}");
 
     // What send refuses.
     fails(&["send", name, "--as", &w, "--data", &tx], 2, "usage");
@@ -201,6 +210,8 @@ fn solana_send_time_snapshot_revert() {
     assert_eq!(lamports(name, MAINNET_WALLET), wallet_at_snapshot);
     let (slot_now, time_now) = clock(name);
     assert!(slot_now >= slot_at_snapshot && time_now >= time_at_snapshot, "clock ({slot_at_snapshot}, {time_at_snapshot}) -> ({slot_now}, {time_now})");
+    // The engine no longer knows a transaction sent before the revert by its signature.
+    assert!(call(name, "getSignatureStatuses", json!([[sig1]]))["value"][0].is_null());
     // The same container serves the restored state, still as the engine user.
     assert_eq!(docker(&["inspect", &engine, "--format", "{{.Id}}"]), container);
     assert_eq!(docker(&["exec", &engine, "id", "-u"]), "10001");

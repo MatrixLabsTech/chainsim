@@ -189,8 +189,9 @@ impl SolanaAdapter {
         Ok(handle.fork(profile, None))
     }
 
-    /// The selftest checks, in order. They leave 1 SOL and 1 of the profile's
-    /// selftest token on the throwaway address, and 1 SOL less the transfer and its fee on the sender.
+    /// The selftest checks, in order. They set 1 SOL and 1 of the profile's
+    /// selftest token on the throwaway address and 1 SOL on the sender, then
+    /// send 0.001 SOL from the sender to the throwaway address.
     async fn checks(&self, name: &str, rpc: &Rpc<'_>, profile: &Profile) -> Vec<Check> {
         let mut out = Vec::new();
 
