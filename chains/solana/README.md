@@ -30,7 +30,7 @@ from one live run against Solana Mainnet on 2026-11-12.
 - The engine is Surfpool 1.7.0, the image `surfpool/surfpool:1.7.0`, which `engines.lock.json`
   pins by digest for amd64 and arm64. The first `up` pulls it, and `chainsim pull surfpool` pulls
   it ahead of time. Nothing is built.
-- `up` was ready in 1.6 to 2.7 s on arm64 with the image on the host (measured on 2026-11-12).
+- `up` was ready in 2.2 to 2.7 s on arm64 with the image on the host (measured on 2026-11-12).
 - Each fork is an engine container and a control sidecar on the fork's network. chainsim sends
   every engine call as JSON-RPC from the sidecar.
 - The engine runs as uid 10001, not root. `up` creates the fork volume owned by that user and
@@ -74,19 +74,18 @@ left out here:
   "chain": "solana-mainnet",
   "chainId": "solana:mainnet",
   "maturity": "experimental",
-  "forkPoint": {"kind": "slot", "number": 468533539},
+  "forkPoint": {"kind": "slot", "number": 468535961},
   "network": "chainsim-solana-mainnet",
   "alias": "solana-mainnet",
   "rpcUrl": "http://solana-mainnet:8899",
   "wsUrl": "ws://solana-mainnet:8900",
-  "hostRpcUrl": "http://127.0.0.1:61504",
+  "hostRpcUrl": "http://127.0.0.1:63119",
   "upstream": {"default": "https://api.mainnet-beta.solana.com", "env": "CHAINSIM_SOLANA_MAINNET_RPC", "set": false}
 }
 ```
 
-`rpcUrl` and `wsUrl` are Solana JSON-RPC and websocket endpoints for a wallet, an SDK or the
-Solana CLI in a container on the fork's network. `forkPoint` is the upstream's slot read just
-before the engine started.
+`rpcUrl` and `wsUrl` are the engine's Solana JSON-RPC and websocket endpoints, for containers on
+the fork's network. `forkPoint` is the upstream's slot read just before the engine started.
 
 `selftest` checks six parts:
 
@@ -101,12 +100,12 @@ before the engine started.
 {
   "ok": true,
   "parts": [
-    {"part": "genesis-hash", "ok": true, "ms": 390},
-    {"part": "slot-advances", "ok": true, "ms": 1601},
-    {"part": "mainnet-state", "ok": true, "ms": 510},
-    {"part": "fund-native", "ok": true, "ms": 205},
-    {"part": "fund-token", "ok": true, "ms": 365},
-    {"part": "send-as", "ok": true, "ms": 637}
+    {"part": "genesis-hash", "ok": true, "ms": 356},
+    {"part": "slot-advances", "ok": true, "ms": 1590},
+    {"part": "mainnet-state", "ok": true, "ms": 420},
+    {"part": "fund-native", "ok": true, "ms": 196},
+    {"part": "fund-token", "ok": true, "ms": 336},
+    {"part": "send-as", "ok": true, "ms": 594}
   ]
 }
 ```
@@ -166,8 +165,8 @@ chainsim send solana-mainnet --as 5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9 \
 ```json
 {
   "status": "success",
-  "signature": "2TPAuVUJ2xb3dxFWBaB4A5sjNeR17fAFPgAEXdCCKeDFqDsQDsbyVjUNBVjftMzzvH5ZDnYsSXo8PLpfC1jKsSoX",
-  "slot": 468533572,
+  "signature": "38S9VkEK1dmwUrsHFFKwwF4zjxh978KkmcLWn1wxaRVcdVvp9BfXmGC4y1phVaDdkry6rhgxN5WSaXHeLSqiErtN",
+  "slot": 468535990,
   "err": null,
   "logs": ["Program 11111111111111111111111111111111 invoke [1]", "Program 11111111111111111111111111111111 success"],
   "from": "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9",
@@ -189,8 +188,8 @@ chainsim send solana-mainnet --as 5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9 \
 ```json
 {
   "status": "success",
-  "signature": "4jEK3qY6tDBgCWxW7e8UhGZNFnhfcNa12EieQ64BGYCNhmjYCcDe3335RmzjBp1YQENJCVX1Z6iVQDhp91DXuqjj",
-  "slot": 468533576,
+  "signature": "4KPNwJGTdT7rbf6VAEnqNowSmz4JJQXkenz7BGqyEw7tvEXr7A9LZdYdfPTaFUEuEBkCo3fm1hfjWPDeecDcMYyi",
+  "slot": 468535994,
   "err": null,
   "logs": [
     "Program MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr invoke [1]",
@@ -208,7 +207,7 @@ chainsim send solana-mainnet --as 5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9 \
   transaction is still refused.
 - The address must be a required signer of the transaction. chainsim sets the fork's latest
   blockhash and random signature bytes on it, so two sends never share a signature. The second
-  run of the transfer above returned `2JWaEHZwkz4smfcwuQ85v4r7RFQfmbYGZLeWEbsECndbwBCDPGdJcVH8R4Texff6kLe622UwFSmU58Qq92meVoVb`.
+  run of the transfer above returned `L5atqLnM4ghDFHFh7JuE98fPUMNHdBEGgLSJaKnGARH94jjUYVHzfgoLK89XoXgT8yDGfMZv6TisMgAHuqeqtcG`.
 - Legacy and version 0 transactions both work.
 - A transaction that fails exits 1 with `tx_reverted`, and its logs are in `data.logs`.
 
@@ -246,12 +245,12 @@ chainsim call solana-mainnet getAccountInfo \
 
 ```sh
 chainsim snapshot solana-mainnet
-chainsim revert solana-mainnet s18e74d9700bb735c
+chainsim revert solana-mainnet s18e74e100d534f10
 ```
 
 ```json
-{"id": "s18e74d9700bb735c"}
-{"reverted": "s18e74d9700bb735c", "snapshot": "s18e74d972184d3f4"}
+{"id": "s18e74e100d534f10"}
+{"reverted": "s18e74e100d534f10", "snapshot": "s18e74e102c337e95"}
 ```
 
 A snapshot is the engine's account export, program accounts included, kept on the fork volume.
@@ -271,12 +270,12 @@ chainsim mine solana-mainnet --blocks 3
 ```
 
 ```json
-{"previous": 1794488288, "timestamp": 1794574688, "previousSlot": 468533591, "slot": 468879188}
-{"mined": 3, "previousSlot": 468879188, "slot": 468879191, "timestamp": 1794574689}
+{"previous": 1794488808, "timestamp": 1794575208, "previousSlot": 468536011, "slot": 468881607}
+{"mined": 3, "previousSlot": 468881607, "slot": 468881610, "timestamp": 1794575208}
 ```
 
 Both move the Clock sysvar, which programs read, and the slot. After the two commands above
-the Clock read slot 468879191 and Unix time 1794574689. `time --to <unix seconds>`
+the Clock read slot 468881611 and Unix time 1794575208. `time --to <unix seconds>`
 moves to a given time. Time moves forward only: a target in the past exits 3 and names `revert`.
 
 Each result carries a `note`: the slot is read at processed commitment, and reads at the default
@@ -312,8 +311,8 @@ chainsim call solana-mainnet getSlot '[{"commitment": "processed"}]'
 ```
 
 ```json
-{"context": {"apiVersion": "4.3.2", "slot": 468533591}, "value": 250000000}
-468879192
+{"context": {"apiVersion": "4.3.2", "slot": 468536010}, "value": 250000000}
+468881611
 ```
 
 Pass `{"commitment": "processed"}` to a read that must see a write at once. `getSlot` at the
@@ -332,16 +331,16 @@ writes included. This run had 19 entries, and these are 7 of them:
 
 ```json
 {
-  "head": 468879396,
+  "head": 468881816,
   "uptimeSecs": 63,
   "modifications": [
-    {"address": "8aZetj5YrYXhMT2WtqSTjYVnPW82qEVG7pxG5BcrRT6w", "amount": "5", "asset": "native", "at": 1794488283, "kind": "fund", "symbol": "SOL"},
-    {"at": 1794488285, "from": "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9", "kind": "send-as", "signature": "2TPAuVUJ2xb3dxFWBaB4A5sjNeR17fAFPgAEXdCCKeDFqDsQDsbyVjUNBVjftMzzvH5ZDnYsSXo8PLpfC1jKsSoX", "signatureCheckSkipped": true, "status": "success", "to": "8aZetj5YrYXhMT2WtqSTjYVnPW82qEVG7pxG5BcrRT6w", "value": "1"},
-    {"address": "8aZetj5YrYXhMT2WtqSTjYVnPW82qEVG7pxG5BcrRT6w", "amount": "0.25", "at": 1794488286, "kind": "set-balance", "symbol": "SOL"},
-    {"at": 1794488287, "kind": "call", "method": "surfnet_setAccount", "params": ["Ep6CuSTHU4t4YLMxBxRwdmJmZbCVXsTcHaXYCVeSxbTJ", {"data": "0102", "lamports": 1000000, "owner": "noopb9bkMVfRPU8AsbpTUg8AQkHtKwMYZiFUjNRtMmV"}]},
-    {"at": 1794488288, "kind": "revert", "note": "account changes listed above this entry and after that snapshot are undone", "snapshot": "s18e74d9700bb735c"},
-    {"at": 1794488289, "from": 1794488288, "kind": "time", "slot": 468879188, "to": 1794574688},
-    {"at": 1794488289, "kind": "mine", "slot": 468879191, "slots": 3}
+    {"address": "8aZetj5YrYXhMT2WtqSTjYVnPW82qEVG7pxG5BcrRT6w", "amount": "5", "asset": "native", "at": 1794488803, "kind": "fund", "symbol": "SOL"},
+    {"at": 1794488805, "from": "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9", "kind": "send-as", "signature": "38S9VkEK1dmwUrsHFFKwwF4zjxh978KkmcLWn1wxaRVcdVvp9BfXmGC4y1phVaDdkry6rhgxN5WSaXHeLSqiErtN", "signatureCheckSkipped": true, "status": "success", "to": "8aZetj5YrYXhMT2WtqSTjYVnPW82qEVG7pxG5BcrRT6w", "value": "1"},
+    {"address": "8aZetj5YrYXhMT2WtqSTjYVnPW82qEVG7pxG5BcrRT6w", "amount": "0.25", "at": 1794488806, "kind": "set-balance", "symbol": "SOL"},
+    {"at": 1794488807, "kind": "call", "method": "surfnet_setAccount", "params": ["Ep6CuSTHU4t4YLMxBxRwdmJmZbCVXsTcHaXYCVeSxbTJ", {"data": "0102", "lamports": 1000000, "owner": "noopb9bkMVfRPU8AsbpTUg8AQkHtKwMYZiFUjNRtMmV"}]},
+    {"at": 1794488808, "kind": "revert", "note": "account changes listed above this entry and after that snapshot are undone", "snapshot": "s18e74e100d534f10"},
+    {"at": 1794488808, "from": 1794488808, "kind": "time", "slot": 468881607, "to": 1794575208},
+    {"at": 1794488809, "kind": "mine", "slot": 468881610, "slots": 3}
   ]
 }
 ```
@@ -368,7 +367,7 @@ a test report:
 - send --as skips the signature check for that one request, on the copy only. The engine keeps checking the signatures of every other client. The address must be a required signer of the transaction, and the fee payer must be a wallet (an account of the System program) that holds SOL on the copy. send sets the copy's latest blockhash and random signature bytes on the transaction, so a transaction passed with --data need not be signed.
 - time and mine move the clock and the slot forward only. A target in the past exits 3: revert goes back. After a jump, reads at the default (finalized) commitment show the old slot for about 15 s.
 - snapshot writes the engine's account export, program accounts included, to the fork volume: about 2 MB on a fresh fork, and more with every account and program the copy has touched. revert restarts the engine inside its container, which takes about 1 s, restores the accounts, and moves the clock forward to the snapshot's. The slot and the clock after a revert are never earlier than the snapshot's and can be later. A transaction sent before the revert is no longer known to the engine by its signature.
-- An account the copy has read keeps its data when the clock moves. A Pyth price account read before time --advance 86400 kept its publish time, so a program that checks the age of a price refuses it until chainsim call <name> surfnet_setAccount writes the account again.
+- An account the copy has read keeps its data when the clock moves. A Pyth price account read before time --advance 86400 kept its publish time (measured on 2026-11-12). A program that checks the age of a price may then refuse it (inferred, untested). chainsim call <name> surfnet_setAccount writes the account again.
 - chainsim call <name> surfnet_cloneProgramAccount copies a program of the upgradeable loader to a new address. A program of an older loader is refused.
 - Solana signatures do not bind to this copy. A transaction signed for the copy is valid on Solana Mainnet while its blockhash is recent there. The copy's blockhashes are local, so use test keys that hold no mainnet assets.
 - The websocket subscriptions rootSubscribe, blockSubscribe and voteSubscribe send nothing.
