@@ -31,7 +31,7 @@ pub async fn time(adapter: &SolanaAdapter, name: &str, req: &TimeRequest) -> Res
     let (handle, profile) = adapter.open(name).await?;
     let rpc = adapter.rpc(&handle, &profile);
     let (slot_before, before) = clock(&rpc).await?;
-    let past = |target: u64| Error::unsupported(&format!("moving the clock back from {before} s to {target} s"), format!("chainsim revert {name} <snapshot> goes back to an earlier state; time moves forward only"));
+    let past = |target: u64| Error::unsupported(&format!("moving the clock back from {before} s to {target} s"), format!("chainsim revert {name} <snapshot> goes back to an earlier state. time moves forward only"));
     let target = match req {
         TimeRequest::Advance(0) => return Err(Error::new(ErrorCode::Usage, "--advance takes one second or more")),
         TimeRequest::Advance(secs) => before.checked_add(*secs).ok_or_else(|| Error::new(ErrorCode::Usage, "the offset is too large"))?,

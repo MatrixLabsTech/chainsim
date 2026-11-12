@@ -1,6 +1,6 @@
 ---
 name: chainsim
-description: Local mainnet forks of Ethereum, Arc, Robinhood Chain, HyperEVM, Sui and Aptos. Use when work needs a chain fork, a funded test wallet on mainnet state, or time and state control on a local chain.
+description: Local mainnet forks of Ethereum, Arc, Robinhood Chain, HyperEVM, Sui, Aptos and Solana. Use when work needs a chain fork, a funded test wallet on mainnet state, or time and state control on a local chain.
 ---
 
 # chainsim
@@ -31,13 +31,17 @@ Work through these steps in order. Each ends on a check you can make.
 4. **Prove it is fit.** Run `chainsim selftest <name>`. Done when it exits 0. On any other exit,
    follow `error.next`, and stop the task if it stays red.
 5. **Fund a fresh test wallet.** Run `chainsim fund <name> <address> --native <amount>` and
-   `--token <symbol>:<amount>` as the task needs. Done when `fund` exits 0, since it returns the
-   read-back balances.
+   `--token <symbol>:<amount>` as the task needs. On Solana, a token that is not a profile symbol
+   is named by its mint address. Done when `fund` exits 0, since it returns the read-back
+   balances.
 6. **Act as any account, or change contract state, when the task needs it.** To call a function
    only an admin, owner or other role holder may call, run `chainsim send <name> --as <address>
    --to <target> [<arg>...]` with the role holder's address: no key is needed. The target is a
    contract with `--sig "<fn(types)>"` on EVM, `package::module::function<T...>` on Sui, or
-   `address::module::function<T...>` with `<type>:<value>` arguments on Aptos. To change state
+   `address::module::function<T...>` with `<type>:<value>` arguments on Aptos. On Solana, `send
+   <name> --as <address> --to <receiver> --value <SOL>` transfers SOL, and `send <name> --as
+   <address> --data <base64 transaction>` sends a transaction built by any SDK, unsigned, with
+   that address as a required signer. To change state
    directly, run `chainsim set <name> balance|token|owner|object|resource|storage|code ...`. On
    HyperEVM, `set <name> hypercore price|spot-balance|position ...` and `set <name> precompile`
    set what contracts read from HyperCore, `set <name> hypercore mirror <user>` copies a mainnet
@@ -49,7 +53,7 @@ Work through these steps in order. Each ends on a check you can make.
    (`set hypercore book xyz:XYZ100 --live`), and `hyperevm-testnet` works the same way. Core actions apply after every block, whoever sends them, and the fork answers the Hyperliquid
    info API at `<rpcUrl>/info`.
    `chainsim describe <chain>` lists what each chain supports. Done when the receipt `status` is
-   1 (`success` on Aptos) or the read-back matches what you set.
+   1 (`success` on Aptos and Solana) or the read-back matches what you set.
 7. **Do the work.** Before each scenario run `chainsim snapshot <name>`, and after it
    `chainsim revert <name> <id>`. Done when every scenario has a pass or fail and each `revert`
    exited 0.
@@ -64,7 +68,9 @@ Work through these steps in order. Each ends on a check you can make.
 `fork.network` reach it, the host does not. From the host, use `chainsim call <name> <method>
 [<params-json>]`, or start the fork with `--publish` and use `fork.hostRpcUrl`. On Aptos,
 `rpcUrl` is a fullnode REST endpoint: give an Aptos SDK `rpcUrl` plus `/v1` as its fullnode, or
-read the fork with `chainsim call <name> view|resource|ledger`. On HyperEVM,
+read the fork with `chainsim call <name> view|resource|ledger`. On Solana, `rpcUrl` is a
+Solana JSON-RPC endpoint, and a read that must see a write at once passes `{"commitment":
+"processed"}`. On HyperEVM,
 `fork.hypercore` lists the HyperCore answers seeded at `up`.
 
 Copy `fork.limits` into the report word for word: they are how the fork differs from the real

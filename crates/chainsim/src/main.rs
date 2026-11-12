@@ -74,7 +74,7 @@ enum Command {
         /// Native balance in whole units.
         #[arg(long)]
         native: Option<String>,
-        /// <symbol|address>:<amount>, repeatable.
+        /// <symbol|address>:<amount>, repeatable. On Solana the address is a mint.
         #[arg(long = "token", value_name = "TOKEN:AMOUNT")]
         tokens: Vec<String>,
     },
@@ -177,7 +177,7 @@ enum SetWhat {
     /// A token balance, in whole units of the token, minted or taken from a holder.
     Token {
         address: String,
-        /// The token: on EVM a profile symbol or an ERC-20 address, on Sui a coin type such as 0x...::usdc::USDC.
+        /// The token: on EVM a profile symbol or an ERC-20 address, on Sui a coin type such as 0x...::usdc::USDC, on Solana a profile symbol or a mint address.
         coin_type: String,
         amount: String,
         /// Take the amount from this holder instead of minting.
@@ -379,12 +379,12 @@ fn describe(chain: Option<&str>) -> Result<Value> {
             "ls",
             "status <name>",
             "down <name> | --all",
-            "fund <name> <address> [--native <amount>] [--token <symbol|address>:<amount>]...",
+            "fund <name> <address> [--native <amount>] [--token <symbol|address>:<amount>]...  (Solana: the address of a Token or Token-2022 mint)",
             "snapshot <name>",
             "revert <name> <id>",
             "call <name> <method> [<params-json>] [--from <address>]  (HyperEVM: call <name> corewriter_actions [{\"fromBlock\": <n>}])",
-            "send <name> --as <address> --to <address> (--sig \"<fn(types)>\" [<arg>...] | --data <hex>) [--value <amount>]",
-            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex> | precompile <address> <calldata hex> (--result <hex> | --live) | hypercore (price <perp> <px> | price <spot pair> <px> --spot | isolated-margin <user> <perp> <+usd|-usd> | spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>] | position <user> <perp> <szi> <entryNtl> [--leverage <n>] [--isolated-raw-usd <n>] [--isolated] | book <coin> --live | mirror <user> | funding <perp> <rate> | big-blocks <user> on|off)",
+            "send <name> --as <address> --to <address> (--sig \"<fn(types)>\" [<arg>...] | --data <hex>) [--value <amount>]  (Solana: send <name> --as <address> (--to <receiver> --value <amount> | --data <base64 transaction>))",
+            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type|symbol|mint> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex> | precompile <address> <calldata hex> (--result <hex> | --live) | hypercore (price <perp> <px> | price <spot pair> <px> --spot | isolated-margin <user> <perp> <+usd|-usd> | spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>] | position <user> <perp> <szi> <entryNtl> [--leverage <n>] [--isolated-raw-usd <n>] [--isolated] | book <coin> --live | mirror <user> | funding <perp> <rate> | big-blocks <user> on|off)",
             "time <name> (--advance <seconds> | --to <unix seconds> | --replay <perp> --from <time> --to <time>)",
             "mine <name> [--blocks <n>]",
             "selftest <name>",
