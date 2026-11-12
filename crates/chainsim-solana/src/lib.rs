@@ -2,6 +2,7 @@
 //! the fork's control sidecar.
 
 pub mod fund;
+pub mod mirror;
 pub mod rpc;
 pub mod send;
 pub mod snapshot;

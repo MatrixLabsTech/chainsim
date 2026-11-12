@@ -223,6 +223,23 @@ enum SetWhat {
         #[command(subcommand)]
         what: HyperCoreWhat,
     },
+    /// Copy a mainnet position onto a test wallet (Solana).
+    Mirror {
+        #[command(subcommand)]
+        what: MirrorWhat,
+    },
+}
+
+#[derive(Subcommand)]
+enum MirrorWhat {
+    /// A Kamino Lend obligation: the copy goes to the address derived for the wallet, with the wallet as its owner.
+    Kamino {
+        /// The obligation account on Solana Mainnet.
+        obligation: String,
+        /// The test wallet that owns the copy.
+        #[arg(long)]
+        to: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -317,6 +334,17 @@ async fn set_hypercore(name: &str, what: HyperCoreWhat) -> Result<Value> {
     EvmAdapter::connect().await?.hypercore(name, op).await
 }
 
+/// The Solana adapter of a running fork, or exit 3 on another family.
+async fn solana_adapter(name: &str) -> Result<SolanaAdapter> {
+    let docker = Docker::connect().await?;
+    let handle = docker.find(name).await?.ok_or_else(|| Error::fork_not_found(name))?;
+    let profile = profile::get(&handle.chain)?;
+    if profile.family != "solana" {
+        return Err(Error::unsupported(&format!("set mirror on {}", profile.key), "only Solana has set mirror. HyperEVM has chainsim set <name> hypercore mirror <user>"));
+    }
+    SolanaAdapter::connect().await
+}
+
 /// The adapter for a profile family.
 async fn adapter(family: &str) -> Result<Box<dyn Adapter>> {
     match family {
@@ -384,7 +412,7 @@ fn describe(chain: Option<&str>) -> Result<Value> {
             "revert <name> <id>",
             "call <name> <method> [<params-json>] [--from <address>]  (HyperEVM: call <name> corewriter_actions [{\"fromBlock\": <n>}])",
             "send <name> --as <address> --to <address> (--sig \"<fn(types)>\" [<arg>...] | --data <hex>) [--value <amount>]  (Solana: send <name> --as <address> (--to <receiver> --value <amount> | --data <base64 transaction>))",
-            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type|symbol|mint> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex> | precompile <address> <calldata hex> (--result <hex> | --live) | hypercore (price <perp> <px> | price <spot pair> <px> --spot | isolated-margin <user> <perp> <+usd|-usd> | spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>] | position <user> <perp> <szi> <entryNtl> [--leverage <n>] [--isolated-raw-usd <n>] [--isolated] | book <coin> --live | mirror <user> | funding <perp> <rate> | big-blocks <user> on|off)",
+            "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type|symbol|mint> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex> | precompile <address> <calldata hex> (--result <hex> | --live) | hypercore (price <perp> <px> | price <spot pair> <px> --spot | isolated-margin <user> <perp> <+usd|-usd> | spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>] | position <user> <perp> <szi> <entryNtl> [--leverage <n>] [--isolated-raw-usd <n>] [--isolated] | book <coin> --live | mirror <user> | funding <perp> <rate> | big-blocks <user> on|off) | mirror kamino <obligation> --to <test wallet>  (Solana)",
             "time <name> (--advance <seconds> | --to <unix seconds> | --replay <perp> --from <time> --to <time>)",
             "mine <name> [--blocks <n>]",
             "selftest <name>",
@@ -565,6 +593,7 @@ async fn run(command: Command) -> Result<Value> {
                 SetWhat::Resource { address, struct_tag, bcs } => SetRequest { kind: SetKind::Resource { struct_tag, bcs }, address, value: String::new() },
                 SetWhat::Precompile { address, calldata, result, live: _ } => SetRequest { kind: SetKind::Precompile { calldata, result }, address, value: String::new() },
                 SetWhat::Hypercore { what } => return set_hypercore(&name, what).await,
+                SetWhat::Mirror { what: MirrorWhat::Kamino { obligation, to } } => return chainsim_solana::mirror::kamino(&solana_adapter(&name).await?, &name, &obligation, &to).await,
             };
             adapter_of(&name).await?.set(&name, &req).await
         }
