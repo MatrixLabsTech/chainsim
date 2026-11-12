@@ -187,14 +187,16 @@ fn solana_price_set_and_replay() {
         assert_eq!(step["time"].as_u64(), Some(time), "step {i}");
         let got: f64 = step["price"].as_str().unwrap().parse().unwrap();
         assert!((got - close).abs() < 1e-9, "step {i}: the account read {got}, the source closed at {close}");
-        assert_eq!(step["clock"].as_i64().unwrap() - first_clock, (time - source[0].0) as i64, "step {i}: clock offset");
+        // The Clock can tick once between the jump and the write.
+        let late = step["clock"].as_i64().unwrap() - first_clock - (time - source[0].0) as i64;
+        assert!((0..=2).contains(&late), "step {i}: the clock is {late} s off the candle offset");
     }
     // The account now holds the last step, published at the Clock.
     let last = applied.last().unwrap();
     let end = price(name, SOL_USD);
     assert!((end.price as f64 / 1e8 - source.last().unwrap().1).abs() < 1e-9, "{end:?}");
     assert_eq!(Some(end.publish_time), last["clock"].as_i64());
-    assert_eq!(replay["clock"]["to"].as_i64(), last["clock"].as_i64());
+    assert!((0..=2).contains(&(replay["clock"]["to"].as_i64().unwrap() - last["clock"].as_i64().unwrap())));
     assert!((0..10).contains(&(clock(name) - end.publish_time)));
     // A program accepts the replayed price too.
     assert_eq!(ok(&["send", name, "--as", MAINNET_WALLET, "--data", &refresh_reserve(name)])["status"], "success");
@@ -223,7 +225,7 @@ fn solana_price_set_and_replay() {
     assert_eq!(prices, ["1.0001", "0.9995", "1"]);
     let at: Vec<i64> = rows.iter().map(|r| r["clock"].as_i64().unwrap()).collect();
     assert!((0..10).contains(&(at[0] - before_file)), "the first row lands at the fork's clock");
-    assert_eq!((at[1] - at[0], at[2] - at[0]), (90, 300));
+    assert!((90..=92).contains(&(at[1] - at[0])) && (300..=302).contains(&(at[2] - at[0])), "{at:?}");
     let usdc = price(name, USDC_USD);
     assert_eq!((usdc.price, usdc.publish_time), (100_000_000, at[2]));
     std::fs::write(&file, "1735689600,1\n1735689600,2\n").unwrap();

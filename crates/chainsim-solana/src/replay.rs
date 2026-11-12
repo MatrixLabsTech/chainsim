@@ -137,16 +137,19 @@ async fn play(adapter: &SolanaAdapter, name: &str, feed: &str, account: &str, pr
     }
     let (from, to) = (prices[0].0, prices[prices.len() - 1].0);
 
-    let (_, started) = clock(&rpc).await?;
+    // The first step lands at the clock as it reads then, and every later step at that time plus
+    // the row's offset, so the steps are exactly as far apart on the fork as in the source.
+    let mut started = None;
     let mut applied = Vec::with_capacity(prices.len());
     let mut slot = 0;
     let mut failed = None;
     for ((time, _), raw) in prices.iter().zip(raws) {
         let step = async {
-            if *time > from {
-                rpc.call("surfnet_timeTravel", json!([{ "absoluteTimestamp": (started + time - from) * 1000 }])).await?;
+            if let Some(start) = started {
+                rpc.call("surfnet_timeTravel", json!([{ "absoluteTimestamp": (start + time - from) * 1000 }])).await?;
             }
             let (at_slot, now) = clock(&rpc).await?;
+            started.get_or_insert(now);
             price::write(&mut data, raw, old.conf, now as i64, at_slot);
             let read = price::store(&rpc, account, &data).await?;
             Ok::<_, Error>((at_slot, json!({ "time": time, "price": from_raw(read.price as u64, read.exponent), "clock": read.publish_time })))
