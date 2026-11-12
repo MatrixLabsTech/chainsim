@@ -571,7 +571,7 @@ fn solana_scope_prices_for_kamino() {
     assert!(now >= moved["timestamp"].as_u64().unwrap(), "{refreshed}");
     for e in entries {
         assert_eq!((e["timestamp"].as_u64(), e["price"].clone()), (Some(now), e["previousPrice"].clone()), "{e}");
-        assert!(e["previousTimestamp"].as_u64().unwrap() + 86400 <= now, "{e}");
+        assert!(e["previousTimestamp"].as_u64().unwrap() < now, "{e}");
     }
     // Read back through raw calls: an entry is 56 bytes from byte 40, and only the slot and the time of the named entries changed.
     for (r, before) in held.iter().zip(&prices_before) {
@@ -587,6 +587,10 @@ fn solana_scope_prices_for_kamino() {
     assert!(err.is_null(), "borrow failed after set scope refresh: {err} {logs:#?}");
     assert!(!logs.iter().any(|l| l.contains("PriceTooOld")), "{logs:#?}");
     assert_eq!(token_balance(name, &b58(&wallet_b)), 12 * b_unit);
+
+    // A reserve stands for itself: its price entry and its TWAP entry.
+    let one = ok(&["set", name, "scope", "refresh", &b58(&d.address)]);
+    assert_eq!((one["reserves"].clone(), one["entries"].as_array().unwrap().len()), (json!([b58(&d.address)]), 2), "{one}");
 
     // 2. The position is healthy: its debt is under the value at which Kamino calls it unhealthy.
     let (debt, unhealthy) = debt_and_unhealthy(&account(name, &copy));

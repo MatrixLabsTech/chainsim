@@ -136,15 +136,16 @@ pub fn set_entry(prices: &mut [u8], index: u16, e: &Entry) {
 /// A price such as 2.5 as a value and an exponent: the entry's own exponent
 /// when the value fits a u64, else the largest smaller one that does.
 pub fn price_value(price: &str, exponent: u64) -> Result<(u64, u64)> {
-    let mut exp = exponent.min(18) as u8;
-    loop {
+    let first = exponent.min(18) as u8;
+    for exp in (0..=first).rev() {
         match parse_amount(price, exp) {
             Ok(0) => return Err(Error::new(ErrorCode::Usage, "the price must be more than 0")),
             Ok(value) => return Ok((value, exp as u64)),
-            Err(e) if exp == 0 => return Err(e),
-            Err(_) => exp -= 1,
+            Err(_) => continue,
         }
     }
+    // No exponent fits: say why the entry's own does not.
+    parse_amount(price, first).map(|value| (value, first as u64))
 }
 
 fn entry_json(prices: &str, index: u16, role: &str, before: &Entry, after: &Entry) -> Value {
@@ -352,6 +353,6 @@ mod tests {
         assert_eq!(price_value("200", 17).unwrap(), (2_000_000_000_000_000_000, 16));
         assert_eq!(price_value("0.5", 30).unwrap(), (500_000_000_000_000_000, 18));
         assert!(price_value("0", 8).is_err() && price_value("-1", 8).is_err() && price_value("x", 8).is_err());
-        assert!(price_value("1.123456789", 8).is_err());
+        assert!(price_value("1.123456789", 8).unwrap_err().message.contains("more than 8 decimals"));
     }
 }
