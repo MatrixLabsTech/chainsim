@@ -43,7 +43,9 @@ Work through these steps in order. Each ends on a check you can make.
    <address> --data <base64 transaction>` sends a transaction built by any SDK, unsigned, with
    that address as a required signer. After `time` moves a Solana fork's clock, `set <name> price
    SOL/USD <usd>` gives a Pyth price feed a price that programs accept at the new time, and `time
-   <name> --replay SOL/USD --from <time> --to <time>` plays a past range of real prices. To change state
+   <name> --replay SOL/USD --from <time> --to <time>` plays a past range of real prices. `set <name>
+   mirror kamino <obligation> --to <test wallet>` copies a mainnet Kamino Lend position onto a test
+   wallet that signs for it. To change state
    directly, run `chainsim set <name> balance|token|owner|object|resource|storage|code ...`. On
    HyperEVM, `set <name> hypercore price|spot-balance|position ...` and `set <name> precompile`
    set what contracts read from HyperCore, `set <name> hypercore mirror <user>` copies a mainnet

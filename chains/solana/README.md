@@ -5,7 +5,8 @@
 chainsim runs a private copy of Solana Mainnet in Docker as the chain `solana-mainnet`. The
 commands and their JSON output are the same as on every chain, and the [README](../../README.md)
 covers the shared workflow. This page covers what is specific to Solana. Every output below comes
-from a live run against Solana Mainnet on 2026-11-12, the Prices section from a second run that day.
+from a live run against Solana Mainnet on 2026-11-12, the Kamino and Prices sections from later
+runs that day.
 
 ## What chainsim gives on Solana
 

@@ -71,7 +71,9 @@ error codes from the binary.
   commitment. `up --block` exits 3, since the engine has no pinned fork point. `set <name> price
   <feed> <usd> [--conf <usd>]` writes a Pyth price account with a publish time equal to the
   fork's Clock, and `time <name> --replay <feed> --from <time> --to <time>` plays a past range
-  of real prices, one step a minute, and returns each step under `applied`.
+  of real prices, one step a minute, and returns each step under `applied`. `set <name> mirror
+  kamino <obligation> --to <test wallet>` copies a Kamino Lend obligation of Solana Mainnet onto
+  a wallet that then signs for it, and returns the copy's address under `obligation`.
 - On HyperEVM, the `fork` object carries a `hypercore` field: the HyperCore answers `up` seeded
   and, under `core`, the order books it took. In `status` it adds `coreWriterActions`, the count
   of captured CoreWriter actions, and `coreState`. Other chains' fork objects have no such field.
