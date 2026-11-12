@@ -413,6 +413,33 @@ pub struct Account {
     /// Account abstraction (action 16): 0 default, 1 disabled, 2 unified account, 3 portfolio margin.
     #[serde(rename = "ab", default, skip_serializing_if = "is_zero_u8")]
     pub abstraction: u8,
+    /// Margin reservations from a mirror, without executable order IDs.
+    #[serde(rename = "om", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub order_margin: BTreeMap<u32, OrderMargin>,
+    #[serde(rename = "v", default, skip_serializing_if = "is_false")]
+    pub vault: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderMargin {
+    /// Original sizes (x8) and limit notionals (x6), buy then sell.
+    pub sizes: [u64; 2],
+    pub notionals: [u64; 2],
+    pub leverage: u32,
+    pub isolated: bool,
+}
+
+impl OrderMargin {
+    fn held(&self, position: i64) -> u64 {
+        let position = if self.isolated { 0 } else { position };
+        (0..2).map(|side| {
+            let size = self.sizes[side] as u128;
+            if size == 0 { return 0; }
+            let offset = if (side == 0 && position < 0) || (side == 1 && position > 0) { 2 * position.unsigned_abs() as u128 } else { 0 };
+            // The opening fraction of each side uses that side's size-weighted limit price.
+            (size.saturating_sub(offset) * self.notionals[side] as u128 / size / self.leverage.max(1) as u128) as u64
+        }).max().unwrap_or(0)
+    }
 }
 
 fn is_zero_u8(v: &u8) -> bool {
@@ -1037,11 +1064,14 @@ impl State {
             signed_entry += sign * p.entry_ntl as i128;
         }
         let order_margin: u64 = self.orders.iter().filter(|o| o.user == user && dex_of(o.asset) == dex).map(|o| notional(o.sz_x8, o.px_x8) / self.leverage_of(user, o.asset) as u64).sum();
+        let mirrored_margin: u128 = acct.order_margin.iter().filter(|(asset, _)| dex_of(**asset) == dex)
+            .map(|(asset, hold)| hold.held(acct.positions.get(asset).map_or(0, |p| p.szi_x8)) as u128).sum();
         let usd = acct.usd_of(dex);
         m.account_value = (usd as i128 + upnl) as i64;
         m.raw_usd = (usd as i128 - signed_entry) as i64;
-        m.free = (m.account_value as i128 - m.margin_used as i128 - order_margin as i128).max(0) as u64;
-        m.withdrawable = (m.account_value as i128 - transfer_margin as i128 - order_margin as i128).max(0) as u64;
+        m.free = (m.account_value as i128 - m.margin_used as i128 - order_margin as i128 - mirrored_margin as i128).max(0) as u64;
+        let mirrored_transfer = if acct.vault { 0 } else { mirrored_margin };
+        m.withdrawable = (m.account_value as i128 - transfer_margin as i128 - order_margin as i128 - mirrored_transfer as i128).max(0) as u64;
         m
     }
 
@@ -2247,6 +2277,45 @@ impl State {
         skipped
     }
 
+    /// Replace one dex's mirrored reservations. These are margin holds, not locally executable orders.
+    pub fn mirror_order_margin(&mut self, user: Address, dex: u32, orders: &Value) -> Vec<String> {
+        let mut holds: BTreeMap<u32, OrderMargin> = BTreeMap::new();
+        let mut skipped = Vec::new();
+        for o in orders.as_array().into_iter().flatten().filter(|o| o["reduceOnly"] != true && o["isTrigger"] != true) {
+            let coin = o["coin"].as_str().unwrap_or_default();
+            if coin.starts_with('@') || coin.contains('/') { continue; }
+            let Some((&asset, _)) = self.perps.iter().find(|(a, p)| dex_of(**a) == dex && p.name == coin) else {
+                skipped.push(coin.to_string());
+                continue;
+            };
+            let side = match o["side"].as_str() { Some("B") => 0, Some("A") => 1, _ => { skipped.push(coin.to_string()); continue; } };
+            let decimal = |field: &str| o[field].as_str().and_then(|s| parse_rounded(s, 8)).and_then(|v| u64::try_from(v).ok());
+            let (Some(size), Some(price)) = (decimal("origSz").or_else(|| decimal("sz")), decimal("limitPx")) else {
+                skipped.push(coin.to_string());
+                continue;
+            };
+            let position = self.accounts.get(&user).and_then(|a| a.positions.get(&asset)).filter(|p| p.szi_x8 != 0);
+            let leverage = position.map(|p| p.leverage).or_else(|| o["leverage"]["value"].as_u64().and_then(|v| u32::try_from(v).ok()));
+            let Some(leverage) = leverage.filter(|v| *v > 0) else { skipped.push(coin.to_string()); continue; };
+            let isolated = position.map_or(o["leverage"]["type"] == "isolated", |p| p.isolated);
+            let Ok(notional) = u64::try_from(size as u128 * price as u128 / 10_000_000_000) else {
+                skipped.push(coin.to_string());
+                continue;
+            };
+            let hold = holds.entry(asset).or_insert_with(|| OrderMargin { leverage, isolated, ..Default::default() });
+            let (Some(total_size), Some(total_notional)) = (hold.sizes[side].checked_add(size), hold.notionals[side].checked_add(notional)) else {
+                skipped.push(coin.to_string());
+                continue;
+            };
+            hold.sizes[side] = total_size;
+            hold.notionals[side] = total_notional;
+        }
+        let account = self.account(user);
+        account.order_margin.retain(|asset, _| dex_of(*asset) != dex);
+        account.order_margin.extend(holds);
+        skipped
+    }
+
     /// Sets a user's spot balances from the info API's `spotClearinghouseState`.
     /// Tokens must already be in `tokens`; others are skipped and returned.
     pub fn mirror_spot(&mut self, user: Address, sch: &Value) -> Vec<String> {
@@ -2379,6 +2448,49 @@ mod tests {
         assert_eq!(run(&mut s, 15, ALICE, encode_action(10, &[word_u(0), word_u(2)].concat())), "canceled oid 2");
         assert!(s.orders.is_empty());
         assert_eq!(s.margin(ALICE).withdrawable, 10_000_000_000);
+    }
+
+    #[test]
+    fn mirrored_orders_hold_original_size_and_replace_the_previous_reservation() {
+        let mut s = state();
+        s.perps.get_mut(&0).unwrap().name = "HYPE".into();
+        s.account(ALICE).positions.insert(0, Pos { szi_x8: -4_560_000_000, leverage: 10, ..Default::default() });
+        let before = s.margin(ALICE).withdrawable;
+        // Public snapshot at 1794447681531: remaining 1.64, original 4 HYPE, hold 28.7108 USD.
+        let orders = json!([
+            { "coin": "HYPE", "side": "A", "sz": "1.64", "origSz": "4.0", "limitPx": "71.777", "reduceOnly": false },
+            { "coin": "HYPE", "side": "B", "sz": "100", "origSz": "100", "limitPx": "71.777", "reduceOnly": true },
+            { "coin": "HYPE", "side": "A", "sz": "100", "origSz": "100", "limitPx": "71.777", "isTrigger": true }
+        ]);
+        assert!(s.mirror_order_margin(ALICE, 0, &orders).is_empty());
+        assert_eq!(before - s.margin(ALICE).withdrawable, 28_710_800);
+        assert!(s.orders.is_empty());
+        s.account(ALICE).vault = true;
+        assert_eq!(s.margin(ALICE).withdrawable, before);
+        s.account(ALICE).vault = false;
+        assert!(s.mirror_order_margin(ALICE, 0, &json!([])).is_empty());
+        assert_eq!(s.margin(ALICE).withdrawable, before);
+    }
+
+    #[test]
+    fn mirrored_reversal_margin_uses_the_sides_weighted_limit_price() {
+        // Public snapshot at 1794448147500: BTC long 4.96299, original asks 13.04811,
+        // ask notional 962317.17404 USD at 40x. The account held 5756.536461 USD.
+        let hold = OrderMargin { sizes: [0, 1_304_811_000], notionals: [0, 962_317_174_040], leverage: 40, isolated: false };
+        assert!(hold.held(496_299_000).abs_diff(5_756_536_461) < 10_000);
+        assert_eq!(hold.held(1_304_811_000), 0);
+        let isolated = OrderMargin { isolated: true, ..hold };
+        assert_eq!(isolated.held(496_299_000), 24_057_929_351);
+    }
+
+    #[test]
+    fn mirrored_flat_asset_uses_selected_leverage_and_roundtrips() {
+        let mut s = state();
+        let orders = json!([{ "coin": "BTC", "side": "B", "sz": "2", "origSz": "2", "limitPx": "90", "leverage": { "type": "cross", "value": 3 } }]);
+        assert!(s.mirror_order_margin(ALICE, 0, &orders).is_empty());
+        assert_eq!(s.margin(ALICE).withdrawable, 9_940_000_000);
+        let restored: State = serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
+        assert_eq!(restored.margin(ALICE).withdrawable, s.margin(ALICE).withdrawable);
     }
 
     #[test]

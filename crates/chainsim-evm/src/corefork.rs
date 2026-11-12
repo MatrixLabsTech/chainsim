@@ -603,15 +603,20 @@ impl EvmAdapter {
         let positions = info["clearinghouseState"]["assetPositions"].as_array().map_or(0, Vec::len);
         let balances = info["spotClearinghouseState"]["balances"].as_array().map_or(0, |b| b.iter().filter(|x| x["total"] != "0.0").count());
         let dexes: Vec<&str> = f.dexes.iter().map(|d| d.name.as_str()).collect();
+        let summarized_orders = std::iter::once(&f.orders).chain(f.dexes.iter().map(|d| &d.orders))
+            .flat_map(|orders| orders.as_array().into_iter().flatten())
+            .filter(|o| o["coin"].as_str().is_some_and(|c| !c.starts_with('@') && !c.contains('/'))).count();
         chainsim_core::log(format_args!("mirrored {addr}: {calls} info API calls, {rpc} upstream RPC calls, {} ms", started.elapsed().as_millis()));
         Ok((
             json!({
                 "kind": "hypercore", "helper": "mirror", "user": addr, "positions": positions, "spotBalances": balances,
                 "accountValue": info["clearinghouseState"]["marginSummary"]["accountValue"], "dexes": dexes,
+                "withdrawable": info["clearinghouseState"]["withdrawable"], "sourceWithdrawable": f.ch["withdrawable"], "sourceTime": f.ch["time"],
                 "borrowLend": info["borrowLendUserState"]["tokenToState"].as_array().map_or(0, Vec::len), "abstraction": f.abstraction,
                 "evm": evm, "skipped": skipped,
                 "marks": moved, "kept": kept, "filled": fills, "liquidated": liquidated.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
                 "infoCalls": calls, "upstreamCalls": rpc,
+                "orderMargin": { "summarizedOrders": summarized_orders, "executableOrders": false },
             }),
             json!({ "kind": "set-hypercore", "helper": "mirror", "user": addr, "positions": positions }),
         ))
@@ -622,12 +627,19 @@ impl EvmAdapter {
     async fn mirror_fetch(&self, handle: &ForkHandle, eng: &Engine<'_>, who: Address, calls: &mut u32) -> Result<MirrorFetch> {
         let state = coresync::load_state(eng).await?.ok_or_else(|| Error::new(ErrorCode::Internal, "this fork has no HyperCore state").next(format!("chainsim down {0} && chainsim up {1} --name {0}", handle.name, handle.chain)))?;
         let user = who.to_string().to_lowercase();
-        let ch = eng.info(json!({ "type": "clearinghouseState", "user": user }), calls).await?;
+        // Positions and orders must come from one response on rapidly changing accounts.
+        let combined = eng.info(json!({ "type": "webData2", "user": user }), calls).await?;
+        let ch = combined["clearinghouseState"].clone();
+        if !ch.is_object() || !combined["openOrders"].is_array() || !combined["isVault"].is_boolean() || !combined["meta"].is_object() || !combined["assetCtxs"].is_array() {
+            return Err(Error::new(ErrorCode::UpstreamUnavailable, "account snapshot is missing positions, orders or vault status"));
+        }
+        let orders = mirror_order_leverages(eng, &user, &ch, combined["openOrders"].clone(), calls).await?;
+        let vault = combined["isVault"] == true;
         let sch = eng.info(json!({ "type": "spotClearinghouseState", "user": user }), calls).await?;
         // Mainnet's marks and oracle prices of this moment, and the meta of perps the copy does not track.
-        let meta = match position_coins(&ch).is_empty() {
+        let meta = match mirror_coins(&ch, &orders).is_empty() {
             true => None,
-            false => Some(eng.info(json!({ "type": "metaAndAssetCtxs" }), calls).await?),
+            false => Some(json!([combined["meta"], combined["assetCtxs"]])),
         };
         let spot = match unknown_tokens(&state, &sch).is_empty() {
             true => None,
@@ -638,17 +650,20 @@ impl EvmAdapter {
         let mut dexes = Vec::new();
         for (index, name) in dex_names(&list) {
             let ch = eng.info(json!({ "type": "clearinghouseState", "user": user, "dex": name }), calls).await?;
+            let orders = eng.info(json!({ "type": "frontendOpenOrders", "user": user, "dex": name }), calls).await?;
+            let orders = mirror_order_leverages(eng, &user, &ch, orders, calls).await?;
             let value = ch["marginSummary"]["accountValue"].as_str().and_then(|v| hc::parse_dec(v, 6)).unwrap_or(0);
-            if position_coins(&ch).is_empty() && value == 0 {
+            let had_order_margin = state.accounts.get(&who).is_some_and(|a| a.order_margin.keys().any(|asset| hc::dex_of(*asset) == index));
+            if mirror_coins(&ch, &orders).is_empty() && value == 0 && !had_order_margin {
                 continue;
             }
             let meta = eng.info(json!({ "type": "metaAndAssetCtxs", "dex": name }), calls).await?;
-            dexes.push(DexFetch { index, name, ch, meta });
+            dexes.push(DexFetch { index, name, ch, meta, orders });
         }
         // Borrow and lend positions and the account abstraction.
         let lend = eng.info(json!({ "type": "borrowLendUserState", "user": user }), calls).await?;
         let abstraction = eng.info(json!({ "type": "userAbstraction", "user": user }), calls).await?;
-        Ok(MirrorFetch { who, ch, sch, meta, spot, list, dexes, lend, abstraction })
+        Ok(MirrorFetch { who, ch, sch, meta, spot, list, dexes, lend, abstraction, orders, vault })
     }
 
     /// `call hypercore_state [<user>]`: one user's Core state in the info API's shapes.
@@ -777,6 +792,8 @@ pub(crate) struct MirrorFetch {
     dexes: Vec<DexFetch>,
     lend: Value,
     abstraction: Value,
+    orders: Value,
+    vault: bool,
 }
 
 /// A builder-deployed dex the user has value on: its clearinghouseState and metaAndAssetCtxs.
@@ -786,6 +803,31 @@ struct DexFetch {
     name: String,
     ch: Value,
     meta: Value,
+    orders: Value,
+}
+
+fn mirror_coins(ch: &Value, orders: &Value) -> Vec<String> {
+    position_coins(ch).into_iter().chain(orders.as_array().into_iter().flatten()
+        .filter(|o| o["reduceOnly"] != true && o["isTrigger"] != true)
+        .filter_map(|o| o["coin"].as_str()).filter(|c| !c.starts_with('@') && !c.contains('/')).map(str::to_string))
+        .collect::<BTreeSet<_>>().into_iter().collect()
+}
+
+async fn mirror_order_leverages(eng: &Engine<'_>, user: &str, ch: &Value, mut orders: Value, calls: &mut u32) -> Result<Value> {
+    if !orders.is_array() {
+        return Err(Error::new(ErrorCode::UpstreamUnavailable, "account orders are not an array"));
+    }
+    let held: BTreeSet<_> = position_coins(ch).into_iter().collect();
+    for coin in mirror_coins(&json!({}), &orders).into_iter().filter(|c| !held.contains(c)) {
+        let data = eng.info(json!({ "type": "activeAssetData", "user": user, "coin": coin }), calls).await?;
+        if data["leverage"]["value"].as_u64().is_none_or(|v| v == 0) {
+            return Err(Error::new(ErrorCode::UpstreamUnavailable, format!("missing selected leverage for {coin}")));
+        }
+        for order in orders.as_array_mut().into_iter().flatten().filter(|o| o["coin"] == coin) {
+            order["leverage"] = data["leverage"].clone();
+        }
+    }
+    Ok(orders)
 }
 
 fn position_coins(ch: &Value) -> Vec<String> {
@@ -793,9 +835,9 @@ fn position_coins(ch: &Value) -> Vec<String> {
 }
 
 /// Coins the user has positions in on the main dex that the state does not track.
-fn untracked_coins(state: &State, ch: &Value) -> Vec<String> {
+fn untracked_coins(state: &State, ch: &Value, orders: &Value) -> Vec<String> {
     let by_name: BTreeSet<&str> = state.perps.values().map(|p| p.name.as_str()).collect();
-    position_coins(ch).into_iter().filter(|c| !by_name.contains(c.as_str())).collect()
+    mirror_coins(ch, orders).into_iter().filter(|c| !by_name.contains(c.as_str())).collect()
 }
 
 fn unknown_tokens(state: &State, sch: &Value) -> Vec<u64> {
@@ -845,7 +887,7 @@ async fn mirror_track_locked(rpc: &dyn CoreRpc, f: &MirrorFetch) -> Result<()> {
     let mut entries = Vec::new();
     if let Some(meta) = &f.meta {
         let universe = meta[0]["universe"].as_array().cloned().unwrap_or_default();
-        for coin in untracked_coins(&state, &f.ch) {
+        for coin in untracked_coins(&state, &f.ch, &f.orders) {
             let Some(a) = universe.iter().position(|u| u["name"] == json!(coin)) else { continue };
             let (u, ctx) = (&universe[a], &meta[1][a]);
             let d = u["szDecimals"].as_u64().unwrap_or(0) as u8;
@@ -866,7 +908,7 @@ async fn mirror_track_locked(rpc: &dyn CoreRpc, f: &MirrorFetch) -> Result<()> {
             let collateral = d.meta[0]["collateralToken"].as_u64().unwrap_or(0);
             snapshot.dexes.insert(d.name.clone(), hc::DexMeta { index: d.index, collateral, meta: Box::new(hc::Meta::from_info(&d.meta)) });
             let universe = d.meta[0]["universe"].as_array().cloned().unwrap_or_default();
-            for coin in position_coins(&d.ch) {
+            for coin in mirror_coins(&d.ch, &d.orders) {
                 let Some(local) = universe.iter().position(|u| u["name"] == json!(coin)) else { continue };
                 let perp = d.index * hc::DEX_SIZE + local as u32;
                 if !state.perps.contains_key(&perp) {
@@ -911,9 +953,12 @@ async fn mirror_account_locked(rpc: &dyn CoreRpc, f: &MirrorFetch) -> Result<Mir
     let time = coresync::block_time(&rpc.call("eth_getBlockByNumber", json!(["latest", false])).await?)?;
     let (applied, moved, kept) = state.mirror_prices(f.who, &prices, time);
     let mut skipped = state.mirror_perps(f.who, &f.ch);
+    state.accounts.entry(f.who).or_default().vault = f.vault;
+    skipped.extend(state.mirror_order_margin(f.who, 0, &f.orders));
     skipped.extend(state.mirror_spot(f.who, &f.sch));
     for d in &f.dexes {
         skipped.extend(state.mirror_dex(f.who, d.index, &d.ch));
+        skipped.extend(state.mirror_order_margin(f.who, d.index, &d.orders));
     }
     skipped.extend(state.mirror_lend(f.who, &f.lend, &f.abstraction).into_iter().map(|t| format!("borrow and lend token {t}")));
     let mut answers = state.answers_for(&applied);
@@ -1057,6 +1102,8 @@ mod tests {
             dexes: vec![],
             lend: json!({}),
             abstraction: json!("default"),
+            orders: json!([]),
+            vault: false,
         }
     }
 
@@ -1070,6 +1117,21 @@ mod tests {
         s.cursor = Some((10, "0xa".into()));
         coresync::store(&chain, &s, &[]).await.unwrap();
         chain
+    }
+
+    #[tokio::test]
+    async fn a_mirror_stores_order_holds_without_executable_orders() {
+        let chain = chain_with_core(false).await;
+        let mut f = fetched();
+        let before = mirror_apply(&chain, &chain, &f).await.unwrap().state.margin(CAROL).withdrawable;
+        f.orders = json!([{ "coin": "BTC", "side": "B", "limitPx": "90", "sz": "1", "origSz": "2" }]);
+        let mirrored = mirror_apply(&chain, &chain, &f).await.unwrap();
+        assert_eq!(before - mirrored.state.margin(CAROL).withdrawable, 36_000_000);
+        let stored = coresync::load_state(&chain).await.unwrap().unwrap();
+        assert_eq!(stored.margin(CAROL).withdrawable, mirrored.state.margin(CAROL).withdrawable);
+        assert!(stored.orders.is_empty());
+        f.orders = json!([]);
+        assert_eq!(mirror_apply(&chain, &chain, &f).await.unwrap().state.margin(CAROL).withdrawable, before);
     }
 
     #[tokio::test]
