@@ -61,8 +61,9 @@ error codes from the binary.
   them back.
 - `describe` and the `fork` object carry each chain's `limits`: plain sentences on how the fork
   differs from the real chain, to copy into a report word for word.
-- The `fork` object's `rpcUrl` is the engine's in-network RPC URL, or `null` when the engine
-  serves no RPC (Aptos). `forkPoint.kind` is `block`, `checkpoint` (Sui) or `version` (Aptos).
+- The `fork` object's `rpcUrl` is the engine's in-network RPC URL. On Aptos it is the fork's
+  REST endpoint, and `rpcUrl` plus `/v1` is the fullnode URL for an Aptos SDK. `forkPoint.kind`
+  is `block`, `checkpoint` (Sui) or `version` (Aptos).
 - On HyperEVM, the `fork` object carries a `hypercore` field: the HyperCore answers `up` seeded
   and, under `core`, the order books it took. In `status` it adds `coreWriterActions`, the count
   of captured CoreWriter actions, and `coreState`. Other chains' fork objects have no such field.

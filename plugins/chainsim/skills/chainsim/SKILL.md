@@ -26,9 +26,8 @@ Work through these steps in order. Each ends on a check you can make.
    each supports, then `chainsim describe <chain>`. Done when the `limits` that touch this
    task, and the `upstream` it reads from, are in your working notes or report.
 3. **Start the fork.** Run `chainsim up <chain>`. For a tool in a container, join its network
-   with `--network <net> --alias <host>`. For a tool on the host, add `--publish`. An Aptos fork
-   serves no RPC, so it takes neither and its `rpcUrl` is `null`. Done when you hold the `fork`
-   object it prints.
+   with `--network <net> --alias <host>`. For a tool on the host, add `--publish`. Done when you
+   hold the `fork` object it prints.
 4. **Prove it is fit.** Run `chainsim selftest <name>`. Done when it exits 0. On any other exit,
    follow `error.next`, and stop the task if it stays red.
 5. **Fund a fresh test wallet.** Run `chainsim fund <name> <address> --native <amount>` and
@@ -64,7 +63,8 @@ Work through these steps in order. Each ends on a check you can make.
 `fork` is what `up` returns and every later step reads. Its `rpcUrl` is in-network: containers on
 `fork.network` reach it, the host does not. From the host, use `chainsim call <name> <method>
 [<params-json>]`, or start the fork with `--publish` and use `fork.hostRpcUrl`. On Aptos,
-`rpcUrl` is `null`: read the fork with `chainsim call <name> view|resource|ledger`. On HyperEVM,
+`rpcUrl` is a fullnode REST endpoint: give an Aptos SDK `rpcUrl` plus `/v1` as its fullnode, or
+read the fork with `chainsim call <name> view|resource|ledger`. On HyperEVM,
 `fork.hypercore` lists the HyperCore answers seeded at `up`.
 
 Copy `fork.limits` into the report word for word: they are how the fork differs from the real

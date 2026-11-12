@@ -148,7 +148,7 @@ What each chain adds:
 - [Arc](chains/arc/README.md): Circle's own engine, so native USDC behaves as on Arc.
 - [Robinhood Chain](chains/robinhood/README.md): Arbitrum's ArbSys and ArbGasInfo precompiles answer on the copy.
 - [Sui](chains/sui/README.md): `set object` changes any Move object's fields, and SUI and USDC funding takes seconds.
-- [Aptos](chains/aptos/README.md): entry functions as any account, APT and native USDC funding, and `set resource` for any Move resource.
+- [Aptos](chains/aptos/README.md): a fullnode REST endpoint for the Aptos SDKs, entry functions as any account, APT and native USDC funding, and `set resource` for any Move resource.
 - [HyperEVM](chains/hyperliquid/README.md): a local HyperCore, so CoreWriter orders fill against the mainnet book, prices, funding and liquidations can be scripted or replayed, and an RPC proxy serves any client and the `/info` API.
 
 Each chain page covers its engine, tokens, funding, `send` and `set` support, and selftest
