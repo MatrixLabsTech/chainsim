@@ -98,13 +98,13 @@ enum Command {
         /// The sender to act as (impersonated; a mainnet-active address works).
         #[arg(long = "as", value_name = "ADDRESS")]
         from: String,
-        /// The contract address (EVM), or the Move function package::module::function<T...> (Sui, Aptos).
-        #[arg(long)]
+        /// The contract address (EVM), the Move function package::module::function<T...> (Sui, Aptos), or the receiver of a transfer (Solana).
+        #[arg(long, default_value = "")]
         to: String,
         /// The function, such as "pause()" or "transfer(address,uint256)", followed by its arguments.
         #[arg(long, conflicts_with = "data")]
         sig: Option<String>,
-        /// Raw calldata in hex, instead of --sig.
+        /// Raw calldata in hex, instead of --sig (EVM), or a whole base64 transaction, instead of --to (Solana).
         #[arg(long)]
         data: Option<String>,
         /// Native value to send, in whole units of the native symbol.

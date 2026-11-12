@@ -3,6 +3,9 @@
 
 pub mod fund;
 pub mod rpc;
+pub mod send;
+pub mod snapshot;
+pub mod time;
 pub mod units;
 
 use std::collections::HashMap;
@@ -28,8 +31,10 @@ const READY_TIMEOUT: Duration = Duration::from_secs(90);
 const DATASOURCE_ENV: &str = "SURFPOOL_DATASOURCE_RPC_URL";
 /// The address selftest funds. No key for it is known.
 const ST_RECEIVER: &str = "US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELGZ";
+/// The address selftest sends from: the SHA-256 of "chainsim selftest sender". No key for it is known.
+const ST_SENDER: &str = "9JK5Y9jJJkJNbi52uCbxTtNKfmBhSsbindebh2noAWRc";
 
-pub const OPERATIONS: &[&str] = &["describe", "up", "down", "ls", "status", "fund", "set", "call", "selftest"];
+pub const OPERATIONS: &[&str] = &["describe", "up", "down", "ls", "status", "fund", "send", "set", "snapshot", "revert", "time", "mine", "call", "selftest"];
 
 /// Whether `set <kind>` works on Solana. Raw account data and owner changes
 /// go through `call <name> surfnet_setAccount`.
@@ -52,7 +57,7 @@ pub fn surfpool_args(profile: &Profile) -> Vec<String> {
 }
 
 pub struct SolanaAdapter {
-    docker: Docker,
+    pub(crate) docker: Docker,
     lock: EngineLock,
 }
 
@@ -69,13 +74,13 @@ impl SolanaAdapter {
         Ok(Self { docker: Docker::connect().await?, lock: EngineLock::embedded()? })
     }
 
-    fn rpc<'a>(&'a self, handle: &ForkHandle, profile: &Profile) -> Rpc<'a> {
+    pub(crate) fn rpc<'a>(&'a self, handle: &ForkHandle, profile: &Profile) -> Rpc<'a> {
         let secret = profile.upstream_is_secret().then(|| profile.upstream_url());
         Rpc { control: Control::new(&self.docker, handle.control_container.clone(), secret).with_env(&profile.upstream.env), url: Target::Engine(handle.rpc_url(profile)) }
     }
 
     /// The fork, its profile, and a running engine, or an error an agent can act on.
-    async fn open(&self, name: &str) -> Result<(ForkHandle, Profile)> {
+    pub(crate) async fn open(&self, name: &str) -> Result<(ForkHandle, Profile)> {
         let handle = self.docker.find(name).await?.ok_or_else(|| Error::fork_not_found(name))?;
         let profile = profile::get(&handle.chain)?;
         if !handle.running || !self.docker.is_running(&handle.control_container).await {
@@ -137,13 +142,17 @@ impl SolanaAdapter {
             (docker::LABEL_ALIAS.to_string(), alias.clone()),
             (docker::LABEL_NETWORK_CREATED.to_string(), created.to_string()),
         ]);
+        // The fork volume holds the snapshots, and is created owned by the engine user.
+        if let Some(owner) = &engine.user {
+            self.docker.ensure_volume_owned(&self.lock, &snapshot::data_volume(name), name, owner).await?;
+        }
         let spec = ContainerSpec {
             name: docker::engine_container(name),
             image,
             user: engine.user.clone(),
-            // The image's own entrypoint runs surfpool with these arguments.
-            entrypoint: None,
-            cmd: surfpool_args(profile),
+            // A shell loop runs surfpool with these arguments, so revert can start it again from a snapshot.
+            entrypoint: Some(vec!["/bin/sh".into(), "-c".into()]),
+            cmd: vec![snapshot::engine_script(&surfpool_args(profile))],
             env: vec![format!("{DATASOURCE_ENV}={upstream}"), "HOME=/tmp".to_string()],
             labels,
             network,
@@ -152,7 +161,7 @@ impl SolanaAdapter {
             tmpfs: vec![("/tmp".to_string(), "rw,nosuid,size=256m".to_string()), ("/workspace".to_string(), "rw,nosuid,size=64m,mode=1777".to_string())],
             memory: docker::ENGINE_MEMORY,
             publish: req.publish.then_some(profile.rpc_port()),
-            mounts: vec![],
+            mounts: vec![(snapshot::data_volume(name), snapshot::DATA.into())],
         };
         self.docker.run(&spec).await?;
 
@@ -181,7 +190,7 @@ impl SolanaAdapter {
     }
 
     /// The selftest checks, in order. They leave 1 SOL and 1 of the profile's
-    /// selftest token on the throwaway address.
+    /// selftest token on the throwaway address, and 1 SOL less the transfer and its fee on the sender.
     async fn checks(&self, name: &str, rpc: &Rpc<'_>, profile: &Profile) -> Vec<Check> {
         let mut out = Vec::new();
 
@@ -236,11 +245,15 @@ impl SolanaAdapter {
             }
             out.push(Check { part: "fund-token", ok: funded, reason: if funded { "a token balance set on the fork read back exactly" } else { "a token balance set on the fork did not read back" }, ms: ms(t) });
         }
+
+        let t = Instant::now();
+        let sent = send::selftest_transfer(self, name, rpc, profile, ST_SENDER, ST_RECEIVER).await;
+        out.push(Check { part: "send-as", ok: sent, reason: if sent { "a transfer sent as an address without its key moved the amount" } else { "a transfer sent as an address without its key did not land" }, ms: ms(t) });
         out
     }
 
     /// Adds one change to the fork's list, which `status` shows.
-    async fn record(&self, name: &str, mut entry: Value) -> Result<()> {
+    pub(crate) async fn record(&self, name: &str, mut entry: Value) -> Result<()> {
         entry["at"] = json!(now_secs());
         chainsim_core::mods::record(&self.docker, name, &entry).await
     }
@@ -389,12 +402,24 @@ impl Adapter for SolanaAdapter {
         Ok(out)
     }
 
-    async fn snapshot(&self, _name: &str) -> Result<Snapshot> {
-        Err(Error::unsupported("snapshot", "chainsim down <name> then chainsim up <chain> gives a fresh fork"))
+    async fn snapshot(&self, name: &str) -> Result<Snapshot> {
+        snapshot::snapshot(self, name).await
     }
 
-    async fn revert(&self, _name: &str, _id: &str) -> Result<Reverted> {
-        Err(Error::unsupported("revert", "chainsim down <name> then chainsim up <chain> gives a fresh fork"))
+    async fn revert(&self, name: &str, id: &str) -> Result<Reverted> {
+        snapshot::revert(self, name, id).await
+    }
+
+    async fn send(&self, name: &str, req: &SendRequest) -> Result<Value> {
+        send::send(self, name, req).await
+    }
+
+    async fn time(&self, name: &str, req: &TimeRequest) -> Result<Value> {
+        time::time(self, name, req).await
+    }
+
+    async fn mine(&self, name: &str, blocks: Option<u64>) -> Result<Value> {
+        time::mine(self, name, blocks).await
     }
 
     async fn call(&self, name: &str, method: &str, params: Value, from: Option<&str>) -> Result<Value> {
