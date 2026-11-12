@@ -449,7 +449,7 @@ impl EvmAdapter {
         };
         self.docker.run(&spec).await?;
 
-        let handle = self.docker.find(name).await?.ok_or_else(|| Error::new(ErrorCode::EngineFailed, "the engine container vanished after start"))?;
+        let mut handle = self.docker.find(name).await?.ok_or_else(|| Error::new(ErrorCode::EngineFailed, "the engine container vanished after start"))?;
         let eng = self.engine(&handle, profile);
         let direct = Engine { control: Control::new(&self.docker, handle.control_container.clone(), secret.clone()).with_env(&profile.upstream.env), url: Target::Engine(engine_url(&handle, profile)), info: None, prefetched: Default::default() };
         let started = Instant::now();
@@ -468,6 +468,7 @@ impl EvmAdapter {
         }
         if proxied {
             self.start_proxy(&handle, profile, req, &network, &alias, &eng).await?;
+            handle = self.docker.find(name).await?.ok_or_else(|| Error::new(ErrorCode::EngineFailed, "the engine container vanished after proxy start"))?;
         }
 
         for o in &profile.overrides {

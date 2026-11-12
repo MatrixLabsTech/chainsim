@@ -247,21 +247,22 @@ fn ethereum_mainnet() {
 #[test]
 #[ignore]
 fn publish_binds_loopback_only() {
-    let name = "acc-pub";
-    chainsim(&["down", name]);
-    let fork = ok(&["up", "arc-mainnet", "--name", name, "--publish"]);
-    let url = fork["hostRpcUrl"].as_str().expect("hostRpcUrl").to_string();
-    assert!(url.starts_with("http://127.0.0.1:"), "{url}");
-    check_hardening(name, true);
-    let out = Command::new("curl")
-        .args(["-s", "-X", "POST", "-H", "content-type: application/json", "--data", r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}"#, &url])
-        .output()
-        .unwrap();
-    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["result"], "0x13b2");
-    // A second up asking --publish of a fork without it is a conflict.
-    ok(&["down", name]);
-    assert_gone(name);
+    for (chain, chain_id) in [("arc-mainnet", "0x13b2"), ("hyperevm-mainnet", "0x3e7")] {
+        let name = "acc-pub";
+        chainsim(&["down", name]);
+        let fork = ok(&["up", chain, "--name", name, "--publish"]);
+        let url = fork["hostRpcUrl"].as_str().expect("hostRpcUrl").to_string();
+        assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+        check_hardening(name, chain == "arc-mainnet");
+        let out = Command::new("curl")
+            .args(["-s", "-X", "POST", "-H", "content-type: application/json", "--data", r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}"#, &url])
+            .output()
+            .unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["result"], chain_id);
+        ok(&["down", name]);
+        assert_gone(name);
+    }
 }
 
 #[test]
