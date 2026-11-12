@@ -15,6 +15,7 @@ path = "src/main.rs"
 chainsim-aptos.workspace = true
 chainsim-core.workspace = true
 chainsim-evm.workspace = true
+chainsim-solana.workspace = true
 chainsim-sui.workspace = true
 clap.workspace = true
 serde.workspace = true

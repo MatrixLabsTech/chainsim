@@ -497,6 +497,7 @@ dependencies = [
  "chainsim-aptos",
  "chainsim-core",
  "chainsim-evm",
+ "chainsim-solana",
  "chainsim-sui",
  "clap",
  "serde",
@@ -556,6 +557,16 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+]
+
+[[package]]
+name = "chainsim-solana"
+version = "0.1.13"
+dependencies = [
+ "async-trait",
+ "chainsim-core",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

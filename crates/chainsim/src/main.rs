@@ -16,6 +16,7 @@ use chainsim_core::lock::EngineLock;
 use chainsim_core::profile::{self, Profile};
 use chainsim_core::{envelope, Adapter, Error, ErrorCode, Result};
 use chainsim_evm::EvmAdapter;
+use chainsim_solana::SolanaAdapter;
 use chainsim_sui::SuiAdapter;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde_json::{json, Value};
@@ -322,6 +323,7 @@ async fn adapter(family: &str) -> Result<Box<dyn Adapter>> {
         "evm" => Ok(Box::new(EvmAdapter::connect().await?)),
         "sui" => Ok(Box::new(SuiAdapter::connect().await?)),
         "aptos" => Ok(Box::new(AptosAdapter::connect().await?)),
+        "solana" => Ok(Box::new(SolanaAdapter::connect().await?)),
         other => Err(Error::unsupported(&format!("the {other} family"), "chainsim describe")),
     }
 }
@@ -345,7 +347,7 @@ fn describe_profile(p: &Profile, lock: &EngineLock) -> Value {
         // A source-built engine: the repo, branch and commit it compiles.
         "engineSource": engine.and_then(|e| e.build.as_ref()).and_then(|b| b.source.as_ref()),
         "maturity": p.maturity,
-        "operations": match p.family.as_str() { "evm" => chainsim_evm::OPERATIONS, "sui" => chainsim_sui::OPERATIONS, "aptos" => chainsim_aptos::OPERATIONS, _ => &[] },
+        "operations": match p.family.as_str() { "evm" => chainsim_evm::OPERATIONS, "sui" => chainsim_sui::OPERATIONS, "aptos" => chainsim_aptos::OPERATIONS, "solana" => chainsim_solana::OPERATIONS, _ => &[] },
         "upstream": p.upstream_info(),
         "native": p.native,
         "tokens": p.tokens,

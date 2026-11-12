@@ -1,0 +1,35 @@
+{
+  "key": "solana-mainnet",
+  "id": "solana:mainnet",
+  "name": "Solana Mainnet",
+  "family": "solana",
+  "engine": "surfpool",
+  "upstream": { "default": "https://api.mainnet-beta.solana.com", "env": "CHAINSIM_SOLANA_MAINNET_RPC" },
+  "ports": { "rpc": 8899, "ws": 8900 },
+  "maturity": "experimental",
+  "fork": { "default": "latest", "flags": [] },
+  "native": { "symbol": "SOL", "decimals": 9 },
+  "overrides": [],
+  "tokens": [
+    { "symbol": "USDC", "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "decimals": 6 }
+  ],
+  "warmup": [],
+  "selftest": { "token": "USDC", "extras": [] },
+  "funder": null,
+  "control": null,
+  "hypercore": null,
+  "limits": [
+    "Experimental: the engine is Surfpool 1.7.0 (https://github.com/solana-foundation/surfpool), run from the image surfpool/surfpool:1.7.0 that engines.lock.json pins by digest.",
+    "This is a private copy of Solana Mainnet: transactions run on the copy only and never appear on Solana Mainnet or its explorers.",
+    "There is no pinned fork point, so up --block exits 3. The copy starts at the upstream's current slot and reads each account from the upstream when it is first touched, as Solana Mainnet has it at that moment. forkPoint is the upstream's slot read just before the engine started.",
+    "The copy reads Solana Mainnet from https://api.mainnet-beta.solana.com by default, and CHAINSIM_SOLANA_MAINNET_RPC replaces it with a provider URL. The public endpoint throttles scans such as getProgramAccounts and getTokenLargestAccounts, so heavier runs need a provider URL.",
+    "fund, set balance and set token write balances with Surfpool's surfnet_setAccount and surfnet_setTokenAccount. A token balance goes to the owner's token account under the program that owns the mint, Token or Token-2022. Nothing is sent on Solana Mainnet.",
+    "fund refuses an address that holds SOL on Solana Mainnet. set balance and set token write any address.",
+    "Raw account data and owner changes go through chainsim call <name> surfnet_setAccount. status lists every fund, set and surfnet_ write made through chainsim. A write that another client sends to rpcUrl is not listed.",
+    "getSlot at the default (finalized) commitment trails the processed slot by about 31 slots.",
+    "Each selftest run sets 1 SOL and 1 USDC on the fixed throwaway address US517G5965aydkZ46HS38QLi7UQiSojurfbQfKCELGZ on the copy and leaves them in place.",
+    "Solana signatures do not bind to this copy. A transaction signed for the copy is valid on Solana Mainnet while its blockhash is recent there. The copy's blockhashes are local, so use test keys that hold no mainnet assets.",
+    "The websocket subscriptions rootSubscribe, blockSubscribe and voteSubscribe send nothing.",
+    "up --publish binds the RPC port on 127.0.0.1. The websocket port is reachable on the fork's Docker network only."
+  ]
+}

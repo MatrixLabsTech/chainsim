@@ -13,6 +13,7 @@ fn operations(family: &str) -> &'static [&'static str] {
         "evm" => chainsim_evm::OPERATIONS,
         "sui" => chainsim_sui::OPERATIONS,
         "aptos" => chainsim_aptos::OPERATIONS,
+        "solana" => chainsim_solana::OPERATIONS,
         _ => &[],
     }
 }
@@ -23,6 +24,7 @@ fn supports_set(p: &Profile, kind: &SetKind) -> bool {
         "evm" => chainsim_evm::supports_set(p, kind),
         "sui" => chainsim_sui::supports_set(p, kind),
         "aptos" => chainsim_aptos::supports_set(p, kind),
+        "solana" => chainsim_solana::supports_set(p, kind),
         _ => false,
     }
 }

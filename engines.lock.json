@@ -112,6 +112,19 @@
         }
       }
     },
+    "surfpool": {
+      "name": "Surfpool",
+      "version": "1.7.0",
+      "user": "10001:10001",
+      "pull": {
+        "image": "surfpool/surfpool:1.7.0",
+        "digest": "sha256:88d8c8a938cd41780caf1b52ecd6b97e863580aa97d52b9964ed4544631bf445",
+        "platforms": {
+          "amd64": "sha256:c6c98ba4b2e220edf69864671ebc130a64138f1016c313094c8111b26ca2f7af",
+          "arm64": "sha256:dea22cb9cf0a5ef472b07e0791986c4198e5267e4be5b24b5ed1118dc38282d4"
+        }
+      }
+    },
     "control-grpcurl": {
       "name": "grpcurl",
       "version": "1.9.3",
