@@ -70,8 +70,9 @@ error codes from the binary.
   `signature`, `slot`, `err` and `logs`. `time` and `mine` return the slot read at processed
   commitment. `up --block` exits 3, since the engine has no pinned fork point. `set <name> price
   <feed> <usd> [--conf <usd>]` writes a Pyth price account with a publish time equal to the
-  fork's Clock, and `time <name> --replay <feed> --from <time> --to <time>` plays a past range
-  of real prices, one step a minute, and returns each step under `applied`. `set <name> mirror
+  fork's Clock, and `time <name> --replay <feed> (--from <time> --to <time> | --file <csv>)`
+  plays a past range of prices, or the rows of your own file, and returns each step under
+  `applied`. `set <name> mirror
   kamino <obligation> --to <test wallet>` copies a Kamino Lend obligation of Solana Mainnet onto
   a wallet that then signs for it, and returns the copy's address under `obligation`.
 - On HyperEVM, the `fork` object carries a `hypercore` field: the HyperCore answers `up` seeded

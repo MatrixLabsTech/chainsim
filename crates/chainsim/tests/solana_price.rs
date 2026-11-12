@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 /// The Pyth SOL/USD price account.
 const SOL_USD: &str = "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE";
 const BTC_USD: &str = "4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo";
+const USDC_USD: &str = "Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX";
 const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 /// A wallet that holds SOL on Solana Mainnet, the fee payer of the program calls.
 const MAINNET_WALLET: &str = "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9";
@@ -106,10 +107,10 @@ fn refresh_reserve(name: &str) -> String {
 
 /// The source's close for each minute of `[from, to)`, read here with curl.
 fn source_closes(from: u64, to: u64) -> Vec<(u64, f64)> {
-    let url = format!("https://api.exchange.coinbase.com/products/SOL-USD/candles?granularity=60&start={from}&end={}", to - 60);
-    let out = Command::new("curl").args(["-sS", "-m", "30", "-H", "User-Agent: chainsim-test", &url]).output().expect("curl");
+    let body = json!({ "type": "candleSnapshot", "req": { "coin": "SOL", "interval": "1m", "startTime": from * 1000, "endTime": (to - 60) * 1000 } }).to_string();
+    let out = Command::new("curl").args(["-sS", "-m", "30", "-X", "POST", "-H", "content-type: application/json", "--data", &body, "https://api.hyperliquid.xyz/info"]).output().expect("curl");
     let rows: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("the source answered no JSON ({e}): {}", String::from_utf8_lossy(&out.stdout)));
-    let mut closes: Vec<(u64, f64)> = rows.as_array().expect("candles").iter().map(|r| (r[0].as_u64().unwrap(), r[4].as_f64().unwrap())).collect();
+    let mut closes: Vec<(u64, f64)> = rows.as_array().expect("candles").iter().map(|r| (r["t"].as_u64().unwrap() / 1000, r["c"].as_str().unwrap().parse().unwrap())).collect();
     closes.sort_by_key(|c| c.0);
     closes
 }
@@ -176,7 +177,7 @@ fn solana_price_set_and_replay() {
     assert!(applied.len() >= 30, "{} steps", applied.len());
     assert_eq!(applied.len(), source.len(), "one step for each candle of the source");
     assert_eq!((replay["steps"].as_u64(), replay["feed"].as_str()), (Some(applied.len() as u64), Some("SOL/USD")));
-    assert!(replay["source"].as_str().unwrap().contains("Coinbase"));
+    assert!(replay["source"].as_str().unwrap().contains("Hyperliquid"));
     // Three sampled steps: the price the account read back at that step is the source's for that minute,
     // and the fork's clock moved by the time between the candles.
     let first_clock = applied[0]["clock"].as_i64().unwrap();
@@ -205,12 +206,37 @@ fn solana_price_set_and_replay() {
     fails(&["time", name, "--replay", "SOL/USD", "--from", &(from - 3 * 86400).to_string(), "--to", &(from - 2 * 86400 + 60).to_string()], 2, "usage");
     fails(&["time", name, "--replay", "SOL/USD", "--from", &host_now.to_string(), "--to", &(host_now + 3600).to_string()], 2, "usage");
     fails(&["time", name, "--replay", "NOPE", "--from", &from.to_string(), "--to", &to.to_string()], 2, "usage");
+    fails(&["time", name, "--replay", "SOL/USD"], 2, "usage");
+    // A range the source no longer keeps points at --file.
+    let old = fails(&["time", name, "--replay", "SOL/USD", "--from", "2025-01-01", "--to", "2025-01-01T01:00Z"], 2, "usage");
+    assert!(old["error"]["next"].as_str().unwrap().contains("--file"), "{old}");
+
+    // A price file replays any feed at its own times: here USDC/USD, 90 and then 210 seconds apart.
+    let file = std::env::temp_dir().join("chainsim-acc-sol-px.csv");
+    std::fs::write(&file, "time,price\n1735689600,1.0001\n1735689690,0.9995\n1735689900,1\n").unwrap();
+    let before_file = clock(name);
+    let played = ok(&["time", name, "--replay", "USDC/USD", "--file", file.to_str().unwrap()]);
+    assert_eq!((played["steps"].as_u64(), played["feed"].as_str(), played["from"].as_u64(), played["to"].as_u64()), (Some(3), Some("USDC/USD"), Some(1735689600), Some(1735689900)));
+    assert!(played["source"].as_str().unwrap().contains("CSV"));
+    let rows = played["applied"].as_array().unwrap();
+    let prices: Vec<&str> = rows.iter().map(|r| r["price"].as_str().unwrap()).collect();
+    assert_eq!(prices, ["1.0001", "0.9995", "1"]);
+    let at: Vec<i64> = rows.iter().map(|r| r["clock"].as_i64().unwrap()).collect();
+    assert!((0..10).contains(&(at[0] - before_file)), "the first row lands at the fork's clock");
+    assert_eq!((at[1] - at[0], at[2] - at[0]), (90, 300));
+    let usdc = price(name, USDC_USD);
+    assert_eq!((usdc.price, usdc.publish_time), (100_000_000, at[2]));
+    std::fs::write(&file, "1735689600,1\n1735689600,2\n").unwrap();
+    fails(&["time", name, "--replay", "USDC/USD", "--file", file.to_str().unwrap()], 2, "usage");
+    fails(&["time", name, "--replay", "USDC/USD", "--file", "/no/such/file.csv"], 2, "usage");
+    let _ = std::fs::remove_file(&file);
 
     // status lists each price change.
     let status = ok(&["status", name]);
     let mods = status["modifications"].as_array().unwrap();
     let kinds: Vec<&str> = mods.iter().map(|m| m["kind"].as_str().unwrap()).collect();
     assert_eq!(kinds.iter().filter(|k| **k == "set-price").count(), 3, "{kinds:?}");
+    assert_eq!(kinds.iter().filter(|k| **k == "replay").count(), 2, "{kinds:?}");
     let listed = mods.iter().find(|m| m["kind"] == "replay").expect("a replay entry");
     assert_eq!((listed["feed"].as_str(), listed["steps"].as_u64(), listed["of"].as_u64(), listed["from"].as_u64()), (Some("SOL/USD"), Some(applied.len() as u64), Some(applied.len() as u64), Some(from)));
 

@@ -322,7 +322,7 @@ chainsim set solana-mainnet price SOL/USD 123.45 --conf 0.05
 ```
 
 ```json
-{"kind": "price", "feed": "SOL/USD", "account": "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE", "price": "123.45", "conf": "0.05", "raw": "12345000000", "exponent": -8, "publishTime": 1794577235, "clock": 1794577235, "slot": 468891044, "previous": {"price": "81.47896745", "publishTime": 1794490829}}
+{"kind": "price", "feed": "SOL/USD", "account": "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE", "price": "123.45", "conf": "0.05", "raw": "12345000000", "exponent": -8, "publishTime": 1794578690, "clock": 1794578690, "slot": 468897789, "previous": {"price": "81.24469456", "publishTime": 1794492279}}
 ```
 
 - The feed is `SOL/USD`, `BTC/USD`, `ETH/USD` or `USDC/USD`, or the address of any Pyth price
@@ -332,33 +332,56 @@ chainsim set solana-mainnet price SOL/USD 123.45 --conf 0.05
   reserve's price (measured on 2026-11-12).
 - A program that reads its price from another oracle does not see the change.
 
-`time --replay` plays a past range of real prices, one step a minute. Each step moves the clock
+`time --replay` plays a past range of prices, one step a minute. Each step moves the clock
 forward by a minute and writes that minute's price with a publish time equal to the Clock:
 
 ```sh
-chainsim time solana-mainnet --replay SOL/USD --from 2026-11-11T12:00Z --to 2026-11-11T12:05Z
+chainsim time solana-mainnet --replay SOL/USD --from 1794405840 --to 1794406140
 ```
 
 ```json
 {
   "kind": "replay", "feed": "SOL/USD", "account": "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE",
-  "source": "Coinbase Exchange 1-minute candles, close price, SOL-USD",
-  "from": 1794398400, "to": 1794398700, "steps": 5, "clock": {"from": 1794577235, "to": 1794577475}, "slot": 468892003,
+  "source": "Hyperliquid 1-minute perp candles, close price, SOL",
+  "from": 1794405840, "to": 1794406080, "steps": 5, "clock": {"from": 1794578690, "to": 1794578930}, "slot": 468898749,
   "applied": [
-    {"clock": 1794577235, "price": "83.76", "time": 1794398400},
-    {"clock": 1794577295, "price": "83.84", "time": 1794398460},
-    {"clock": 1794577355, "price": "83.79", "time": 1794398520},
-    {"clock": 1794577415, "price": "83.78", "time": 1794398580},
-    {"clock": 1794577475, "price": "83.65", "time": 1794398640}
+    {"clock": 1794578690, "price": "84.688", "time": 1794405840},
+    {"clock": 1794578750, "price": "84.544", "time": 1794405900},
+    {"clock": 1794578810, "price": "84.513", "time": 1794405960},
+    {"clock": 1794578870, "price": "84.495", "time": 1794406020},
+    {"clock": 1794578930, "price": "84.421", "time": 1794406080}
   ]
 }
 ```
 
-- The prices are the close of Coinbase Exchange's public 1-minute candles, for `SOL/USD`,
-  `BTC/USD` and `ETH/USD`. A range is at most one day.
+- The prices are the close of Hyperliquid's 1-minute candles for the SOL, BTC and ETH perps,
+  for `SOL/USD`, `BTC/USD` and `ETH/USD`. It is a perp price on that venue, not Pyth's
+  aggregate. The source keeps about the latest 5,000 minutes, and a range is at most one day.
+- `--from` and `--to` take Unix seconds, `YYYY-MM-DD` or `YYYY-MM-DDTHH:MMZ`.
 - The clock moves forward only, so the past range plays from the fork's current time on. `time`
   in each step is the candle's, and `clock` is the fork's when the price was written.
-- An hour of 60 steps took 6 s and a day of 1,440 steps took 128 s (measured on 2026-11-12).
+
+`--file` plays your own prices instead, for any feed and any times. The file has one
+`<unix seconds>,<price>` a line, oldest first, and each step moves the clock by the time between
+two rows:
+
+```sh
+printf 'time,price\n1735689600,1.0001\n1735689690,0.9995\n1735689900,1\n' > usdc.csv
+chainsim time solana-mainnet --replay USDC/USD --file usdc.csv
+```
+
+```json
+{
+  "kind": "replay", "feed": "USDC/USD", "account": "Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX",
+  "source": "a CSV file of unix seconds and price",
+  "from": 1735689600, "to": 1735689900, "steps": 3, "clock": {"from": 1794578930, "to": 1794579230}, "slot": 468899948,
+  "applied": [
+    {"clock": 1794578930, "price": "1.0001", "time": 1735689600},
+    {"clock": 1794579020, "price": "0.9995", "time": 1735689690},
+    {"clock": 1794579230, "price": "1", "time": 1735689900}
+  ]
+}
+```
 
 ## Programs
 
@@ -448,7 +471,7 @@ a test report:
 - snapshot writes the engine's account export, program accounts included, to the fork volume: about 2 MB on a fresh fork, and more with every account and program the copy has touched. revert restarts the engine inside its container, which takes about 1 s, restores the accounts, and moves the clock forward to the snapshot's. The slot and the clock after a revert are never earlier than the snapshot's and can be later. A transaction sent before the revert is no longer known to the engine by its signature.
 - An account the copy has read keeps its data when the clock moves. A Pyth price account read before time --advance 86400 kept its publish time (measured on 2026-11-12). Save's RefreshReserve then refused the SOL reserve with PriceTooOld, and passed after set price (measured on 2026-11-12). chainsim set <name> price <feed> <price> writes a Pyth price account again, and chainsim call <name> surfnet_setAccount writes any other account.
 - set price writes a Pyth price account (PriceUpdateV2) on the copy: the price, the confidence, a publish time equal to the Clock, the posted slot, and the EMA price and confidence set to the same values. It knows SOL/USD, BTC/USD, ETH/USD and USDC/USD by symbol and takes any other fully verified price account by address. Nothing signs the price, and Pyth's later updates on Solana Mainnet do not reach an account the copy has read. A program that reads its price elsewhere does not see it: Kamino lending reads Scope, which names none of these four accounts (measured on 2026-11-12).
-- time --replay <feed> plays a past range of at most one day onto the copy, one step a minute: each step moves the clock forward by the time between two prices and writes the price with a publish time equal to the Clock. The clock moves forward only, so the past range plays from the copy's current time on. The prices are the close of Coinbase Exchange's public 1-minute candles for SOL-USD, BTC-USD and ETH-USD, that venue's spot price and not Pyth's aggregate, read from the fork's control sidecar under Coinbase's Market Data Terms of Use and not kept. USDC/USD has no replay.
+- time --replay <feed> plays a range of prices onto the copy: each step moves the clock forward by the time between two prices and writes the price with a publish time equal to the Clock. The clock moves forward only, so a past range plays from the copy's current time on. With --from and --to the prices are the close of Hyperliquid's 1-minute candles for the SOL, BTC and ETH perps, a perp price on that venue and not Pyth's aggregate, read from the fork's control sidecar and not kept. That source keeps about the latest 5,000 minutes, a range is at most one day, and USDC/USD is not in it. With --file <csv> the prices are your own rows of <unix seconds>,<price>, for any feed and any times, at most 10,000 rows.
 - set mirror kamino <obligation> --to <test wallet> copies a Kamino Lend obligation of Solana Mainnet as the copy reads it when the command runs. The copy does not follow the source afterwards. It writes the obligation at the address Kamino derives for the wallet, with the wallet as its owner, and the farm user state of each farmed reserve the obligation holds, with its owner and its obligation rewritten. Every other byte equals the source. Reserve totals and farm stakes are not raised, so a reserve counts the position once while the source and the copy both claim it (inferred): a test that drains a reserve or reads a farm's total stake sees that. The command finds the seeds of the source's address among tags 0 to 3, ids 0 to 7 and the mints the obligation holds now, and exits 3 when none gives it. The wallet's token accounts are not made: fund or set token makes them. Kamino prices the copy from the oracle accounts the copy has read, which keep their age when the clock moves. After time --advance 120 a deposit, a borrow and a repay passed. After time --advance 600, and after 86400, Kamino logged PriceTooOld, a deposit still passed and a borrow failed with ReserveStale (6009). surfnet_resetAccount on the price accounts did not change that, since their mainnet time is then behind the copy's clock (measured on 2026-11-12 on one market).
 - chainsim call <name> surfnet_cloneProgramAccount copies a program of the upgradeable loader to a new address. A program of an older loader is refused.
 - Solana signatures do not bind to this copy. A transaction signed for the copy is valid on Solana Mainnet while its blockhash is recent there. The copy's blockhashes are local, so use test keys that hold no mainnet assets.

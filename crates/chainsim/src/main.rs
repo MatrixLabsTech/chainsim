@@ -130,11 +130,14 @@ enum Command {
         #[arg(long)]
         to: Option<String>,
         /// HyperEVM: replay this perp's hourly mainnet candles (BTC, ETH...) as its price path. Solana: replay a Pyth feed's past prices (SOL/USD...), a step a minute.
-        #[arg(long, requires_all = ["from", "to"])]
+        #[arg(long)]
         replay: Option<String>,
         /// With --replay: the start of the range (Unix seconds, YYYY-MM-DD or YYYY-MM-DDTHH:MMZ).
         #[arg(long, requires = "replay")]
         from: Option<String>,
+        /// With --replay on Solana: a CSV file of your own prices, <unix seconds>,<price> a line, instead of --from and --to.
+        #[arg(long, requires = "replay", conflicts_with_all = ["from", "to"])]
+        file: Option<PathBuf>,
     },
     /// Produce blocks on the fork (default: 1).
     Mine {
@@ -433,7 +436,7 @@ fn describe(chain: Option<&str>) -> Result<Value> {
             "call <name> <method> [<params-json>] [--from <address>]  (HyperEVM: call <name> corewriter_actions [{\"fromBlock\": <n>}])",
             "send <name> --as <address> --to <address> (--sig \"<fn(types)>\" [<arg>...] | --data <hex>) [--value <amount>]  (Solana: send <name> --as <address> (--to <receiver> --value <amount> | --data <base64 transaction>))",
             "set <name> storage <address> <slot> <value> | code <address> (<hex> | --file <path>) | balance <address> <amount> | token <address> <coin type|symbol|mint> <amount> [--from <holder>] | owner <object> <new owner> | object <id> (--field <name>=<value>... | --bcs <hex>) | resource <address> <struct tag> --bcs <hex> | precompile <address> <calldata hex> (--result <hex> | --live) | price <feed|price account> <usd> [--conf <usd>] | hypercore (price <perp> <px> | price <spot pair> <px> --spot | isolated-margin <user> <perp> <+usd|-usd> | spot-balance <user> <token> <total> [--hold <n>] [--entry-ntl <n>] | position <user> <perp> <szi> <entryNtl> [--leverage <n>] [--isolated-raw-usd <n>] [--isolated] | book <coin> --live | mirror <user> | funding <perp> <rate> | big-blocks <user> on|off) | mirror kamino <obligation> --to <test wallet>  (Solana)",
-            "time <name> (--advance <seconds> | --to <unix seconds> | --replay <perp> --from <time> --to <time>)  (Solana: --replay <feed> --from <time> --to <time>, such as SOL/USD)",
+            "time <name> (--advance <seconds> | --to <unix seconds> | --replay <perp> --from <time> --to <time>)  (Solana: --replay <feed> (--from <time> --to <time> | --file <csv>), such as SOL/USD)",
             "mine <name> [--blocks <n>]",
             "selftest <name>",
             "pull [<engine>]",
@@ -640,7 +643,19 @@ async fn run(command: Command) -> Result<Value> {
             };
             adapter_of(&name).await?.call(&name, &method, params, from.as_deref()).await
         }
-        Command::Time { name, advance, to, replay, from } => {
+        Command::Time { name, advance, to, replay, from, file } => {
+            if let (Some(feed), Some(file)) = (&replay, &file) {
+                let csv = std::fs::read_to_string(file).map_err(|e| Error::new(ErrorCode::Usage, format!("read {}: {e}", file.display())))?;
+                let docker = Docker::connect().await?;
+                let handle = docker.find(&name).await?.ok_or_else(|| Error::fork_not_found(&name))?;
+                if profile::get(&handle.chain)?.family != "solana" {
+                    return Err(Error::unsupported(&format!("time --replay --file on {}", handle.chain), "a price file replays a Pyth feed on a Solana fork"));
+                }
+                return chainsim_solana::replay::replay_file(&SolanaAdapter::connect().await?, &name, feed, &csv).await;
+            }
+            if replay.is_some() && (from.is_none() || to.is_none()) {
+                return Err(Error::new(ErrorCode::Usage, "--replay takes --from <time> and --to <time>, or on Solana --file <csv>"));
+            }
             if let (Some(coin), Some(from), Some(to)) = (&replay, &from, &to) {
                 use chainsim_evm::parse_time;
                 let docker = Docker::connect().await?;
