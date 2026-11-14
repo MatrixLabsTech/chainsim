@@ -19,7 +19,8 @@ use chainsim_core::profile::{self, Profile};
 use chainsim_core::{Adapter, Error, ErrorCode, Result};
 use serde_json::{json, Value};
 
-use grpc::{upstream_next, Grpc};
+use chainsim_core::error::{archive_next, upstream_next};
+use grpc::Grpc;
 use units::*;
 
 /// How long `up` waits for gRPC health. A cold fork measured 4 to 22 s.
@@ -225,9 +226,9 @@ impl SuiAdapter {
         let lower = log.to_lowercase();
         let tail: String = log.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
         if lower.contains("429") || lower.contains("rate limit") || lower.contains("too many requests") {
-            Error::new(ErrorCode::RateLimited, format!("the upstream rate-limited the engine at startup: {tail}")).next(upstream_next(&g.upstream_env))
+            Error::new(ErrorCode::RateLimited, format!("the upstream rate-limited the engine at startup: {tail}")).next(upstream_next(Some(&g.upstream_env), true))
         } else if lower.contains("graphql") || lower.contains("error sending request") || lower.contains("connect") {
-            Error::new(ErrorCode::UpstreamUnavailable, format!("the engine could not fork from the upstream: {tail}")).next(upstream_next(&g.upstream_env))
+            Error::new(ErrorCode::UpstreamUnavailable, format!("the engine could not fork from the upstream: {tail}")).next(upstream_next(Some(&g.upstream_env), false))
         } else {
             Error::new(ErrorCode::EngineFailed, format!("the engine did not start: {tail}"))
         }
@@ -282,7 +283,7 @@ impl SuiAdapter {
             Some(c) => c,
             None => {
                 let data = probe.upstream_graphql("{ checkpoint { sequenceNumber } }", Duration::from_secs(30)).await?;
-                u64_field(&data["checkpoint"]["sequenceNumber"]).ok_or_else(|| Error::new(ErrorCode::UpstreamUnavailable, "the upstream did not return its latest checkpoint").next("retry"))?
+                u64_field(&data["checkpoint"]["sequenceNumber"]).ok_or_else(|| Error::new(ErrorCode::UpstreamUnavailable, "the upstream did not return its latest checkpoint").next(upstream_next(Some(&profile.upstream.env), false)))?
             }
         };
 
@@ -578,7 +579,7 @@ impl SuiAdapter {
             .flatten()
             .filter_map(|o| Some((json!({ "objectId": o["objectId"], "version": o["version"], "digest": o["digest"] }), u64_field(&o["balance"])?)))
             .max_by_key(|(_, b)| *b)
-            .ok_or_else(|| too_old(&fork.name, fork.fork_point.number))
+            .ok_or_else(|| too_old(&fork.name, fork.fork_point.number, &g.upstream_env))
     }
 
     /// Sends `amount` MIST from the profile's funder to `to` by impersonation:
@@ -828,12 +829,12 @@ pub fn largest_first(mut coins: Vec<(String, u64)>) -> Vec<String> {
 
 /// The funder holds no coins on the fork: its coins were not seeded, because
 /// the upstream keeps owned objects only for about the last hour of checkpoints.
-pub fn too_old(name: &str, fork_point: u64) -> Error {
+pub fn too_old(name: &str, fork_point: u64, upstream_env: &str) -> Error {
     Error::new(
         ErrorCode::Unsupported,
         format!("fund needs a fork point within about an hour of the upstream head, and checkpoint {fork_point} is older: the upstream GraphQL keeps owned objects only for about the last hour, so the funder's coins were not seeded at up"),
     )
-    .next(format!("chainsim down {name}, then chainsim up sui-mainnet --name {name} without --block, which forks from the upstream head"))
+    .next(format!("chainsim down {name}, then up again. For a fork point this old: {}", archive_next(upstream_env)))
 }
 
 /// An ExecuteTransaction request with no signatures: SplitCoins from the gas
@@ -1279,10 +1280,10 @@ mod tests {
 
     #[test]
     fn too_old_names_the_fork_point_and_the_fix() {
-        let e = too_old("f", 42);
+        let e = too_old("f", 42, "ENV");
         assert_eq!(e.code, ErrorCode::Unsupported);
         assert!(e.message.contains("checkpoint 42") && e.message.contains("about an hour"), "{}", e.message);
-        assert!(e.next.as_deref().is_some_and(|n| n.starts_with("chainsim down f,") && n.contains("without --block")));
+        assert!(e.next.as_deref().is_some_and(|n| n.starts_with("chainsim down f,") && n.ends_with(&archive_next("ENV"))), "{:?}", e.next);
     }
 
     #[test]

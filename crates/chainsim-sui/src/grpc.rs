@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use chainsim_core::control::redact_urls;
 use chainsim_core::docker::{Docker, UPSTREAM_ENV};
+use chainsim_core::error::upstream_next;
 use chainsim_core::{Error, ErrorCode, Result};
 use serde_json::{json, Value};
 
@@ -19,11 +20,6 @@ pub struct Grpc<'a> {
     pub secret: Option<String>,
     /// The profile's upstream variable, named in `next` on upstream failures.
     pub upstream_env: String,
-}
-
-/// The `next` for an upstream failure (exit 5): the variable to set, never its value.
-pub fn upstream_next(upstream_env: &str) -> String {
-    format!("retry, or set {upstream_env} to a provider GraphQL URL; the public endpoint rate-limits heavy runs (chainsim describe sui-mainnet)")
 }
 
 /// The engine's descriptor set in the control sidecar. It lives on the
@@ -104,11 +100,12 @@ impl<'a> Grpc<'a> {
         let script = format!("exec wget -q -O - -T {} --header 'content-type: application/json' --post-data \"$1\" \"${UPSTREAM_ENV}\"", timeout.as_secs().max(1));
         let argv: Vec<String> = vec!["sh".into(), "-c".into(), script, "sh".into(), body];
         let out = self.docker.exec(&self.container, &argv).await?;
-        let next = upstream_next(&self.upstream_env);
+        let next = upstream_next(Some(&self.upstream_env), false);
         if out.exit_code != 0 {
             let msg = self.scrub(out.stderr.trim());
-            let code = if msg.contains("429") { ErrorCode::RateLimited } else { ErrorCode::UpstreamUnavailable };
-            return Err(Error::new(code, format!("upstream GraphQL failed (wget exit {}): {msg}", out.exit_code)).next(next.clone()));
+            let limited = msg.contains("429");
+            let code = if limited { ErrorCode::RateLimited } else { ErrorCode::UpstreamUnavailable };
+            return Err(Error::new(code, format!("upstream GraphQL failed (wget exit {}): {msg}", out.exit_code)).next(upstream_next(Some(&self.upstream_env), limited)));
         }
         let v: Value = serde_json::from_str(out.stdout.trim()).map_err(|_| Error::new(ErrorCode::UpstreamUnavailable, "upstream GraphQL reply is not JSON").next(next.clone()))?;
         if let Some(errors) = v.get("errors").filter(|e| e.as_array().is_some_and(|a| !a.is_empty())) {
@@ -151,13 +148,13 @@ pub fn classify(method: &str, exit_code: i64, stderr: &str, upstream_env: &str) 
     let message = stderr.lines().find_map(|l| l.trim().strip_prefix("Message: ")).unwrap_or(stderr.trim());
     match exit_code {
         // ResourceExhausted
-        72 => Error::new(ErrorCode::RateLimited, format!("{method}: {message}")).next(upstream_next(upstream_env)),
+        72 => Error::new(ErrorCode::RateLimited, format!("{method}: {message}")).next(upstream_next(Some(upstream_env), true)),
         // Unavailable, DeadlineExceeded
         78 | 68 => Error::new(ErrorCode::EngineFailed, format!("{method}: {message}")).next("chainsim status <name>; if the engine stopped, chainsim down <name> then chainsim up <chain>"),
         c if c > 64 => {
             let lower = message.to_lowercase();
             if lower.contains("error sending request") || lower.contains("graphql") || lower.contains("upstream") {
-                Error::new(ErrorCode::UpstreamUnavailable, format!("{method}: {message}")).next(upstream_next(upstream_env))
+                Error::new(ErrorCode::UpstreamUnavailable, format!("{method}: {message}")).next(upstream_next(Some(upstream_env), false))
             } else {
                 Error::new(ErrorCode::RpcError, format!("{method}: {message}"))
             }
@@ -222,10 +219,10 @@ mod tests {
         assert_eq!(e.message, "m: Object 0x1234 not found");
         let limited = classify("m", 72, "ERROR:\n  Code: ResourceExhausted\n  Message: slow down", "ENV");
         assert_eq!(limited.code, ErrorCode::RateLimited);
-        assert!(limited.next.as_deref().is_some_and(|n| n.contains("set ENV to a provider")), "{limited:?}");
+        assert_eq!(limited.next.as_deref(), Some(upstream_next(Some("ENV"), true).as_str()));
         let upstream = classify("m", 77, "ERROR:\n  Code: Internal\n  Message: error sending request for url", "ENV");
         assert_eq!(upstream.code, ErrorCode::UpstreamUnavailable);
-        assert!(upstream.next.as_deref().is_some_and(|n| n.contains("ENV")));
+        assert_eq!(upstream.next.as_deref(), Some(upstream_next(Some("ENV"), false).as_str()));
         assert_eq!(classify("m", 78, "", "ENV").code, ErrorCode::EngineFailed);
         assert_eq!(classify("m", 1, "Failed to dial target host \"sui:9001\": connection refused", "ENV").code, ErrorCode::EngineFailed);
         assert_eq!(classify("m", 1, "service \"x\" does not include a method named \"NoSuch\"", "ENV").code, ErrorCode::Usage);
