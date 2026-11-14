@@ -336,8 +336,8 @@ chainsim status aptos-mainnet
 chainsim down aptos-mainnet
 ```
 
-`status` adds the head block height and the `modifications` list, every `send --as` and `set`
-since `up`, so a report can name each result that depends on impersonation or an override:
+`status` adds the head block height and the `modifications` list, every `fund`, `send --as` and
+`set` since `up`, so a report can name each result that depends on impersonation or an override:
 
 ```json
 {

@@ -888,7 +888,7 @@ chainsim down hyperevm-mainnet
 ```
 
 `status` adds the head block, the captured CoreWriter action count, a summary of Core state and
-the `modifications` list, every `send --as` and `set` since `up`. From the 2026-11-02 run,
+the `modifications` list, every `fund`, `send --as` and `set` since `up`. From the 2026-11-02 run,
 shortened here:
 
 ```json

@@ -438,6 +438,9 @@ fn hyperevm_mainnet() {
     assert_eq!(status["hypercore"]["coreWriterActions"], 1);
     let kinds: Vec<_> = status["modifications"].as_array().unwrap().iter().map(|m| m["kind"].as_str().unwrap().to_string()).collect();
     assert!(kinds.contains(&"set-precompile".to_string()) && kinds.contains(&"send-as".to_string()), "{kinds:?}");
+    // fund is listed too, one entry per balance it set.
+    let funds: Vec<_> = status["modifications"].as_array().unwrap().iter().filter(|m| m["kind"] == "fund" && m["address"].as_str().unwrap().eq_ignore_ascii_case(&wallet)).map(|m| (m["asset"].as_str().unwrap().to_string(), m["symbol"].as_str().unwrap().to_string(), m["amount"].as_str().unwrap().to_string())).collect();
+    assert_eq!(funds, vec![("native".into(), "HYPE".into(), "10".into()), (HYPEREVM_USDC.into(), "USDC".into(), "1000".into())], "{}", status["modifications"]);
 
     // Snapshot, a price set, revert: the old price is back.
     let snap = ok(&["snapshot", name]);

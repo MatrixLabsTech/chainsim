@@ -297,6 +297,6 @@ chainsim status sui-mainnet
 chainsim down sui-mainnet
 ```
 
-`status` adds the head checkpoint and the `modifications` list: every `send --as` and `set` since
-`up`, so a report can name each result that depends on impersonation or an override. `down`
+`status` adds the head checkpoint and the `modifications` list: every `fund`, `send --as` and `set`
+since `up`, so a report can name each result that depends on impersonation or an override. `down`
 removes the engine, the sidecar, the fork volume and the network chainsim made.
