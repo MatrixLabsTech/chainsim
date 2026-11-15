@@ -7,12 +7,13 @@
 // `cast call`. Functions not listed here revert.
 //
 // Build, from the repo root, in the pinned foundry image (the lock's foundry
-// digest), and write the output, without a newline, to
-// profiles/assets/arbgasinfo-mock.hex:
+// digest). The build has no metadata hash, so a rebuild matches the committed
+// file byte for byte (check with git diff --exit-code):
 //   docker run --rm -v "$PWD/profiles/assets/src":/in:ro --entrypoint sh \
 //     ghcr.io/foundry-rs/foundry:v1.8.5 -c 'cd /tmp && mkdir -p b/src && cd b && \
 //     cp /in/ArbGasInfoMock.sol src/ && forge inspect src/ArbGasInfoMock.sol:ArbGasInfoMock \
-//     deployedBytecode --use 0.8.30 --optimize' 
+//     deployedBytecode --use 0.8.30 --optimize --no-metadata' \
+//     | tr -d '\n' > profiles/assets/arbgasinfo-mock.hex
 pragma solidity 0.8.30;
 
 contract ArbGasInfoMock {

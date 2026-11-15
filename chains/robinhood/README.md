@@ -73,14 +73,16 @@ The values are a dated snapshot. To refresh them:
    ```
 
 2. Put the new values, block and date in `profiles/assets/src/ArbGasInfoMock.sol`.
-3. Rebuild the runtime code with the command in that file's header and write it, without a
-   newline, to `profiles/assets/arbgasinfo-mock.hex`:
+3. Rebuild the runtime code with the command in that file's header. It writes
+   `profiles/assets/arbgasinfo-mock.hex` without a newline and without a metadata hash, so an
+   unchanged source rebuilds to the same bytes:
 
    ```sh
    docker run --rm -v "$PWD/profiles/assets/src":/in:ro --entrypoint sh \
      ghcr.io/foundry-rs/foundry:v1.8.5 -c 'cd /tmp && mkdir -p b/src && cd b && \
      cp /in/ArbGasInfoMock.sol src/ && forge inspect src/ArbGasInfoMock.sol:ArbGasInfoMock \
-     deployedBytecode --use 0.8.30 --optimize'
+     deployedBytecode --use 0.8.30 --optimize --no-metadata' \
+     | tr -d '\n' > profiles/assets/arbgasinfo-mock.hex
    ```
 
 4. Update the date, block and example values in the profile's `overrides` note and `limits`,

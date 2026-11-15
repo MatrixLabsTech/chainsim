@@ -11,7 +11,7 @@ mod install;
 
 use chainsim_core::docker::Docker;
 use chainsim_aptos::AptosAdapter;
-use chainsim_core::fork::{FundRequest, SendRequest, SetKind, SetRequest, TimeRequest, TokenAmount, UpRequest};
+use chainsim_core::fork::{FundRequest, Funded, SendRequest, SetKind, SetRequest, TimeRequest, TokenAmount, UpRequest};
 use chainsim_core::lock::EngineLock;
 use chainsim_core::profile::{self, Profile};
 use chainsim_core::{envelope, Adapter, Error, ErrorCode, Result};
@@ -400,6 +400,26 @@ async fn adapter(family: &str) -> Result<Box<dyn Adapter>> {
     }
 }
 
+/// What `fund` adds to the fork's modification list: one entry per balance it set,
+/// in the shape the Solana adapter records (asset is `native` or the token address).
+fn fund_entries(funded: &Funded, native_symbol: Option<&str>, at: u64) -> Vec<Value> {
+    funded
+        .balances
+        .iter()
+        .map(|b| {
+            let (asset, symbol) = match &b.address {
+                Some(token) => (token.as_str(), b.asset.as_str()),
+                None => ("native", native_symbol.unwrap_or(&b.asset)),
+            };
+            json!({ "kind": "fund", "address": funded.address, "asset": asset, "symbol": symbol, "amount": b.amount, "at": at })
+        })
+        .collect()
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
 /// The adapter of a running fork, from its labels.
 async fn adapter_of(name: &str) -> Result<Box<dyn Adapter>> {
     let docker = Docker::connect().await?;
@@ -653,7 +673,17 @@ async fn run(command: Command) -> Result<Value> {
         }
         Command::Fund { name, address, native, tokens } => {
             let req = FundRequest { address, native, tokens: parse_tokens(&tokens)? };
-            to_value(adapter_of(&name).await?.fund(&name, &req).await)
+            let docker = Docker::connect().await?;
+            let handle = docker.find(&name).await?.ok_or_else(|| Error::fork_not_found(&name))?;
+            let profile = profile::get(&handle.chain)?;
+            let funded = adapter(&profile.family).await?.fund(&name, &req).await?;
+            // status lists every fund. The Solana adapter records its own entries, with the token account.
+            if profile.family != "solana" {
+                for entry in fund_entries(&funded, profile.native.as_ref().map(|n| n.symbol.as_str()), now_secs()) {
+                    chainsim_core::mods::record(&docker, &name, &entry).await?;
+                }
+            }
+            to_value(Ok(funded))
         }
         Command::Snapshot { name } => to_value(adapter_of(&name).await?.snapshot(&name).await),
         Command::Revert { name, id } => to_value(adapter_of(&name).await?.revert(&name, &id).await),
@@ -751,4 +781,30 @@ async fn main() {
     let (out, code) = envelope::render(&result);
     print(&out, pretty);
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chainsim_core::fork::Balance;
+
+    #[test]
+    fn fund_entries_list_each_balance_with_its_asset() {
+        let funded = Funded {
+            address: "0xab".into(),
+            balances: vec![
+                Balance { asset: "native".into(), address: None, decimals: 9, amount: "5".into(), raw: "5000000000".into() },
+                Balance { asset: "USDC".into(), address: Some("0x36".into()), decimals: 6, amount: "1000".into(), raw: "1000000000".into() },
+            ],
+        };
+        assert_eq!(
+            fund_entries(&funded, Some("SUI"), 7),
+            [
+                json!({ "kind": "fund", "address": "0xab", "asset": "native", "symbol": "SUI", "amount": "5", "at": 7 }),
+                json!({ "kind": "fund", "address": "0xab", "asset": "0x36", "symbol": "USDC", "amount": "1000", "at": 7 }),
+            ]
+        );
+        // Without a native asset in the profile, the balance's own name stays.
+        assert_eq!(fund_entries(&funded, None, 7)[0]["symbol"], "native");
+    }
 }

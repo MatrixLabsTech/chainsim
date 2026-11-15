@@ -124,7 +124,7 @@ the fork with `--publish`.
 - `describe` and the `fork` object carry each chain's `limits`, plain sentences an agent copies
   into its report.
 - `selftest` exits 0 only when every check passes, with each check's cause in `data`.
-- `status` lists every `send` and `set` under `modifications`, so a report can say which
+- `status` lists every `fund`, `send` and `set` under `modifications`, so a report can say which
   results depend on a change mainnet would not allow.
 - The Claude Code and Codex plugin adds a skill that starts with a setup check through
   `chainsim doctor`, then walks through up, selftest, fund, snapshot and revert, and cleanup.

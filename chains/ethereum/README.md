@@ -76,7 +76,7 @@ chainsim set ethereum-mainnet token 0x0000000000000000000000000000000000c0ffee U
 { "kind": "token", "address": "0x0000000000000000000000000000000000C0FFEE", "symbol": "USDC", "token": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "decimals": 6, "amount": "1234.5", "raw": "1234500000" }
 ```
 
-`status` lists every `send` and `set` under `modifications`. The list lives in the fork's
+`status` lists every `fund`, `send` and `set` under `modifications`. The list lives in the fork's
 sidecar, so it is gone after `down`, and a `revert` does not shorten it.
 
 ## Time and blocks
